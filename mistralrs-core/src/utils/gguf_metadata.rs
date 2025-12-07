@@ -265,7 +265,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         _matformer_config: Option<&MatformerSliceConfig>,
     ) -> Result<usize> {
         let size_in_bytes = match self.arch {
-            GGUFArchitecture::Llama => {
+            GGUFArchitecture::Llama | GGUFArchitecture::Mistral3 => {
                 let token_embd = tensor_info_size_in_bytes!(
                     self.model.tensor_info("token_embd.weight")?,
                     DType::F32
@@ -362,7 +362,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         _matformer_config: Option<&MatformerSliceConfig>,
     ) -> Result<Vec<usize>> {
         let size_in_bytes = match self.arch {
-            GGUFArchitecture::Llama => {
+            GGUFArchitecture::Llama | GGUFArchitecture::Mistral3 => {
                 let attn_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("blk.0.attn_norm.weight")?,
                     DType::F32
