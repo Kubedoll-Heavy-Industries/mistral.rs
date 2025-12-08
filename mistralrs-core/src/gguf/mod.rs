@@ -15,6 +15,7 @@ pub const GGUF_MULTI_FILE_DELIMITER: &str = " ";
 #[strum(serialize_all = "lowercase")]
 pub enum GGUFArchitecture {
     Llama,
+    Mistral3,
     Mpt,
     Gptneox,
     Gptj,
