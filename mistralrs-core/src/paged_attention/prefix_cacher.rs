@@ -159,6 +159,8 @@ impl PrefixCacher {
                         self.lru_queue.retain(|h| h != hash);
                     }
 
+                    // Increment physical block refcount so both cache and sequence hold valid refs
+                    entry.physical_block.deref_mut().increment_refcount();
                     matched_blocks.push((idx, entry.physical_block.clone()));
                     num_matched = idx + 1;
                     self.hits += 1;
