@@ -296,6 +296,7 @@ impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, Adapter<'_>> {
 
 use crate::{
     models::quantized_llama::ModelWeights as QLlama,
+    models::quantized_mistral3::ModelWeights as QMistral3,
     models::quantized_phi2::ModelWeights as QPhi,
     models::quantized_phi3::ModelWeights as QPhi3,
     models::quantized_qwen::ModelWeights as QQwen,
@@ -325,7 +326,7 @@ impl TryFrom<ModelParams<'_, ParamsGGML>> for XLoraQLlama {
 }
 
 akin! {
-    let &models_gguf = [QLlama, QPhi, QPhi3, QStarcoder2, QQwen, QQwen3, QQwen3MoE];
+    let &models_gguf = [QLlama, QMistral3, QPhi, QPhi3, QStarcoder2, QQwen, QQwen3, QQwen3MoE];
 
     impl<R: std::io::Seek + std::io::Read> TryFrom<ModelParams<'_, ParamsGGUF<'_, R>>> for *models_gguf {
         type Error = candle_core::Error;
