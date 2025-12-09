@@ -221,9 +221,19 @@ impl PagedAttentionScheduler {
                 let mut seq_handle = get_mut_arcmutex!(seq);
                 self._allocate(&mut seq_handle);
                 // Check for prefix cache hit and report to logger
-                let seq_id = seq_handle.get_id();
-                if get_mut_arcmutex!(self.block_engine).last_allocate_had_cache_hit(seq_id) > 0 {
+                // allocate() sets prefix_cache_len on the sequence to the number of cached tokens
+                let cached_tokens = seq_handle.prefix_cache_len();
+                if cached_tokens > 0 {
                     logger.add_prefix_cache_hit();
+                    // CRITICAL: Sync token_offset with prefix_cache_len so the model
+                    // knows to skip computing KV for cached tokens.
+                    // Without this, the model recomputes KV for all tokens, overwriting
+                    // the cached data and corrupting the KV cache.
+                    seq_handle.set_token_offset(cached_tokens);
+                    // Trim prefill_prompt_toks to only include non-cached tokens
+                    let all_tokens = seq_handle.get_all_tokens();
+                    let non_cached_tokens = all_tokens[cached_tokens..].to_vec();
+                    seq_handle.set_prefill_toks(non_cached_tokens);
                 }
             }
 

@@ -747,6 +747,12 @@ impl Sequence {
         &self.tokens
     }
 
+    /// Get the raw underlying tokens, ignoring any prefill trimming.
+    /// Used by the scheduler to access all tokens when setting up prefix cache.
+    pub fn get_all_tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
     pub fn get_initial_prompt(&self) -> &str {
         &self.prompt
     }
@@ -757,6 +763,12 @@ impl Sequence {
 
     pub fn token_offset(&self) -> usize {
         self.token_offset
+    }
+
+    /// Set the token offset for prefix caching.
+    /// This indicates where in the KV cache to start writing new values.
+    pub fn set_token_offset(&mut self, offset: usize) {
+        self.token_offset = offset;
     }
 
     /// Get the number of prefix tokens that are cached (KV already computed).

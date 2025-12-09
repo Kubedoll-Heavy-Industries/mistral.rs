@@ -943,6 +943,44 @@ mod tests {
         assert_eq!(engine.num_free_blocks(), 4); // 6 total - 2 in cache = 4 free
     }
 
+    /// Test that prefix_cache_len is correctly set on cache hit, providing the
+    /// information needed by the scheduler to set token_offset and trim tokens.
+    #[test]
+    fn test_prefix_cache_len_set_on_cache_hit() {
+        let block_size = 16;
+        let num_gpu_blocks = 6;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, true);
+
+        // First sequence: allocate 3 full blocks (48 tokens) and complete
+        let mut seq1 = MockSequence::with_full_blocks(1, block_size, 3);
+        engine.allocate(&mut seq1);
+
+        // prefix_cache_len should be 0 (no cache hit on first allocation)
+        assert_eq!(seq1.prefix_cache_len, 0);
+        // last_allocate_had_cache_hit returns number of blocks, not tokens
+        assert_eq!(engine.last_allocate_had_cache_hit(1), 0);
+
+        // Complete and cache
+        let logical_blocks1 = seq1.logical_blocks.clone();
+        engine.free_sequence_with_caching(1, Some(&logical_blocks1));
+
+        // Second sequence: same tokens, should get full cache hit
+        let mut seq2 = MockSequence::with_full_blocks(2, block_size, 3);
+        seq2.logical_blocks = logical_blocks1.clone();
+        engine.allocate(&mut seq2);
+
+        // prefix_cache_len is set to 48 tokens (3 blocks * 16 tokens/block)
+        // This is what the scheduler uses to set token_offset and trim tokens
+        assert_eq!(seq2.prefix_cache_len, 48);
+        // last_allocate_had_cache_hit returns 3 (number of blocks, for cache stats)
+        assert_eq!(engine.last_allocate_had_cache_hit(2), 3);
+
+        // The scheduler uses prefix_cache_len (48 tokens), not last_allocate_had_cache_hit (3 blocks)
+        // to:
+        // 1. Set token_offset on the Sequence
+        // 2. Trim prefill_prompt_toks to skip cached tokens
+    }
+
     /// Test the specific scenario from the production bug:
     /// Multiple sequences complete, blocks accumulate in cache with wrong refcount,
     /// eventually causing allocation failure.
