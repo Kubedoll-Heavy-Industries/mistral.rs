@@ -392,19 +392,11 @@ impl BlockEngine {
                 }
             }
 
-            // Free non-cached blocks (or all if not caching)
-            for (idx, block) in block_table.iter().enumerate() {
-                // Skip blocks that were from cache and are now in cache
-                // (they have refcount > 1 due to cache holding a reference)
-                if idx < num_cached && self.prefix_cacher.is_enabled() {
-                    // This was a cached block - just decrement our reference
-                    self.gpu_allocator.free_block(block.clone());
-                } else if self.prefix_cacher.is_enabled() && logical_blocks.is_some() {
-                    // This block is being added to cache, so cache holds the ref
-                    // We don't free it to the allocator
-                } else {
-                    self.gpu_allocator.free_block(block.clone());
-                }
+            // Free all blocks - each block needs its sequence reference released.
+            // The cache holds its own reference (incremented in insert_blocks),
+            // so we must release the sequence's reference for proper refcounting.
+            for block in block_table.iter() {
+                self.gpu_allocator.free_block(block.clone());
             }
         }
     }
@@ -513,5 +505,476 @@ impl BlockEngine {
     /// Get number of blocks in prefix cache.
     pub fn prefix_cache_size(&self) -> usize {
         self.prefix_cacher.num_cached_blocks()
+    }
+
+    /// Get number of free blocks in the GPU allocator.
+    #[cfg(test)]
+    pub fn num_free_blocks(&self) -> usize {
+        *self.gpu_allocator.get_num_free_blocks()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal sequence implementation for testing block engine allocation.
+    struct MockSequence {
+        id: usize,
+        logical_blocks: Vec<LogicalTokenBlock>,
+        block_size: usize,
+        waitlist_count: usize,
+        prefix_cache_len: usize,
+        physical_blocks_prefill: Option<Vec<Arc<PhysicalTokenBlock>>>,
+    }
+
+    impl MockSequence {
+        fn new(id: usize, block_size: usize, num_tokens: usize) -> Self {
+            Self::new_with_token_offset(id, block_size, num_tokens, 0)
+        }
+
+        /// Create a sequence with tokens starting from a given offset.
+        /// This allows creating sequences with different token values for cache testing.
+        fn new_with_token_offset(id: usize, block_size: usize, num_tokens: usize, token_offset: usize) -> Self {
+            let num_blocks = (num_tokens + block_size - 1) / block_size;
+            let mut logical_blocks = Vec::with_capacity(num_blocks);
+
+            let mut token_id = token_offset;
+            let mut remaining = num_tokens;
+            for _ in 0..num_blocks {
+                let mut block = LogicalTokenBlock::new(block_size);
+                let tokens_in_block = remaining.min(block_size);
+                for _ in 0..tokens_in_block {
+                    block.append_token_id(token_id);
+                    token_id += 1;
+                }
+                logical_blocks.push(block);
+                remaining = remaining.saturating_sub(block_size);
+            }
+
+            Self {
+                id,
+                logical_blocks,
+                block_size,
+                waitlist_count: 0,
+                prefix_cache_len: 0,
+                physical_blocks_prefill: None,
+            }
+        }
+
+        fn with_full_blocks(id: usize, block_size: usize, num_blocks: usize) -> Self {
+            Self::new(id, block_size, num_blocks * block_size)
+        }
+
+        fn with_full_blocks_offset(id: usize, block_size: usize, num_blocks: usize, token_offset: usize) -> Self {
+            Self::new_with_token_offset(id, block_size, num_blocks * block_size, token_offset)
+        }
+    }
+
+    impl BlockEngineSequence for MockSequence {
+        fn blocks_to_add_new_tok(&self) -> usize {
+            if let Some(last) = self.logical_blocks.last() {
+                if last.is_full() { 1 } else { 0 }
+            } else {
+                1
+            }
+        }
+
+        fn take_physical_blocks_prefill(&mut self) -> Option<Vec<Arc<PhysicalTokenBlock>>> {
+            self.physical_blocks_prefill.take()
+        }
+
+        fn get_id(&self) -> usize {
+            self.id
+        }
+
+        fn logical_token_blocks(&self) -> &[LogicalTokenBlock] {
+            &self.logical_blocks
+        }
+
+        fn increment_waitlist_count(&mut self) -> usize {
+            let prev = self.waitlist_count;
+            self.waitlist_count += 1;
+            prev
+        }
+
+        fn set_prefix_cache_len(&mut self, len: usize) {
+            self.prefix_cache_len = len;
+        }
+
+        fn block_size(&self) -> usize {
+            self.block_size
+        }
+    }
+
+    // ========================================================================
+    // Basic allocation tests
+    // ========================================================================
+
+    #[test]
+    fn test_basic_allocation() {
+        let block_size = 16;
+        let num_gpu_blocks = 10;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        let mut seq = MockSequence::with_full_blocks(1, block_size, 2);
+
+        assert!(matches!(engine.can_allocate(&mut seq), AllocStatus::Ok));
+        engine.allocate(&mut seq);
+
+        assert!(engine.block_tables.contains_key(&1));
+        assert_eq!(engine.block_tables.get(&1).unwrap().len(), 2);
+        assert_eq!(engine.num_free_blocks(), num_gpu_blocks - 2);
+    }
+
+    #[test]
+    fn test_free_sequence() {
+        let block_size = 16;
+        let num_gpu_blocks = 10;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        let mut seq = MockSequence::with_full_blocks(1, block_size, 3);
+        engine.allocate(&mut seq);
+
+        assert_eq!(engine.num_free_blocks(), num_gpu_blocks - 3);
+
+        engine.free_sequence(1);
+
+        assert_eq!(engine.num_free_blocks(), num_gpu_blocks);
+        assert!(!engine.block_tables.contains_key(&1));
+    }
+
+    #[test]
+    fn test_allocation_impossible_when_sequence_too_large() {
+        let block_size = 16;
+        let num_gpu_blocks = 5;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        // Sequence needs 10 blocks, but only 5 available
+        let mut seq = MockSequence::with_full_blocks(1, block_size, 10);
+
+        assert!(matches!(engine.can_allocate(&mut seq), AllocStatus::Impossible));
+    }
+
+    #[test]
+    fn test_allocation_later_when_insufficient_blocks() {
+        let block_size = 16;
+        let num_gpu_blocks = 10;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        // Allocate 8 blocks
+        let mut seq1 = MockSequence::with_full_blocks(1, block_size, 8);
+        engine.allocate(&mut seq1);
+
+        // Try to allocate 5 more (only 2 free)
+        let mut seq2 = MockSequence::with_full_blocks(2, block_size, 5);
+        assert!(matches!(engine.can_allocate(&mut seq2), AllocStatus::Later { .. }));
+    }
+
+    // ========================================================================
+    // Block exhaustion bug reproduction
+    // ========================================================================
+
+    #[test]
+    fn test_exhaustion_without_prefix_cache() {
+        let block_size = 16;
+        let num_gpu_blocks = 4;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        // Allocate all blocks
+        let mut seq1 = MockSequence::with_full_blocks(1, block_size, 4);
+        engine.allocate(&mut seq1);
+
+        assert_eq!(engine.num_free_blocks(), 0);
+
+        // Trying to allocate more should return Later, not panic
+        let mut seq2 = MockSequence::with_full_blocks(2, block_size, 1);
+        let status = engine.can_allocate(&mut seq2);
+        assert!(matches!(status, AllocStatus::Later { .. }));
+    }
+
+    #[test]
+    fn test_exhaustion_with_prefix_cache_evictable() {
+        let block_size = 16;
+        let num_gpu_blocks = 4;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, true);
+
+        // Allocate all blocks to a sequence
+        let mut seq1 = MockSequence::with_full_blocks(1, block_size, 4);
+        engine.allocate(&mut seq1);
+
+        assert_eq!(engine.num_free_blocks(), 0);
+
+        // Free with caching - blocks go to prefix cache
+        let logical_blocks = seq1.logical_blocks.clone();
+        engine.free_sequence_with_caching(1, Some(&logical_blocks));
+
+        // Blocks are now in prefix cache with ref_count = 0 (evictable)
+        // (The cache holds them but the CachedBlockEntry.ref_count is 0)
+
+        // Create a new sequence with DIFFERENT tokens that won't match cache
+        // Use token_offset=10000 so tokens are completely different
+        let mut seq2 = MockSequence::with_full_blocks_offset(2, block_size, 2, 10000);
+
+        // This should be able to evict from cache and allocate
+        let status = engine.can_allocate(&mut seq2);
+        assert!(matches!(status, AllocStatus::Ok), "Expected Ok, got {:?}", status);
+
+        // Allocation should succeed (evicting from cache)
+        engine.allocate(&mut seq2);
+        assert!(engine.block_tables.contains_key(&2));
+    }
+
+    /// This test reproduces the panic scenario: all blocks are held by active
+    /// sequences with ref_count > 0, eviction fails, and allocate() panics.
+    #[test]
+    fn test_exhaustion_with_all_blocks_actively_referenced() {
+        let block_size = 16;
+        let num_gpu_blocks = 4;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, true);
+
+        // Allocate all blocks across two sequences
+        let mut seq1 = MockSequence::with_full_blocks(1, block_size, 2);
+        let mut seq2 = MockSequence::with_full_blocks(2, block_size, 2);
+
+        engine.allocate(&mut seq1);
+        engine.allocate(&mut seq2);
+
+        assert_eq!(engine.num_free_blocks(), 0);
+
+        // Both sequences are still "running" - blocks have refcount = 1
+        // There's nothing in the prefix cache LRU queue to evict
+
+        // Trying to allocate more should NOT panic
+        let mut seq3 = MockSequence::with_full_blocks(3, block_size, 1);
+        let status = engine.can_allocate(&mut seq3);
+
+        // Should return Later, not Ok (and definitely not panic)
+        assert!(
+            matches!(status, AllocStatus::Later { .. }),
+            "Expected Later when all blocks are in use, got {:?}",
+            status
+        );
+    }
+
+    /// Test that simulates the deterioration scenario: a sequence holds cache
+    /// refs that prevent eviction, leading to allocation failure.
+    #[test]
+    fn test_prefix_cache_ref_leak_scenario() {
+        let block_size = 16;
+        let num_gpu_blocks = 6;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, true);
+
+        // First sequence: allocate and complete (adds blocks to cache)
+        let mut seq1 = MockSequence::with_full_blocks(1, block_size, 3);
+        engine.allocate(&mut seq1);
+        let logical_blocks1 = seq1.logical_blocks.clone();
+        engine.free_sequence_with_caching(1, Some(&logical_blocks1));
+
+        // At this point: 3 blocks in cache (evictable), 3 free blocks
+        assert_eq!(engine.prefix_cache_size(), 3);
+
+        // Second sequence: same prefix, gets cache hit, is still running
+        let mut seq2 = MockSequence::with_full_blocks(2, block_size, 3);
+        // Use same tokens to get cache hit
+        seq2.logical_blocks = logical_blocks1.clone();
+        engine.allocate(&mut seq2);
+
+        // seq2 now holds refs to cached blocks (refcount incremented by match_prefix)
+        // cached_blocks_per_seq should show 3 blocks were from cache
+        assert_eq!(engine.last_allocate_had_cache_hit(2), 3);
+
+        // Allocate remaining free blocks with a DIFFERENT sequence (different tokens)
+        let mut seq3 = MockSequence::with_full_blocks_offset(3, block_size, 3, 10000);
+        engine.allocate(&mut seq3);
+
+        assert_eq!(engine.num_free_blocks(), 0);
+
+        // Now try to allocate more - this requires evicting from cache,
+        // but cached blocks have ref_count > 0 due to seq2 (it matched the cache)
+        let mut seq4 = MockSequence::with_full_blocks_offset(4, block_size, 1, 20000);
+        let status = engine.can_allocate(&mut seq4);
+
+        // Should be Later (evictable = 0 because cached blocks are referenced by seq2)
+        assert!(
+            matches!(status, AllocStatus::Later { .. }),
+            "Expected Later when cached blocks are referenced, got {:?}",
+            status
+        );
+    }
+
+    // ========================================================================
+    // Refcount correctness tests
+    // ========================================================================
+
+    #[test]
+    fn test_refcount_after_allocation() {
+        let block_size = 16;
+        let num_gpu_blocks = 10;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        let mut seq = MockSequence::with_full_blocks(1, block_size, 2);
+        engine.allocate(&mut seq);
+
+        // All allocated blocks should have refcount = 1
+        for block in engine.block_tables.get(&1).unwrap() {
+            assert_eq!(block.deref_mut().refcount, 1);
+        }
+    }
+
+    #[test]
+    fn test_refcount_after_free() {
+        let block_size = 16;
+        let num_gpu_blocks = 10;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        let mut seq = MockSequence::with_full_blocks(1, block_size, 2);
+        engine.allocate(&mut seq);
+        engine.free_sequence(1);
+
+        // All free blocks should have refcount = 0
+        for block in &engine.gpu_allocator.free_blocks {
+            assert_eq!(block.deref_mut().refcount, 0);
+        }
+    }
+
+    #[test]
+    fn test_double_free_panics() {
+        let block_size = 16;
+        let num_gpu_blocks = 10;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, false);
+
+        let mut seq = MockSequence::with_full_blocks(1, block_size, 2);
+        engine.allocate(&mut seq);
+
+        // First free succeeds
+        engine.free_sequence(1);
+
+        // Second free should be a no-op (block_tables no longer contains id)
+        // This tests that we handle double-free gracefully
+        engine.free_sequence(1); // Should not panic
+    }
+
+    /// Verify that free_sequence_with_caching properly releases the sequence's
+    /// reference while letting the cache hold its own reference.
+    #[test]
+    fn test_refcount_correct_after_free_with_caching() {
+        let block_size = 16;
+        let num_gpu_blocks = 4;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, true);
+
+        // Allocate blocks
+        let mut seq = MockSequence::with_full_blocks(1, block_size, 2);
+        engine.allocate(&mut seq);
+
+        // After allocation, blocks have refcount = 1 (held by sequence)
+        for block in engine.block_tables.get(&1).unwrap() {
+            assert_eq!(block.deref_mut().refcount, 1, "Block should have refcount 1 after allocation");
+        }
+
+        // Free with caching
+        let logical_blocks = seq.logical_blocks.clone();
+        engine.free_sequence_with_caching(1, Some(&logical_blocks));
+
+        // Blocks should now be in cache with refcount = 1 (cache's reference only)
+        // The sequence's reference should have been released
+        assert_eq!(engine.prefix_cache_size(), 2);
+
+        // Verify we can evict and the refcount is correct
+        // Allocate a different sequence to force eviction
+        let mut seq2 = MockSequence::with_full_blocks_offset(2, block_size, 4, 10000);
+        let status = engine.can_allocate(&mut seq2);
+        assert!(matches!(status, AllocStatus::Ok), "Should be able to allocate by evicting");
+
+        engine.allocate(&mut seq2);
+
+        // All 4 blocks should now be allocated to seq2
+        assert_eq!(engine.num_free_blocks(), 0);
+        assert!(engine.block_tables.contains_key(&2));
+        assert_eq!(engine.block_tables.get(&2).unwrap().len(), 4);
+    }
+
+    /// Test that verifies the fix from cagyirey/fix/paged-attention-prefix-cache-refcount:
+    /// When a sequence matches blocks from the prefix cache, the physical block's
+    /// refcount must be incremented so both cache and sequence hold valid refs.
+    /// Without this fix, the sequence could free a block that the cache still references.
+    #[test]
+    fn test_cache_match_increments_physical_refcount() {
+        let block_size = 16;
+        let num_gpu_blocks = 6;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, true);
+
+        // First sequence: allocate and complete (adds blocks to cache)
+        let mut seq1 = MockSequence::with_full_blocks(1, block_size, 2);
+        engine.allocate(&mut seq1);
+        let logical_blocks1 = seq1.logical_blocks.clone();
+        engine.free_sequence_with_caching(1, Some(&logical_blocks1));
+
+        // Blocks are now in cache with refcount = 1 (cache's ref)
+        assert_eq!(engine.prefix_cache_size(), 2);
+
+        // Second sequence: same prefix, should get cache hit
+        let mut seq2 = MockSequence::with_full_blocks(2, block_size, 2);
+        seq2.logical_blocks = logical_blocks1.clone();
+        engine.allocate(&mut seq2);
+
+        // Verify cache hit
+        assert_eq!(engine.last_allocate_had_cache_hit(2), 2);
+
+        // The physical blocks should now have refcount = 2:
+        // - 1 from the cache
+        // - 1 from seq2
+        for block in engine.block_tables.get(&2).unwrap() {
+            assert_eq!(
+                block.deref_mut().refcount, 2,
+                "Block should have refcount 2 (cache + sequence)"
+            );
+        }
+
+        // Free seq2 - this should decrement refcount to 1, NOT free to pool
+        let logical_blocks2 = seq2.logical_blocks.clone();
+        engine.free_sequence_with_caching(2, Some(&logical_blocks2));
+
+        // Cache should still hold the blocks (refcount = 1)
+        assert_eq!(engine.prefix_cache_size(), 2);
+
+        // Blocks should NOT be in the free pool yet
+        // (they're still referenced by cache)
+        assert_eq!(engine.num_free_blocks(), 4); // 6 total - 2 in cache = 4 free
+    }
+
+    /// Test the specific scenario from the production bug:
+    /// Multiple sequences complete, blocks accumulate in cache with wrong refcount,
+    /// eventually causing allocation failure.
+    #[test]
+    fn test_multiple_sequences_with_caching_no_leak() {
+        let block_size = 16;
+        let num_gpu_blocks = 8;
+        let mut engine = BlockEngine::new(block_size, num_gpu_blocks, true);
+
+        // Simulate multiple requests completing
+        for i in 0..10 {
+            let mut seq = MockSequence::with_full_blocks_offset(i, block_size, 2, i * 1000);
+
+            let status = engine.can_allocate(&mut seq);
+            assert!(matches!(status, AllocStatus::Ok),
+                "Iteration {}: Expected Ok, got {:?}", i, status);
+
+            engine.allocate(&mut seq);
+
+            // Complete the sequence
+            let logical_blocks = seq.logical_blocks.clone();
+            engine.free_sequence_with_caching(i, Some(&logical_blocks));
+        }
+
+        // After 10 iterations, cache should have evicted old blocks
+        // and we should still be able to allocate
+        let mut final_seq = MockSequence::with_full_blocks_offset(100, block_size, 4, 100000);
+        let status = engine.can_allocate(&mut final_seq);
+        assert!(matches!(status, AllocStatus::Ok),
+            "Final allocation should succeed, got {:?}", status);
+
+        engine.allocate(&mut final_seq);
+        assert!(engine.block_tables.contains_key(&100));
     }
 }
