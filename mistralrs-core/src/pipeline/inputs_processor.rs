@@ -212,9 +212,13 @@ pub mod text_models_inputs_processor {
                     .collect::<Vec<_>>();
 
                 let start_idx = if let Some(sliding_window) = paged_attn_metadata.sliding_window {
-                    prompt_len.saturating_sub(sliding_window)
+                    if prompt_len > sliding_window {
+                        chunk_offset_toks.min(prompt_len - sliding_window)
+                    } else {
+                        chunk_offset_toks
+                    }
                 } else {
-                    0
+                    chunk_offset_toks
                 };
 
                 let mut slot_mapping = Vec::new();
@@ -224,7 +228,9 @@ pub mod text_models_inputs_processor {
                         // Pad [0,start_idx) with _PAD_TOKEN_ID
                         slot_mapping.push(_PAD_SLOT_ID);
                     }
-                    ctxt_len.push(i);
+                    // context_len is the number of K,V positions to attend to for causal attention
+                    // Position i attends to positions 0..=i (inclusive), so context_len = i + 1
+                    ctxt_len.push(i + 1);
 
                     let block_number = if i / paged_attn_metadata.block_size >= table.len() {
                         panic!(
@@ -305,18 +311,26 @@ pub mod text_models_inputs_processor {
             )?;
             let block_tables = block_tables.reshape(((), max_block_table_len))?;
 
-            let max_context_len = paged_attn_context_lens
+            // max_context_len_tensor_size is the maximum LENGTH of context_lens vectors (for padding)
+            // max_context_len is the maximum VALUE in context_lens (for paged_attention kernel)
+            let max_context_lens_tensor_size = paged_attn_context_lens
                 .iter()
                 .map(|x| x.len())
                 .max()
                 .unwrap();
+            let max_context_len = paged_attn_context_lens
+                .iter()
+                .flat_map(|x| x.iter())
+                .max()
+                .copied()
+                .unwrap_or(0);
 
             let context_lens = _make_tensor_with_pad(
                 paged_attn_context_lens
                     .iter()
                     .map(|x| x.iter().map(|x| *x as u32).collect::<Vec<_>>())
                     .collect::<Vec<_>>(),
-                max_context_len,
+                max_context_lens_tensor_size,
                 0,
                 device,
             )?
@@ -406,15 +420,18 @@ pub mod text_models_inputs_processor {
                     .map(|block| block.deref_mut().block_id)
                     .collect::<Vec<_>>();
 
-                let block_pos = start_pos - seq.token_offset();
-                let block_number = if block_pos / paged_attn_metadata.block_size >= table.len() {
-                    panic!("Block table is too small (completion)! start_pos={} block_size={} table_len={}", block_pos, paged_attn_metadata.block_size, table.len());
+                // For paged attention, use start_pos directly - the block table already maps
+                // positions correctly. token_offset is only used for non-paged attention
+                // (PrefixCacherV2) where it tells the model to skip positions in a contiguous
+                // KV cache tensor.
+                let block_number = if start_pos / paged_attn_metadata.block_size >= table.len() {
+                    panic!("Block table is too small (completion)! start_pos={} block_size={} table_len={}", start_pos, paged_attn_metadata.block_size, table.len());
                 } else {
                     table
-                        .get(block_pos / paged_attn_metadata.block_size)
+                        .get(start_pos / paged_attn_metadata.block_size)
                         .unwrap()
                 };
-                let block_offset = block_pos % paged_attn_metadata.block_size;
+                let block_offset = start_pos % paged_attn_metadata.block_size;
                 // Use checked arithmetic to prevent overflow
                 let slot = block_number
                     .checked_mul(paged_attn_metadata.block_size)
