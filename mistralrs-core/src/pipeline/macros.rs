@@ -558,6 +558,7 @@ macro_rules! normal_model_loader {
         $is_moqe:expr,
         $multi_progress:expr,
         $matformer_config:expr,
+        $layer_range:expr,
     ) => {{
         let regexes = if $loading_isq && $loading_uqff {
             // Dummy weights for the layers which will be overwritten...
@@ -593,6 +594,7 @@ macro_rules! normal_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                layer_range: $layer_range,
             },
             $attention_mechanism,
         )?
@@ -612,6 +614,7 @@ macro_rules! normal_model_loader_sharded {
         $attention_mechanism:expr,
         $multi_progress:expr,
         $matformer_config:expr,
+        $layer_range:expr,
     ) => {{
         $loader.load(
             &$config,
@@ -622,6 +625,7 @@ macro_rules! normal_model_loader_sharded {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                layer_range: $layer_range,
             },
             $attention_mechanism,
         )?
@@ -677,6 +681,7 @@ macro_rules! vision_normal_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                layer_range: None,
             },
             $attention_mechanism,
         )?
@@ -706,6 +711,7 @@ macro_rules! vision_normal_model_loader_sharded {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                layer_range: None,
             },
             $attention_mechanism,
         )?
@@ -760,6 +766,7 @@ macro_rules! embedding_normal_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: None,
+                layer_range: None,
             },
             $attention_mechanism,
         )?
@@ -788,6 +795,7 @@ macro_rules! embedding_normal_model_loader_sharded {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: None,
+                layer_range: None,
             },
             $attention_mechanism,
         )?
@@ -861,6 +869,7 @@ macro_rules! xlora_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                layer_range: None,
             },
             &None,
         )?
@@ -949,6 +958,7 @@ macro_rules! lora_model_loader {
                 real_device: $real_device,
                 multi_progress: $multi_progress,
                 matformer_slicing_config: $matformer_config,
+                layer_range: None,
             },
             $attention_mechanism,
         )?

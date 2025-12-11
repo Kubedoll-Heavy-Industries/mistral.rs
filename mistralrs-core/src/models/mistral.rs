@@ -20,7 +20,8 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
+        EitherCache, HookContainer, IsqModel, KvCache, NormalCache, NormalLoadingMetadata,
+        NormalModel,
     },
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
@@ -380,6 +381,13 @@ pub struct Model {
     max_seq_len: usize,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     cfg: ModelConfigMetadata,
+    /// Pipeline hook for distributed inference.
+    hook: Option<HookContainer>,
+    /// Starting layer index for partial layer loading (pipeline parallelism).
+    /// When Some, only layers [layer_start..layer_start+layers.len()) are loaded.
+    layer_start: usize,
+    /// Total number of layers in the full model (for hooks).
+    total_layers: usize,
 }
 
 impl Model {
@@ -419,6 +427,24 @@ impl Model {
         }
         let mapper = normal_loading_metadata.mapper;
 
+        // Determine layer range for partial loading (pipeline parallelism)
+        let total_layers = cfg.num_hidden_layers;
+        let layer_range = normal_loading_metadata
+            .layer_range
+            .unwrap_or(0..total_layers);
+        let layer_start = layer_range.start;
+        let layer_end = layer_range.end.min(total_layers);
+        let num_loaded_layers = layer_end - layer_start;
+
+        if layer_start > 0 || layer_end < total_layers {
+            tracing::info!(
+                "Pipeline parallelism: loading layers {}..{} of {} total",
+                layer_start,
+                layer_end,
+                total_layers
+            );
+        }
+
         let embed_tokens = embedding(
             cfg.vocab_size,
             cfg.hidden_size,
@@ -428,7 +454,8 @@ impl Model {
 
         let head_dim = cfg.head_dim();
         let mut ropes = HashMap::new();
-        for layer_idx in 0..cfg.num_hidden_layers {
+        // Only create RoPE embeddings for loaded layers
+        for layer_idx in layer_start..layer_end {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
@@ -446,8 +473,9 @@ impl Model {
         }
 
         let vb_l = vb_m.pp("layers");
+        // Only load layers in the specified range
         let layers: Vec<DecoderLayer> = NiceProgressBar::<_, 'b'>(
-            0..cfg.num_hidden_layers,
+            layer_start..layer_end,
             "Loading repeating layers",
             &normal_loading_metadata.multi_progress,
         )
@@ -469,7 +497,7 @@ impl Model {
             DecoderLayer::new(
                 rotary_emb.clone(),
                 cfg,
-                vb_l.pp(layer_idx),
+                vb_l.pp(layer_idx), // Use global layer index for weight loading
                 &*mapper,
                 layer_idx,
                 normal_loading_metadata.loading_isq,
@@ -506,15 +534,16 @@ impl Model {
             lm_head,
             sliding_window: cfg.sliding_window,
             device: normal_loading_metadata.real_device,
+            // Only allocate cache for loaded layers
             cache: EitherCache::Normal(NormalCache::new_sliding(
-                cfg.num_hidden_layers,
+                num_loaded_layers,
                 cfg.max_position_embeddings,
                 cfg.sliding_window,
             )),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
-                num_layers: cfg.num_hidden_layers,
+                num_layers: total_layers, // Report total layers for pipeline coordination
                 hidden_size: cfg.hidden_size,
                 num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
                     .max(1),
@@ -524,7 +553,20 @@ impl Model {
                 v_head_dim: cfg.head_dim(),
             },
             mapper,
+            hook: None,
+            layer_start,
+            total_layers,
         })
+    }
+
+    /// Set a pipeline hook for distributed inference.
+    pub fn set_hook(&mut self, hook: HookContainer) {
+        self.hook = Some(hook);
+    }
+
+    /// Get the current pipeline hook.
+    pub fn get_hook(&self) -> Option<&HookContainer> {
+        self.hook.as_ref()
     }
 
     pub fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -579,7 +621,17 @@ impl Model {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            xs = self.mapper.map(xs, i)?;
+            // Global layer index for hooks (accounts for partial layer loading)
+            let global_layer_idx = self.layer_start + i;
+            xs = self.mapper.map(xs, global_layer_idx)?;
+
+            // Pre-layer hook: can inject activations from previous pipeline stage
+            if let Some(ref hook) = self.hook {
+                if let Some(injected) = hook.call_layer_input(global_layer_idx, &xs, self.total_layers)? {
+                    xs = injected;
+                }
+            }
+
             xs = layer.forward(
                 &xs,
                 attention_mask
@@ -587,12 +639,19 @@ impl Model {
                     .map(|m| m.to_device(xs.device()).unwrap())
                     .as_ref(),
                 seqlen_offsets,
-                &mut cache[i],
+                &mut cache[i], // Local index for cache
                 metadata
                     .as_ref()
                     .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                 flash_params,
             )?;
+
+            // Post-layer hook: can capture/replace activations for next pipeline stage
+            if let Some(ref hook) = self.hook {
+                if let Some(replacement) = hook.call_layer_output(global_layer_idx, &xs, self.total_layers)? {
+                    xs = replacement;
+                }
+            }
         }
         let xs = xs.to_device(&self.device)?;
         let mut xs = xs.apply(&self.norm)?;
@@ -613,16 +672,18 @@ impl IsqModel for Model {
         let mut tensors = Vec::new();
         tensors.push((&mut self.lm_head, None));
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            tensors.push((&mut layer.self_attn.q_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.k_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.v_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.o_proj, Some(i)));
+            // Use global layer index for device mapping
+            let global_idx = self.layer_start + i;
+            tensors.push((&mut layer.self_attn.q_proj, Some(global_idx)));
+            tensors.push((&mut layer.self_attn.k_proj, Some(global_idx)));
+            tensors.push((&mut layer.self_attn.v_proj, Some(global_idx)));
+            tensors.push((&mut layer.self_attn.o_proj, Some(global_idx)));
             tensors.extend(
                 layer
                     .mlp
                     .get_isq_layers()
                     .into_iter()
-                    .map(|m| (m, Some(i)))
+                    .map(|m| (m, Some(global_idx)))
                     .collect::<Vec<_>>(),
             );
         }
@@ -636,8 +697,10 @@ impl IsqModel for Model {
         uvb_m.pp("embed_tokens").add(&self.embed_tokens);
         uvb_m.pp("norm").add(&self.norm);
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Use global layer index for weight naming
+            let global_idx = self.layer_start + i;
+            let uvb_l = uvb_m.pp("layers").pp(global_idx);
             uvb_l.pp("input_layernorm").add(&layer.input_layernorm);
             uvb_l
                 .pp("post_attention_layernorm")
@@ -653,13 +716,15 @@ impl IsqModel for Model {
         // lm_head
         names.push(None);
         for i in 0..self.layers.len() {
-            names.push(Some(format!("blk.{i}.attn_q.weight")));
-            names.push(Some(format!("blk.{i}.attn_k.weight")));
-            names.push(Some(format!("blk.{i}.attn_v.weight")));
-            names.push(Some(format!("blk.{i}.attn_output.weight")));
-            names.push(Some(format!("blk.{i}.ffn_gate.weight")));
-            names.push(Some(format!("blk.{i}.ffn_up.weight")));
-            names.push(Some(format!("blk.{i}.ffn_down.weight")));
+            // Use global layer index for imatrix names
+            let global_idx = self.layer_start + i;
+            names.push(Some(format!("blk.{global_idx}.attn_q.weight")));
+            names.push(Some(format!("blk.{global_idx}.attn_k.weight")));
+            names.push(Some(format!("blk.{global_idx}.attn_v.weight")));
+            names.push(Some(format!("blk.{global_idx}.attn_output.weight")));
+            names.push(Some(format!("blk.{global_idx}.ffn_gate.weight")));
+            names.push(Some(format!("blk.{global_idx}.ffn_up.weight")));
+            names.push(Some(format!("blk.{global_idx}.ffn_down.weight")));
         }
         Ok(names)
     }
@@ -715,6 +780,15 @@ impl NormalModel for Model {
     }
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
+    }
+    fn set_hook(&mut self, hook: HookContainer) {
+        self.hook = Some(hook);
+    }
+    fn get_hook(&self) -> Option<&HookContainer> {
+        self.hook.as_ref()
+    }
+    fn supports_hooks(&self) -> bool {
+        true
     }
 }
 

@@ -32,11 +32,6 @@ candle-nn = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", b
 candle-flash-attn-v3 = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
 candle-flash-attn = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
 candle-metal-kernels = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
-# candle-core = { path = "../candle/candle-core" }
-# candle-nn = { path = "../candle/candle-nn" }
-# candle-flash-attn-v3 = { path = "../candle/candle-flash-attn-v3" }
-# candle-flash-attn = { path = "../candle/candle-flash-attn" }
-# candle-metal-kernels = { path = "../candle/candle-metal-kernels" }
 
 axum = "0.8.4"
 anyhow = "1.0.98"

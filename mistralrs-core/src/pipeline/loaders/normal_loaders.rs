@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
+    ops::Range,
     str::FromStr,
     sync::Arc,
 };
@@ -15,7 +16,7 @@ use crate::{
     pipeline::{
         isq::IsqModelLoader,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel,
+        EitherCache, HookContainer, IsqModel,
     },
     utils::varbuilder_utils::DeviceForLoadTensor,
     xlora_models::NonGranularState,
@@ -70,6 +71,21 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     fn cache_mut(&mut self) -> &mut EitherCache;
     fn max_seq_len(&self) -> usize;
     fn config(&self) -> &ModelConfigMetadata;
+
+    /// Set pipeline hook for distributed inference.
+    /// Default implementation does nothing - models must override to support hooks.
+    fn set_hook(&mut self, _hook: HookContainer) {}
+
+    /// Get current pipeline hook.
+    /// Default implementation returns None - models must override to support hooks.
+    fn get_hook(&self) -> Option<&HookContainer> {
+        None
+    }
+
+    /// Check if model supports pipeline hooks for distributed inference.
+    fn supports_hooks(&self) -> bool {
+        false
+    }
 }
 
 /// Metadata for loading a model with ISQ or device mapping.
@@ -84,6 +100,10 @@ pub struct NormalLoadingMetadata {
     pub multi_progress: Arc<MultiProgress>,
     // Optional Matryoshka Transformer slicing configuration
     pub matformer_slicing_config: Option<MatformerSliceConfig>,
+    // Optional layer range for pipeline parallelism (partial layer loading).
+    // When Some, only layers within this range are loaded.
+    // The range uses global layer indices (0..num_hidden_layers).
+    pub layer_range: Option<Range<usize>>,
 }
 
 pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoader {
