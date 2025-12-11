@@ -5,6 +5,7 @@ mod diffusion;
 mod embedding;
 mod ggml;
 mod gguf;
+pub mod hooks;
 mod inputs_processor;
 mod isq;
 pub(crate) mod llg;
@@ -68,6 +69,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 pub use vision::{VisionLoader, VisionLoaderBuilder, VisionSpecificConfig};
+pub use hooks::{HookContainer, LayerActivation, NoOpHook, PipelineHook};
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, Var};
@@ -851,6 +853,15 @@ pub trait Pipeline:
     ) -> Result<(), candle_core::Error>;
 
     fn category(&self) -> ModelCategory;
+
+    /// Set pipeline hook for distributed inference.
+    /// Default implementation does nothing - override for models that support hooks.
+    fn set_hook(&mut self, _hook: HookContainer) {}
+
+    /// Check if this pipeline supports hooks for distributed inference.
+    fn supports_hooks(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) fn extract_logits(

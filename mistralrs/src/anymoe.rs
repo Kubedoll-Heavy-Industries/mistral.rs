@@ -51,6 +51,7 @@ impl AnyMoeModelBuilder {
             hf_cache_path: self.base.hf_cache_path,
             matformer_config_path: None,
             matformer_slice_name: None,
+            layer_range: None,
         };
 
         if self.base.with_logging {

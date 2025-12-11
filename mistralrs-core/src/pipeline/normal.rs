@@ -6,8 +6,8 @@ use super::{
     TokenSource,
 };
 use super::{
-    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqOrganization,
-    IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
+    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, HookContainer,
+    IsqOrganization, IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use super::{
     AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, GLM4Loader, Gemma2Loader, GemmaLoader,
@@ -134,6 +134,9 @@ pub struct NormalSpecificConfig {
     pub hf_cache_path: Option<PathBuf>,
     pub matformer_config_path: Option<PathBuf>,
     pub matformer_slice_name: Option<String>,
+    /// Optional layer range for pipeline parallelism.
+    /// When set, only layers in this range are loaded (partial layer loading).
+    pub layer_range: Option<std::ops::Range<usize>>,
 }
 
 impl NormalLoaderBuilder {
@@ -644,6 +647,7 @@ impl Loader for NormalLoader {
                     attention_mechanism,
                     multi_progress.clone(),
                     matformer_slicing_config.clone(),
+                    self.config.layer_range.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
@@ -700,6 +704,7 @@ impl Loader for NormalLoader {
                     matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
                     matformer_slicing_config.clone(),
+                    self.config.layer_range.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
@@ -1199,6 +1204,12 @@ impl Pipeline for NormalPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Text
+    }
+    fn set_hook(&mut self, hook: HookContainer) {
+        self.model.set_hook(hook);
+    }
+    fn supports_hooks(&self) -> bool {
+        self.model.supports_hooks()
     }
 }
 

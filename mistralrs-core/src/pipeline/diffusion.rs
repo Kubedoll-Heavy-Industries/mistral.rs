@@ -206,6 +206,7 @@ impl Loader for DiffusionLoader {
                         real_device: device.clone(),
                         multi_progress: Arc::new(new_multi_progress()),
                         matformer_slicing_config: None,
+                        layer_range: None,
                     },
                     attention_mechanism,
                     silent,
