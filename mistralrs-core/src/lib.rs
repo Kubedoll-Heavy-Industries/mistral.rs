@@ -92,13 +92,14 @@ pub use pipeline::{
     DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,
     EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
-    GemmaLoader, Idefics2Loader, IsqOrganization, LLaVALoader, LLaVANextLoader, LlamaLoader,
-    Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader, MixtralLoader, Modalities, ModelKind,
-    ModelPaths, MultimodalPromptPrefixer, NormalLoader, NormalLoaderBuilder, NormalLoaderType,
-    NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig,
-    SpeculativeLoader, SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
-    SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType,
-    VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
+    GemmaLoader, HookContainer, Idefics2Loader, IsqOrganization, LayerActivation, LLaVALoader,
+    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader,
+    MixtralLoader, Modalities, ModelKind, ModelPaths, MultimodalPromptPrefixer, NormalLoader,
+    NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Phi2Loader, Phi3Loader,
+    Phi3VLoader, PipelineHook, Qwen2Loader, SpeculativeConfig, SpeculativeLoader,
+    SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader, SupportedModality,
+    TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
+    UQFF_MULTI_FILE_DELIMITER,
 };
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
@@ -356,6 +357,20 @@ impl MistralRsBuilder {
     /// Configure MCP client to connect to external MCP servers.
     pub fn with_mcp_client(mut self, config: McpClientConfig) -> Self {
         self.mcp_client_config = Some(config);
+        self
+    }
+
+    /// Set a pipeline hook for distributed inference.
+    ///
+    /// The hook will intercept layer activations during forward passes,
+    /// enabling pipeline parallelism across multiple nodes.
+    pub fn with_hook(self, hook: HookContainer) -> Self {
+        // Set the hook on the pipeline immediately
+        if let Ok(mut pipeline) = self.pipeline.try_lock() {
+            pipeline.set_hook(hook);
+        } else {
+            tracing::warn!("Could not acquire pipeline lock to set hook");
+        }
         self
     }
 

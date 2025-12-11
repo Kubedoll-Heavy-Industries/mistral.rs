@@ -7,9 +7,9 @@ use candle_core::Device;
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, paged_attn_supported,
     parse_isq_value, AutoDeviceMapParams, DefaultSchedulerMethod, DeviceLayerMapMetadata,
-    DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder, McpClientConfig, MemoryGpuConfig,
-    MistralRsBuilder, ModelSelected, PagedAttentionConfig, PagedCacheType, SchedulerConfig,
-    SearchCallback, SearchEmbeddingModel, TokenSource,
+    DeviceMapMetadata, DeviceMapSetting, HookContainer, Loader, LoaderBuilder, McpClientConfig,
+    MemoryGpuConfig, MistralRsBuilder, ModelSelected, PagedAttentionConfig, PagedCacheType,
+    SchedulerConfig, SearchCallback, SearchEmbeddingModel, TokenSource,
 };
 use tracing::{info, warn};
 
@@ -229,6 +229,9 @@ pub struct MistralRsForServerBuilder {
 
     /// PagedAttention KV cache type
     paged_cache_type: PagedCacheType,
+
+    /// Pipeline hook for distributed inference
+    hook: Option<HookContainer>,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -261,6 +264,7 @@ impl Default for MistralRsForServerBuilder {
             search_callback: defaults::SEARCH_CALLBACK,
             mcp_client_config: None,
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
+            hook: None,
         }
     }
 }
@@ -563,6 +567,15 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Sets a pipeline hook for distributed inference.
+    ///
+    /// The hook will intercept layer activations during forward passes,
+    /// enabling pipeline parallelism across multiple nodes.
+    pub fn with_hook(mut self, hook: HookContainer) -> Self {
+        self.hook = Some(hook);
+        self
+    }
+
     /// Builds the configured mistral.rs instance.
     ///
     /// ### Examples
@@ -663,6 +676,11 @@ impl MistralRsForServerBuilder {
         // Add MCP client configuration if provided
         if let Some(mcp_config) = self.mcp_client_config {
             builder = builder.with_mcp_client(mcp_config);
+        }
+
+        // Add pipeline hook for distributed inference if provided
+        if let Some(hook) = self.hook {
+            builder = builder.with_hook(hook);
         }
 
         let mistralrs = builder.build().await;

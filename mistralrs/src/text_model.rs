@@ -381,6 +381,7 @@ impl TextModelBuilder {
             hf_cache_path: self.hf_cache_path,
             matformer_config_path: self.matformer_config_path,
             matformer_slice_name: self.matformer_slice_name,
+            layer_range: None,
         };
 
         if self.with_logging {
