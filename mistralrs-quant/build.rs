@@ -250,6 +250,12 @@ fn main() -> Result<(), String> {
             .arg("--compiler-options")
             .arg("-fPIC");
 
+        // Disable bf16 kernels for compute capability < 80 (pre-Ampere).
+        // bf16 WMMA and certain bf16 intrinsics are only available on sm_80+.
+        if !cc_over_800 {
+            builder = builder.arg("-DNO_BF16_KERNEL");
+        }
+
         // https://github.com/EricLBuehler/mistral.rs/issues/286
         if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
             builder = builder.arg("--compiler-options");

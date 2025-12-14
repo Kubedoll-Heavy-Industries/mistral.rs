@@ -95,17 +95,25 @@ rotary_embedding(void *query,     // [num_tokens, num_heads, head_size]
   if (is_neox_bool) {
     if (dtype == 0) {
       CALL_ROTARY(half, true);
-    } else if (dtype == 1) {
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
       CALL_ROTARY(__nv_bfloat16, true);
-    } else if (dtype == 2) {
+    }
+#endif
+    else if (dtype == 2) {
       CALL_ROTARY(float, true);
     }
   } else {
     if (dtype == 0) {
       CALL_ROTARY(half, false);
-    } else if (dtype == 1) {
+    }
+#ifndef NO_BF16_KERNEL
+    else if (dtype == 1) {
       CALL_ROTARY(__nv_bfloat16, false);
-    } else if (dtype == 2) {
+    }
+#endif
+    else if (dtype == 2) {
       CALL_ROTARY(float, false);
     }
   }
