@@ -202,7 +202,7 @@ extern "C" void dequantize_blockwise_f16_nf4(float *code, unsigned char *A,
   dequantizeBlockwise<__half, NF4>(code, A, absmax, out, blocksize, n, stream);
 }
 
-// #if __CUDA_ARCH__ >= 800
+#ifndef NO_BF16_KERNEL
 extern "C" void dequantize_blockwise_bf16_int8(float *code, unsigned char *A,
                                                float *absmax,
                                                __nv_bfloat16 *out,
@@ -225,4 +225,4 @@ extern "C" void dequantize_blockwise_bf16_nf4(float *code, unsigned char *A,
   dequantizeBlockwise<__nv_bfloat16, NF4>(code, A, absmax, out, blocksize, n,
                                           stream);
 }
-// #endif
+#endif

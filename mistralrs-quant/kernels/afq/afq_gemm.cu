@@ -468,7 +468,8 @@ DEFINE_QMV_LAUNCHER(8, 32, __half, f16)
 DEFINE_QMV_LAUNCHER(8, 64, __half, f16)
 DEFINE_QMV_LAUNCHER(8, 128, __half, f16)
 
-// BFloat16 QMV
+// BFloat16 QMV (requires sm_80+)
+#ifndef NO_BF16_KERNEL
 DEFINE_QMV_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(2, 128, __nv_bfloat16, bf16)
@@ -484,6 +485,7 @@ DEFINE_QMV_6BIT_LAUNCHER(128, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(8, 32, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(8, 64, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(8, 128, __nv_bfloat16, bf16)
+#endif
 
 // ============================================================================
 // Extern "C" Launch Functions - QMM (for larger batch sizes)
@@ -526,7 +528,8 @@ DEFINE_QMM_LAUNCHER(2, 32, __half, f16)
 DEFINE_QMM_LAUNCHER(2, 64, __half, f16)
 DEFINE_QMM_LAUNCHER(2, 128, __half, f16)
 
-// BFloat16 QMM
+// BFloat16 QMM (requires sm_80+)
+#ifndef NO_BF16_KERNEL
 DEFINE_QMM_LAUNCHER(4, 32, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(4, 64, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(4, 128, __nv_bfloat16, bf16)
@@ -536,3 +539,4 @@ DEFINE_QMM_LAUNCHER(8, 128, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(2, 128, __nv_bfloat16, bf16)
+#endif

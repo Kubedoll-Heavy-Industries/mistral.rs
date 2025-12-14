@@ -326,7 +326,8 @@ DEFINE_DEQUANT_LAUNCHER(8, 32, __half, f16)
 DEFINE_DEQUANT_LAUNCHER(8, 64, __half, f16)
 DEFINE_DEQUANT_LAUNCHER(8, 128, __half, f16)
 
-// BFloat16 versions
+// BFloat16 versions (requires sm_80+)
+#ifndef NO_BF16_KERNEL
 DEFINE_DEQUANT_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(2, 128, __nv_bfloat16, bf16)
@@ -342,6 +343,7 @@ DEFINE_DEQUANT_6BIT_LAUNCHER(128, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(8, 32, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(8, 64, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(8, 128, __nv_bfloat16, bf16)
+#endif
 
 // ============================================================================
 // Extern "C" Launch Functions - Quantize
@@ -387,7 +389,8 @@ DEFINE_QUANT_LAUNCHER(8, 32, __half, f16)
 DEFINE_QUANT_LAUNCHER(8, 64, __half, f16)
 DEFINE_QUANT_LAUNCHER(8, 128, __half, f16)
 
-// BFloat16 quantize
+// BFloat16 quantize (requires sm_80+)
+#ifndef NO_BF16_KERNEL
 DEFINE_QUANT_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(2, 128, __nv_bfloat16, bf16)
@@ -397,6 +400,7 @@ DEFINE_QUANT_LAUNCHER(4, 128, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 32, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 64, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 128, __nv_bfloat16, bf16)
+#endif
 
 // Note: 3-bit and 6-bit quantization kernels require special byte packing
 // and are more complex. For now, these are handled by the CPU fallback
