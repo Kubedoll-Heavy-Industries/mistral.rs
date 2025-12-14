@@ -27,11 +27,11 @@ license = "MIT"
 rust-version = "1.86"
 
 [workspace.dependencies]
-candle-core = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
-candle-nn = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
-candle-flash-attn-v3 = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
-candle-flash-attn = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
-candle-metal-kernels = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "feature/cagyirey/fix-metal-sdpa-kernel-selection" }
+candle-core = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "cagyirey/dev" }
+candle-nn = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "cagyirey/dev" }
+candle-flash-attn-v3 = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "cagyirey/dev" }
+candle-flash-attn = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "cagyirey/dev" }
+candle-metal-kernels = { git = "https://github.com/Kubedoll-Heavy-Industries/candle.git", branch = "cagyirey/dev" }
 
 axum = "0.8.4"
 anyhow = "1.0.98"
