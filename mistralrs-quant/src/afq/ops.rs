@@ -1066,6 +1066,9 @@ mod cuda_backend {
                 Ok((w_q, scales, biases))
             }
             DType::BF16 => {
+                if !ffi::HAVE_BF16_KERNELS {
+                    candle_core::bail!("BF16 AFQ kernels require compute capability 8.0+ (SM80+)");
+                }
                 let w_q_buf = unsafe { dev.alloc::<u32>(rows * packed_cols)? };
                 let scales_buf = unsafe { dev.alloc::<bf16>(rows * groups_per_row)? };
                 let biases_buf = unsafe { dev.alloc::<bf16>(rows * groups_per_row)? };
@@ -1528,6 +1531,9 @@ mod cuda_backend {
                 Ok(output)
             }
             DType::BF16 => {
+                if !ffi::HAVE_BF16_KERNELS {
+                    candle_core::bail!("BF16 AFQ kernels require compute capability 8.0+ (SM80+)");
+                }
                 let output_buf = unsafe { dev.alloc::<bf16>(rows * cols)? };
                 let (s_ptr, _s_guard) = crate::utils::slice_ptr(
                     s_s.as_cuda_slice::<bf16>()?,
@@ -2123,6 +2129,9 @@ mod cuda_backend {
                 Ok(output)
             }
             DType::BF16 => {
+                if !ffi::HAVE_BF16_KERNELS {
+                    candle_core::bail!("BF16 AFQ kernels require compute capability 8.0+ (SM80+)");
+                }
                 let output_buf = unsafe { dev.alloc::<bf16>(m * n)? };
                 let (x_ptr, _x_guard) = crate::utils::slice_ptr(
                     x_s.as_cuda_slice::<bf16>()?,

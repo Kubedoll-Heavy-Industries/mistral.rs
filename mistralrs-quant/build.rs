@@ -47,6 +47,7 @@ fn main() -> Result<(), String> {
         const BLOCKWISE_FP8_FFI_PATH: &str = "src/blockwise_fp8/ffi.rs";
         const SCALAR_FP8_FFI_PATH: &str = "src/scalar_fp8/ffi.rs";
         const VECTOR_FP8_FFI_PATH: &str = "src/vector_fp8/ffi.rs";
+        const AFQ_FFI_PATH: &str = "src/afq/ffi.rs";
         const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
         println!("cargo:rerun-if-changed=build.rs");
@@ -190,6 +191,21 @@ fn main() -> Result<(), String> {
             );
         }
         std::fs::write(VECTOR_FP8_FFI_PATH, vector_fp8_ffi_ct).unwrap();
+
+        // ======== AFQ bf16 kernel availability ========
+        let mut afq_ffi_ct = read_to_string(AFQ_FFI_PATH).unwrap();
+        if afq_ffi_ct.contains("pub(crate) const HAVE_BF16_KERNELS: bool = true;") {
+            afq_ffi_ct = afq_ffi_ct.replace(
+                "pub(crate) const HAVE_BF16_KERNELS: bool = true;",
+                &format!("pub(crate) const HAVE_BF16_KERNELS: bool = {cc_is_over_800};"),
+            );
+        } else {
+            afq_ffi_ct = afq_ffi_ct.replace(
+                "pub(crate) const HAVE_BF16_KERNELS: bool = false;",
+                &format!("pub(crate) const HAVE_BF16_KERNELS: bool = {cc_is_over_800};"),
+            );
+        }
+        std::fs::write(AFQ_FFI_PATH, afq_ffi_ct).unwrap();
         // ========
 
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -219,6 +235,7 @@ fn main() -> Result<(), String> {
             lib_files.push("kernels/blockwise_fp8/blockwise_fp8_gemm_dummy.cu");
             lib_files.push("kernels/scalar_fp8/scalar_fp8_dummy.cu");
             lib_files.push("kernels/vector_fp8/vector_fp8_dummy.cu");
+            lib_files.push("kernels/dummy_bf16_kernels.cu");
         }
         for lib_file in lib_files.iter() {
             println!("cargo:rerun-if-changed={lib_file}");
