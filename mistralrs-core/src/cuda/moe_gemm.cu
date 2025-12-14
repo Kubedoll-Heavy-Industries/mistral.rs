@@ -68,6 +68,23 @@ inline __device__ void zero(half2 &dst) {
   dst.y = __half_as_ushort(__float2half(0));
 }
 
+// Type-appropriate FMA and add operations
+inline __device__ half2 fma2(half2 a, half2 b, half2 c) {
+  return __hfma2(a, b, c);
+}
+inline __device__ half hadd(half2 a) {
+  return __hadd(a.x, a.y);
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+inline __device__ __nv_bfloat162 fma2(__nv_bfloat162 a, __nv_bfloat162 b, __nv_bfloat162 c) {
+  return __hfma2(a, b, c);
+}
+inline __device__ __nv_bfloat16 hadd(__nv_bfloat162 a) {
+  return __hadd(a.x, a.y);
+}
+#endif
+
 } // namespace vllm_rs
 
 /*
@@ -187,7 +204,7 @@ __global__ void moe_gemm_vectorized_kernel(
     VecT *weight_vec = reinterpret_cast<VecT *>(s_weights[tid_n]);
 #pragma unroll
     for (int k_vec = 0; k_vec < k_compute_vec_tile_size; ++k_vec) {
-      acc = __hfma2(input_vec[k_vec], weight_vec[k_vec], acc);
+      acc = vllm_rs::fma2(input_vec[k_vec], weight_vec[k_vec], acc);
     }
   }
 
@@ -197,11 +214,11 @@ __global__ void moe_gemm_vectorized_kernel(
   if (topk_weights) {
     // Apply top-k weight scaling
     T output_val;
-    vllm::from_float(output_val, vllm::to_float(__hadd(acc.x, acc.y)) *
+    vllm::from_float(output_val, vllm::to_float(vllm_rs::hadd(acc)) *
                                      topk_weights[token_id]);
     output[token_id * N + n] = output_val;
   } else {
-    output[token_id * N + n] = __hadd(acc.x, acc.y);
+    output[token_id * N + n] = vllm_rs::hadd(acc);
   }
 }
 
@@ -325,7 +342,7 @@ __global__ void moe_gemm_transposed_kernel(
     VecT *weight_vec = reinterpret_cast<VecT *>(s_weights[tid_n]);
 #pragma unroll
     for (int k_vec = 0; k_vec < k_compute_vec_tile_size; ++k_vec) {
-      acc = __hfma2(input_vec[k_vec], weight_vec[k_vec], acc);
+      acc = vllm_rs::fma2(input_vec[k_vec], weight_vec[k_vec], acc);
     }
   }
 
@@ -335,11 +352,11 @@ __global__ void moe_gemm_transposed_kernel(
   if (topk_weights) {
     // Apply top-k weight scaling
     T output_val;
-    vllm::from_float(output_val, vllm::to_float(__hadd(acc.x, acc.y)) *
+    vllm::from_float(output_val, vllm::to_float(vllm_rs::hadd(acc)) *
                                      topk_weights[token_id]);
     output[token_id * N + n] = output_val;
   } else {
-    output[token_id * N + n] = __hadd(acc.x, acc.y);
+    output[token_id * N + n] = vllm_rs::hadd(acc);
   }
 }
 
