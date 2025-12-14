@@ -1,9 +1,9 @@
 use float8::F8E4M3;
 use half::{bf16, f16};
 
-pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = true;
-pub(crate) const HAVE_BLOCKWISE_QUANT_KERNELS: bool = true;
-pub(crate) const HAVE_BLOCKWISE_GEMM_KERNELS: bool = true;
+pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = false;
+pub(crate) const HAVE_BLOCKWISE_QUANT_KERNELS: bool = false;
+pub(crate) const HAVE_BLOCKWISE_GEMM_KERNELS: bool = false;
 
 extern "C" {
     pub(crate) fn launch_dequant_fp8_blockwise_kernel_f32(
