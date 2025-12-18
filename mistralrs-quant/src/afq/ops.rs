@@ -36,7 +36,7 @@ pub(crate) fn afq_quantize_op(
     }
 
     #[cfg(feature = "metal")]
-    {
+    if w.device().is_metal() {
         let w_s = w.storage_and_layout().0;
         let Storage::Metal(w_s) = &*w_s else {
             candle_core::bail!("expected metal")
@@ -131,7 +131,7 @@ pub(crate) fn afq_dequantize_op(
     }
 
     #[cfg(feature = "metal")]
-    {
+    if w_q.device().is_metal() {
         let wq_s = w_q.storage_and_layout().0;
         let Storage::Metal(wq_s) = &*wq_s else {
             candle_core::bail!("expected metal")
@@ -281,7 +281,7 @@ pub(crate) fn afq_mm_op(
     };
 
     #[cfg(feature = "metal")]
-    {
+    if x.device().is_metal() {
         let x_s = x.storage_and_layout().0;
         let Storage::Metal(x_s) = &*x_s else {
             candle_core::bail!("expected metal")
