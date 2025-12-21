@@ -1,5 +1,5 @@
 use candle_core::{DType, Device, Result, Tensor};
-use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache};
+use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache, USE_FP8};
 
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -25,10 +25,23 @@ impl PagedAttention {
         } else {
             None
         };
+
+        // Only initialize FP8 KV cache scales when FP8 is supported.
+        // Having these as Some when FP8 isn't supported triggers an error in
+        // the paged attention kernel.
+        let (k_scale, v_scale) = if USE_FP8 {
+            (
+                Some(Tensor::new(1f32, device)?),
+                Some(Tensor::new(1f32, device)?),
+            )
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             alibi_slopes,
-            k_scale: Some(Tensor::new(1f32, device)?),
-            v_scale: Some(Tensor::new(1f32, device)?),
+            k_scale,
+            v_scale,
             kv_updated_times: AtomicI32::new(0),
         })
     }
