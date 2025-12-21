@@ -25,6 +25,9 @@ pub struct LoaderBuilder {
     no_kv_cache: bool,
     chat_template: Option<String>,
     jinja_explicit: Option<String>,
+    /// Optional layer range for pipeline parallelism.
+    /// When set, only layers in this range are loaded (partial layer loading).
+    layer_range: Option<std::ops::Range<usize>>,
 }
 
 impl LoaderBuilder {
@@ -34,6 +37,7 @@ impl LoaderBuilder {
             no_kv_cache: false,
             chat_template: None,
             jinja_explicit: None,
+            layer_range: None,
         }
     }
 
@@ -47,6 +51,21 @@ impl LoaderBuilder {
     }
     pub fn with_jinja_explicit(mut self, jinja_explicit: Option<String>) -> Self {
         self.jinja_explicit = jinja_explicit;
+        self
+    }
+
+    /// Set the layer range for pipeline parallelism.
+    ///
+    /// When set, only layers in this range are loaded into memory,
+    /// enabling distributed inference across multiple nodes.
+    pub fn with_layer_range(mut self, layer_range: std::ops::Range<usize>) -> Self {
+        self.layer_range = Some(layer_range);
+        self
+    }
+
+    /// Optionally set the layer range for pipeline parallelism.
+    pub fn with_layer_range_optional(mut self, layer_range: Option<std::ops::Range<usize>>) -> Self {
+        self.layer_range = layer_range;
         self
     }
 
@@ -264,7 +283,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 hf_cache_path,
                 matformer_config_path,
                 matformer_slice_name,
-                layer_range: None,
+                layer_range: args.layer_range.clone(),
             },
             args.chat_template,
             tokenizer_json,
@@ -308,7 +327,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                     hf_cache_path: hf_cache_path.clone(),
                     matformer_config_path: matformer_config_path.clone(),
                     matformer_slice_name: matformer_slice_name.clone(),
-                    layer_range: None,
+                    layer_range: args.layer_range.clone(),
                 },
                 VisionSpecificConfig {
                     topology: Topology::from_option_path(topology.clone())?,
@@ -437,7 +456,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 hf_cache_path,
                 matformer_config_path: None,
                 matformer_slice_name: None,
-                layer_range: None,
+                layer_range: args.layer_range.clone(),
             },
             args.chat_template,
             tokenizer_json,
@@ -483,7 +502,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 hf_cache_path,
                 matformer_config_path: None,
                 matformer_slice_name: None,
-                layer_range: None,
+                layer_range: args.layer_range.clone(),
             },
             args.chat_template,
             tokenizer_json,
