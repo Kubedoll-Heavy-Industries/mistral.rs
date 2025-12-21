@@ -232,6 +232,10 @@ pub struct MistralRsForServerBuilder {
 
     /// Pipeline hook for distributed inference
     hook: Option<HookContainer>,
+
+    /// Optional layer range for pipeline parallelism.
+    /// When set, only layers in this range are loaded (partial layer loading).
+    layer_range: Option<std::ops::Range<usize>>,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -265,6 +269,7 @@ impl Default for MistralRsForServerBuilder {
             mcp_client_config: None,
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
             hook: None,
+            layer_range: None,
         }
     }
 }
@@ -576,6 +581,22 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Sets the layer range for pipeline parallelism.
+    ///
+    /// When set, only layers in this range are loaded into memory,
+    /// enabling distributed inference across multiple nodes where
+    /// each node loads a subset of layers.
+    pub fn with_layer_range(mut self, layer_range: std::ops::Range<usize>) -> Self {
+        self.layer_range = Some(layer_range);
+        self
+    }
+
+    /// Optionally sets the layer range for pipeline parallelism.
+    pub fn with_layer_range_optional(mut self, layer_range: Option<std::ops::Range<usize>>) -> Self {
+        self.layer_range = layer_range;
+        self
+    }
+
     /// Builds the configured mistral.rs instance.
     ///
     /// ### Examples
@@ -637,6 +658,7 @@ impl MistralRsForServerBuilder {
             .with_no_kv_cache(self.no_kv_cache)
             .with_chat_template(self.chat_template)
             .with_jinja_explicit(self.jinja_explicit)
+            .with_layer_range_optional(self.layer_range.clone())
             .build()?;
 
         mistralrs_instance_info(&*loader);
@@ -729,6 +751,7 @@ impl MistralRsForServerBuilder {
                     .clone()
                     .or(self.jinja_explicit.clone()),
             )
+            .with_layer_range_optional(self.layer_range.clone())
             .build()?;
 
         mistralrs_instance_info(&*loader);
@@ -824,6 +847,7 @@ impl MistralRsForServerBuilder {
                         .clone()
                         .or(self.jinja_explicit.clone()),
                 )
+                .with_layer_range_optional(self.layer_range.clone())
                 .build()?;
 
             let mapper = init_mapper(
