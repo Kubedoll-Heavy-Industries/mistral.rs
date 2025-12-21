@@ -1,3 +1,6 @@
+// Metal (Apple Silicon) always supports FP8 KV cache
+pub const USE_FP8: bool = true;
+
 mod backend;
 mod kernels;
 
