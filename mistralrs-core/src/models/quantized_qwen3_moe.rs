@@ -311,6 +311,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         mapper: Box<dyn DeviceMapper + Send + Sync>,
         attention_mechanism: AttentionImplementation,
         dtype: DType,
+        _layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self> {
         // Parameter extraction from metadata.
         let meta = ct.get_metadata();

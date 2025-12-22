@@ -234,6 +234,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         mapper: Box<dyn DeviceMapper + Send + Sync>,
         attention_mechanism: AttentionImplementation,
         dtype: DType,
+        layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self> {
         // Parameter extraction from metadata.
         let meta = ct.get_metadata();
@@ -255,6 +256,23 @@ impl ModelConfig::FromGGUF for ModelWeights {
             value_length,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
+        // Determine layer range for partial loading (pipeline parallelism)
+        let layer_start = layer_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let layer_end = layer_range
+            .as_ref()
+            .map(|r| r.end.min(block_count))
+            .unwrap_or(block_count);
+        let num_loaded_layers = layer_end - layer_start;
+
+        if layer_start > 0 || layer_end < block_count {
+            tracing::info!(
+                "Pipeline parallelism: loading layers {}..{} of {} total",
+                layer_start,
+                layer_end,
+                block_count
+            );
+        }
+
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
         let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
@@ -263,7 +281,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         } else {
             ct.tensor("output.weight", device)?
         };
-        let mut layers = Vec::with_capacity(block_count);
+        let mut layers = Vec::with_capacity(num_loaded_layers);
 
         let head_dim = key_length;
         if key_length != value_length {
@@ -272,8 +290,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             );
         }
 
+        // Only create RoPE embeddings for loaded layers
         let mut ropes = HashMap::new();
-        for layer_idx in 0..block_count {
+        for layer_idx in layer_start..layer_end {
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
             ropes.insert(
                 device.location(),
@@ -288,8 +307,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             );
         }
 
+        // Only load layers in the specified range
         for layer_idx in NiceProgressBar::<_, 'b'>(
-            0..block_count,
+            layer_start..layer_end,
             "Loading repeating layers",
             &new_multi_progress(),
         ) {
@@ -386,7 +406,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 b: None,
             })?),
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(block_count, max_seq_len)),
+            // Only allocate cache for loaded layers
+            cache: EitherCache::Normal(NormalCache::new(num_loaded_layers, max_seq_len)),
             max_seq_len,
             mapper: Some(mapper),
             dtype,

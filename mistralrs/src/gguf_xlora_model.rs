@@ -32,6 +32,7 @@ impl GgufXLoraModelBuilder {
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = GGUFSpecificConfig {
             topology: self.gguf_model.topology,
+            layer_range: None,
         };
 
         if self.gguf_model.with_logging {
