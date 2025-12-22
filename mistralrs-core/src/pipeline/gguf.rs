@@ -106,6 +106,9 @@ pub struct GGUFLoader {
 /// Config for a GGUF loader.
 pub struct GGUFSpecificConfig {
     pub topology: Option<Topology>,
+    /// Layer range for pipeline parallelism.
+    /// Only loads layers in this range, enabling distributed inference.
+    pub layer_range: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Default)]
@@ -430,6 +433,7 @@ impl Loader for GGUFLoader {
                     AttentionImplementation::Eager
                 },
                 internal_dtype,
+                self.config.layer_range.clone(),  // Pipeline parallelism layer range
             );
 
             // With optional adapter config:
