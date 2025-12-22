@@ -111,6 +111,7 @@ pub struct ParamsGGUF<'a, R: std::io::Seek + std::io::Read>(
     pub Device<'a>,
     pub AttentionImplementation,
     pub DType,
+    pub Option<std::ops::Range<usize>>,  // layer_range for pipeline parallelism
 );
 
 // A `None` type vs the `Some` type (`Adapter<'a>`)
@@ -179,6 +180,7 @@ pub trait FromGGUF {
         mapper: Box<dyn DeviceMapper + Send + Sync>,
         attention_mechanism: AttentionImplementation,
         dtype: DType,
+        layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self, candle_core::Error>
     where
         Self: Sized;
@@ -258,17 +260,17 @@ impl Config<ParamsGGML, Adapter<'_>> {
 impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, NoAdapter> {
     pub fn try_into_model<T: FromGGUF>(self) -> Result<T, candle_core::Error> {
         // Destructure props:
-        let ParamsGGUF(ct, Device { device, mapper }, attention_implementation, dtype) = self.quant;
+        let ParamsGGUF(ct, Device { device, mapper }, attention_implementation, dtype, layer_range) = self.quant;
 
         // Forwards all structured fields above into the required flattened param sequence:
-        T::from_gguf(ct, device, mapper, attention_implementation, dtype)
+        T::from_gguf(ct, device, mapper, attention_implementation, dtype, layer_range)
     }
 }
 
 impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, Adapter<'_>> {
     pub fn try_into_model<T: FromAdapterGGUF>(self) -> Result<T, candle_core::Error> {
         // Destructure props:
-        let ParamsGGUF(ct, Device { device, mapper }, _attention_implementation, dtype) =
+        let ParamsGGUF(ct, Device { device, mapper }, _attention_implementation, dtype, _layer_range) =
             self.quant;
 
         let Adapter {
