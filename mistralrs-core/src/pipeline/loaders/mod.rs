@@ -1,10 +1,9 @@
-pub(crate) mod auto_device_map;
+pub mod auto_device_map;
 mod diffusion_loaders;
 mod embedding_loaders;
 mod normal_loaders;
 mod vision_loaders;
-pub use auto_device_map::AutoDeviceMapParams;
-use auto_device_map::NonMappedSubModel;
+pub use auto_device_map::{AutoDeviceMapParams, NonMappedSubModel};
 
 use std::{
     fmt::{self, Debug},
