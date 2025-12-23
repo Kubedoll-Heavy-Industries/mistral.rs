@@ -16,7 +16,7 @@ const GPU_RESERVE_FRACTION: f64 = 0.02;
 const GPU_MIN_RESERVE_BYTES: usize = 512 * 1024 * 1024; // 512MB safety buffer
 
 #[derive(Clone, Debug)]
-pub(crate) enum NonMappedSubModel {
+pub enum NonMappedSubModel {
     Vision,
     Audio,
 }
