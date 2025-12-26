@@ -246,6 +246,44 @@ pub trait AnyMoePipelineMixin {
     }
 }
 
+/// Serializable model category for configuration and gossip protocols.
+///
+/// Unlike [`ModelCategory`], this enum contains no associated data and can be
+/// safely serialized/deserialized. Use [`ModelCategory::kind()`] to convert
+/// a runtime `ModelCategory` to this type.
+///
+/// Maps to LiteLLM `mode` field via [`ModelCategoryKind::to_litellm_mode()`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelCategoryKind {
+    /// Text/chat model (LiteLLM mode: "chat")
+    #[default]
+    Text,
+    /// Vision model (LiteLLM mode: "chat" with vision capability)
+    Vision,
+    /// Diffusion/image generation model (LiteLLM mode: "image")
+    Diffusion,
+    /// Audio transcription model (LiteLLM mode: "chat")
+    Audio,
+    /// Speech synthesis model (LiteLLM mode: "chat")
+    Speech,
+    /// Embedding model (LiteLLM mode: "embedding")
+    Embedding,
+}
+
+impl ModelCategoryKind {
+    /// Convert to LiteLLM mode string for gateway registration.
+    pub fn to_litellm_mode(&self) -> &'static str {
+        match self {
+            Self::Text | Self::Vision | Self::Audio | Self::Speech => "chat",
+            Self::Embedding => "embedding",
+            Self::Diffusion => "image",
+        }
+    }
+}
+
 /// Category of the model. This can also be used to extract model-category specific tools,
 /// such as the vision model prompt prefixer.
 #[derive(Clone)]
@@ -291,6 +329,23 @@ impl PartialEq for ModelCategory {
                 | Self::Embedding,
                 _,
             ) => false,
+        }
+    }
+}
+
+impl ModelCategory {
+    /// Get the serializable [`ModelCategoryKind`] for this category.
+    ///
+    /// Use this when you need to serialize the model category for configuration,
+    /// gossip protocols, or gateway registration.
+    pub fn kind(&self) -> ModelCategoryKind {
+        match self {
+            Self::Text => ModelCategoryKind::Text,
+            Self::Vision { .. } => ModelCategoryKind::Vision,
+            Self::Diffusion => ModelCategoryKind::Diffusion,
+            Self::Audio => ModelCategoryKind::Audio,
+            Self::Speech => ModelCategoryKind::Speech,
+            Self::Embedding => ModelCategoryKind::Embedding,
         }
     }
 }
