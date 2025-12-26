@@ -1,9 +1,9 @@
 use candle_core::{IndexOp, Result, Tensor, D};
 use candle_nn::Module;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Pooling layer
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Pooling {
     pub word_embedding_dimension: usize,
     pub pooling_mode_cls_token: bool,
@@ -53,7 +53,7 @@ impl Module for Pooling {
 }
 
 /// Normalize layer
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Normalize;
 
 impl Module for Normalize {
@@ -64,14 +64,14 @@ impl Module for Normalize {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub enum DenseActivation {
     #[serde(alias = "torch.nn.modules.linear.Identity")]
     Identity,
 }
 
 /// Dense layer
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct Dense {
     pub in_features: usize,
     pub out_features: usize,

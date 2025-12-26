@@ -7,7 +7,7 @@ pub use engine::{
 };
 use hf_hub::Cache;
 pub use lora::Ordering;
-pub use pipeline::ModelCategory;
+pub use pipeline::{ModelCategory, ModelCategoryKind};
 pub use pipeline::Pipeline;
 #[cfg(feature = "pyo3_macros")]
 use pyo3::exceptions::PyValueError;
@@ -39,6 +39,7 @@ pub use model_loader::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
 };
 mod embedding_models;
+pub use embedding_models::{Dense, DenseActivation, Normalize, Pooling};
 mod kv_cache;
 mod search;
 
