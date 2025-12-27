@@ -131,7 +131,7 @@ impl PagedAttention {
 
         let (k_scale_ptr, v_scale_ptr) =
             if let (Some(k_scale), Some(v_scale)) = (&self.k_scale, &self.v_scale) {
-                if !crate::cuda::USE_FP8 {
+                if !crate::cuda::fp8_supported_on_device(dev) {
                     candle::bail!("FP8 is not supported on this system.");
                 }
 

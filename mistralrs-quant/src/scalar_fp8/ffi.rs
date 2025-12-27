@@ -3,7 +3,7 @@
 use float8::F8E4M3;
 use half::{bf16, f16};
 
-pub(crate) const HAVE_SCALAR_FP8_KERNELS: bool = true;
+pub(crate) const HAVE_SCALAR_FP8_KERNELS: bool = cfg!(mistralrs_quant_build_has_scalar_fp8);
 
 extern "C" {
     pub(crate) fn launch_fp8_to_f32_kernel(
