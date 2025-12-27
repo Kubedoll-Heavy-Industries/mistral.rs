@@ -131,7 +131,7 @@ impl PagedAttention {
 
         let (k_scale_ptr, v_scale_ptr) =
             if let (Some(k_scale), Some(v_scale)) = (&self.k_scale, &self.v_scale) {
-                if !crate::cuda::fp8_supported_on_device(dev) {
+                if !(cfg!(mistralrs_build_has_fp8) && crate::cuda::fp8_supported_on_device(dev)) {
                     candle::bail!("FP8 is not supported on this system.");
                 }
 
@@ -468,7 +468,7 @@ fn update_cache<
 
     // For FP8 cache, we need to get as u8 slices instead
     let ((kc_ptr, _kc_guard), (vc_ptr, _vc_guard)) = if cache_dtype == 3 {
-        if !crate::cuda::USE_FP8 {
+        if !(cfg!(mistralrs_build_has_fp8) && crate::cuda::fp8_supported_on_device(dev)) {
             candle::bail!("FP8 is not supported on this system.");
         }
 
@@ -493,7 +493,7 @@ fn update_cache<
     let s = s.slice(s_l.start_offset()..);
 
     let (k_scale_ptr, v_scale_ptr) = if let (Some(k_scale), Some(v_scale)) = (k_scale, v_scale) {
-        if !crate::cuda::USE_FP8 {
+        if !(cfg!(mistralrs_build_has_fp8) && crate::cuda::fp8_supported_on_device(dev)) {
             candle::bail!("FP8 is not supported on this system.");
         }
 
