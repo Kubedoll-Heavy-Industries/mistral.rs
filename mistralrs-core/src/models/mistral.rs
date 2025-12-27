@@ -28,6 +28,22 @@ use crate::{
 };
 
 serde_default_fn!(bool, tie_word_embeddings, false);
+serde_default_fn!(f64, default_rope_theta, 10000.0);
+
+/// Nested RoPE parameters (used by Ministral-3 and other newer models).
+/// Supports both standard and YaRN scaling configurations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RopeParameters {
+    pub rope_theta: Option<f64>,
+    pub rope_type: Option<String>,
+    // YaRN scaling parameters
+    pub factor: Option<f64>,
+    pub beta_fast: Option<f64>,
+    pub beta_slow: Option<f64>,
+    pub mscale: Option<f64>,
+    pub mscale_all_dim: Option<f64>,
+    pub original_max_position_embeddings: Option<usize>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -40,7 +56,10 @@ pub struct Config {
     pub(crate) hidden_act: Activation,
     pub(crate) max_position_embeddings: usize,
     pub(crate) rms_norm_eps: f64,
+    // Support both top-level rope_theta and nested rope_parameters.rope_theta
+    #[serde(default = "default_rope_theta")]
     pub(crate) rope_theta: f64,
+    pub(crate) rope_parameters: Option<RopeParameters>,
     pub(crate) sliding_window: Option<usize>,
     pub(crate) head_dim: Option<usize>,
     pub(crate) quantization_config: Option<QuantizedConfig>,
@@ -52,6 +71,14 @@ impl Config {
     pub(crate) fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Get effective rope_theta, preferring nested rope_parameters if present
+    pub(crate) fn rope_theta(&self) -> f64 {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|p| p.rope_theta)
+            .unwrap_or(self.rope_theta)
     }
 }
 
@@ -423,7 +450,7 @@ impl Model {
             ropes.insert(
                 device.location(),
                 Arc::new(RotaryEmbedding::new(
-                    cfg.rope_theta as f32,
+                    cfg.rope_theta() as f32,
                     head_dim,
                     cfg.max_position_embeddings,
                     device,
