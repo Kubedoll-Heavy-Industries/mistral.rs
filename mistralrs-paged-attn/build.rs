@@ -5,20 +5,11 @@ const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 fn main() -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::prelude::*;
     use std::path::PathBuf;
     use std::process::Command;
 
-    const OTHER_CONTENT: &str = r#"
-mod backend;
-mod ffi;
-
-pub use backend::{copy_blocks, kv_scale_update, paged_attention, reshape_and_cache, swap_blocks};
-pub use backend::fp8_supported_on_device;
-    "#;
-
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/cuda/mod.rs");
     println!("cargo:rerun-if-changed=src/cuda/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/cuda/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_kernel.cu");
@@ -109,15 +100,6 @@ pub use backend::fp8_supported_on_device;
     println!("cargo:rustc-link-lib=mistralrspagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open("src/cuda/mod.rs")
-        .unwrap();
-
-    // Add the other stuff back
-    if let Err(e) = writeln!(file, "{}", OTHER_CONTENT.trim()) {
-        anyhow::bail!("Error while building dependencies: {:?}\n", e)
-    }
     Ok(())
 }
 
