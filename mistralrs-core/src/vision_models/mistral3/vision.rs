@@ -33,6 +33,15 @@ fn default_num_attention_heads() -> usize {
     16
 }
 
+fn default_rope_theta() -> f64 {
+    10000.0
+}
+
+#[derive(serde::Deserialize, Debug, Clone)]
+struct RopeParameters {
+    rope_theta: f64,
+}
+
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Mistral3VisionConfig {
     #[serde(default = "default_hidden_size")]
@@ -41,7 +50,10 @@ pub struct Mistral3VisionConfig {
     pub num_channels: usize,
     pub image_size: usize,
     pub patch_size: usize,
-    pub rope_theta: f64,
+    // Support both top-level rope_theta and nested rope_parameters.rope_theta
+    #[serde(default = "default_rope_theta")]
+    rope_theta: f64,
+    rope_parameters: Option<RopeParameters>,
     #[serde(default = "default_intermediate_size")]
     pub intermediate_size: usize,
     #[serde(default = "default_num_hidden_layers")]
@@ -57,6 +69,14 @@ impl Mistral3VisionConfig {
     fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    pub fn rope_theta(&self) -> f64 {
+        // Prefer nested rope_parameters.rope_theta if present, fall back to top-level
+        self.rope_parameters
+            .as_ref()
+            .map(|p| p.rope_theta)
+            .unwrap_or(self.rope_theta)
     }
 }
 
@@ -264,7 +284,7 @@ impl RotaryEmbedding {
         let dtype = vb.dtype();
         let dev = vb.device();
         let dim = cfg.head_dim();
-        let rope_theta = cfg.rope_theta as f32;
+        let rope_theta = cfg.rope_theta() as f32;
         let max_patches_per_side = cfg.image_size / cfg.patch_size;
         let freqs: Vec<_> = (0..dim)
             .step_by(2)
