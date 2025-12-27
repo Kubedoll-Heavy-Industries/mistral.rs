@@ -12,6 +12,34 @@ use tracing::{info, warn};
 
 use super::DeviceMappedModelLoader;
 
+/// Estimate KV cache bytes for placement planning (no paged attention).
+/// Uses the same formula as `get_device_layers()` when paged attention is disabled.
+///
+/// This is useful for placement decisions before devices are available,
+/// where the full `get_device_layers()` function cannot be called.
+///
+/// # Arguments
+/// * `model_cfg` - Model configuration providing KV head dimensions and layer count
+/// * `max_seq_len` - Maximum sequence length to estimate for
+/// * `max_batch_size` - Maximum batch size to estimate for
+/// * `dtype` - Data type for KV cache elements
+///
+/// # Returns
+/// Total KV cache size in bytes across all layers
+pub fn estimate_kv_cache_bytes(
+    model_cfg: &dyn ModelConfigLike,
+    max_seq_len: usize,
+    max_batch_size: usize,
+    dtype: DType,
+) -> usize {
+    let key_elems =
+        max_batch_size * model_cfg.num_kv_heads() * max_seq_len * model_cfg.k_head_dim();
+    let val_elems =
+        max_batch_size * model_cfg.num_kv_heads() * max_seq_len * model_cfg.v_head_dim();
+    let kv_per_layer = (key_elems + val_elems) * dtype.size_in_bytes();
+    kv_per_layer * model_cfg.num_layers()
+}
+
 const GPU_RESERVE_FRACTION: f64 = 0.02;
 const GPU_MIN_RESERVE_BYTES: usize = 512 * 1024 * 1024; // 512MB safety buffer
 
