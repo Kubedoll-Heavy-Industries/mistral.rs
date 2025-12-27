@@ -83,130 +83,19 @@ fn main() -> Result<(), String> {
 
         // ======== Handle optional marlin kernel compilation
         let cc_over_800 = compute_cap >= 800;
-        let cc_is_over_800 = match cc_over_800 {
-            true => "true",
-            false => "false",
-        };
 
-        let mut marlin_ffi_ct = read_to_string(MARLIN_FFI_PATH).unwrap();
-        if marlin_ffi_ct.contains("pub(crate) const HAVE_MARLIN_KERNELS: bool = true;") {
-            marlin_ffi_ct = marlin_ffi_ct.replace(
-                "pub(crate) const HAVE_MARLIN_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_MARLIN_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            marlin_ffi_ct = marlin_ffi_ct.replace(
-                "pub(crate) const HAVE_MARLIN_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_MARLIN_KERNELS: bool = {cc_is_over_800};"),
-            );
+        // Emit cfg flags instead of mutating tracked Rust sources.
+        // These cfgs represent what kernels were compiled for *this build*.
+        if cc_over_800 {
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_marlin");
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_blockwise_fp8_dequant");
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_blockwise_fp8_quant");
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_blockwise_fp8_gemm");
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_scalar_fp8");
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_vector_fp8_dequant");
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_vector_fp8_quant");
+            println!("cargo:rustc-cfg=mistralrs_quant_build_has_afq_bf16");
         }
-        std::fs::write(MARLIN_FFI_PATH, marlin_ffi_ct).unwrap();
-
-        let mut blockwise_fp8_ffi_ct = read_to_string(BLOCKWISE_FP8_FFI_PATH).unwrap();
-        if blockwise_fp8_ffi_ct
-            .contains("pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = true;")
-        {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = true;",
-                &format!(
-                    "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = {cc_is_over_800};"
-                ),
-            );
-        } else {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = false;",
-                &format!(
-                    "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = {cc_is_over_800};"
-                ),
-            );
-        }
-
-        if blockwise_fp8_ffi_ct
-            .contains("pub(crate) const HAVE_BLOCKWISE_QUANT_KERNELS: bool = true;")
-        {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_QUANT_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_BLOCKWISE_QUANT_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_QUANT_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_BLOCKWISE_QUANT_KERNELS: bool = {cc_is_over_800};"),
-            );
-        }
-
-        if blockwise_fp8_ffi_ct
-            .contains("pub(crate) const HAVE_BLOCKWISE_GEMM_KERNELS: bool = true;")
-        {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_GEMM_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_BLOCKWISE_GEMM_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_GEMM_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_BLOCKWISE_GEMM_KERNELS: bool = {cc_is_over_800};"),
-            );
-        }
-
-        std::fs::write(BLOCKWISE_FP8_FFI_PATH, blockwise_fp8_ffi_ct).unwrap();
-
-        let mut scalar_fp8_ffi_ct = read_to_string(SCALAR_FP8_FFI_PATH).unwrap();
-        if scalar_fp8_ffi_ct.contains("pub(crate) const HAVE_SCALAR_FP8_KERNELS: bool = true;") {
-            scalar_fp8_ffi_ct = scalar_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_SCALAR_FP8_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_SCALAR_FP8_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            scalar_fp8_ffi_ct = scalar_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_SCALAR_FP8_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_SCALAR_FP8_KERNELS: bool = {cc_is_over_800};"),
-            );
-        }
-        std::fs::write(SCALAR_FP8_FFI_PATH, scalar_fp8_ffi_ct).unwrap();
-
-        let mut vector_fp8_ffi_ct = read_to_string(VECTOR_FP8_FFI_PATH).unwrap();
-        if vector_fp8_ffi_ct.contains("pub(crate) const HAVE_VECTOR_DEQUANT_KERNELS: bool = true;")
-        {
-            vector_fp8_ffi_ct = vector_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_VECTOR_DEQUANT_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_VECTOR_DEQUANT_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            vector_fp8_ffi_ct = vector_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_VECTOR_DEQUANT_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_VECTOR_DEQUANT_KERNELS: bool = {cc_is_over_800};"),
-            );
-        }
-
-        if vector_fp8_ffi_ct.contains("pub(crate) const HAVE_VECTOR_QUANT_KERNELS: bool = true;") {
-            vector_fp8_ffi_ct = vector_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_VECTOR_QUANT_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_VECTOR_QUANT_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            vector_fp8_ffi_ct = vector_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_VECTOR_QUANT_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_VECTOR_QUANT_KERNELS: bool = {cc_is_over_800};"),
-            );
-        }
-        std::fs::write(VECTOR_FP8_FFI_PATH, vector_fp8_ffi_ct).unwrap();
-
-        // ======== AFQ bf16 kernel availability ========
-        let mut afq_ffi_ct = read_to_string(AFQ_FFI_PATH).unwrap();
-        if afq_ffi_ct.contains("pub(crate) const HAVE_BF16_KERNELS: bool = true;") {
-            afq_ffi_ct = afq_ffi_ct.replace(
-                "pub(crate) const HAVE_BF16_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_BF16_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            afq_ffi_ct = afq_ffi_ct.replace(
-                "pub(crate) const HAVE_BF16_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_BF16_KERNELS: bool = {cc_is_over_800};"),
-            );
-        }
-        std::fs::write(AFQ_FFI_PATH, afq_ffi_ct).unwrap();
-        // ========
 
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
         let mut lib_files = vec![

@@ -11,12 +11,11 @@ fn main() -> Result<()> {
     use std::process::Command;
 
     const OTHER_CONTENT: &str = r#"
-pub const USE_FP8: bool = false;
-
 mod backend;
 mod ffi;
 
 pub use backend::{copy_blocks, kv_scale_update, paged_attention, reshape_and_cache, swap_blocks};
+pub use backend::fp8_supported_on_device;
     "#;
 
     println!("cargo:rerun-if-changed=build.rs");
@@ -24,38 +23,44 @@ pub use backend::{copy_blocks, kv_scale_update, paged_attention, reshape_and_cac
     println!("cargo:rerun-if-changed=src/cuda/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/update_kvscales.cu");
-    // Detect CUDA compute capability for FP8 support
-    let compute_cap = {
-        if let Ok(var) = std::env::var("CUDA_COMPUTE_CAP") {
-            var.parse::<usize>().unwrap() * 10
-        } else {
-            let mut cmd = Command::new("nvidia-smi");
-            match cmd
-                .args(["--query-gpu=compute_cap", "--format=csv"])
-                .output()
-            {
-                Ok(out) => {
-                    let output =
-                        String::from_utf8(out.stdout).expect("Output of nvidia-smi was not utf8.");
-                    (output
-                        .split('\n')
-                        .nth(1)
-                        .unwrap()
-                        .trim()
-                        .parse::<f32>()
-                        .unwrap()
-                        * 100.) as usize
+
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+    println!("cargo:rerun-if-env-changed=MISTRALRS_FORCE_FP8");
+
+    let build_has_fp8 = match std::env::var("MISTRALRS_FORCE_FP8").ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") | Some("True") => true,
+        Some("0") | Some("false") | Some("FALSE") | Some("False") => false,
+        _ => {
+            let compute_cap = if let Ok(var) = std::env::var("CUDA_COMPUTE_CAP") {
+                var.parse::<usize>().unwrap() * 10
+            } else {
+                let mut cmd = Command::new("nvidia-smi");
+                match cmd
+                    .args(["--query-gpu=compute_cap", "--format=csv"])
+                    .output()
+                {
+                    Ok(out) => {
+                        let output = String::from_utf8(out.stdout)
+                            .expect("Output of nvidia-smi was not utf8.");
+                        (output
+                            .split('\n')
+                            .nth(1)
+                            .unwrap()
+                            .trim()
+                            .parse::<f32>()
+                            .unwrap()
+                            * 100.) as usize
+                    }
+                    Err(_) => 0,
                 }
-                Err(_) => {
-                    // If nvidia-smi fails, assume no FP8 support
-                    println!(
-                        "cargo:warning=Could not detect CUDA compute capability, disabling FP8"
-                    );
-                    0
-                }
-            }
+            };
+            compute_cap >= 800
         }
     };
+
+    if build_has_fp8 {
+        println!("cargo:rustc-cfg=mistralrs_build_has_fp8");
+    }
 
     let mut builder = bindgen_cuda::Builder::default()
         .arg("-std=c++17")
@@ -71,13 +76,9 @@ pub use backend::{copy_blocks, kv_scale_update, paged_attention, reshape_and_cac
         .arg("--compiler-options")
         .arg("-fPIC");
 
-    // Enable FP8 if compute capability >= 8.0 (Ampere and newer)
-    let using_fp8 = if compute_cap >= 800 {
+    if build_has_fp8 {
         builder = builder.arg("-DENABLE_FP8");
-        true
-    } else {
-        false
-    };
+    }
 
     // https://github.com/EricLBuehler/mistral.rs/issues/286
     if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
@@ -113,17 +114,8 @@ pub use backend::{copy_blocks, kv_scale_update, paged_attention, reshape_and_cac
         .open("src/cuda/mod.rs")
         .unwrap();
 
-    // Build the new content
-    let new_ct = if using_fp8 {
-        &OTHER_CONTENT
-            .trim()
-            .replace("USE_FP8: bool = false", "USE_FP8: bool = true")
-    } else {
-        OTHER_CONTENT.trim()
-    };
-
     // Add the other stuff back
-    if let Err(e) = writeln!(file, "{new_ct}") {
+    if let Err(e) = writeln!(file, "{}", OTHER_CONTENT.trim()) {
         anyhow::bail!("Error while building dependencies: {:?}\n", e)
     }
     Ok(())

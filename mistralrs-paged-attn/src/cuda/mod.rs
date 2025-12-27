@@ -1,4 +1,6 @@
-pub const USE_FP8: bool = true;
+pub fn fp8_supported_on_device(device: &candle_core::cuda::CudaDevice) -> bool {
+    backend::fp8_supported_on_device(device)
+}
 
 mod backend;
 mod ffi;
