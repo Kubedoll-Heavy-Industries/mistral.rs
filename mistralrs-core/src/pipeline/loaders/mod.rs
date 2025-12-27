@@ -3,7 +3,7 @@ mod diffusion_loaders;
 mod embedding_loaders;
 mod normal_loaders;
 mod vision_loaders;
-pub use auto_device_map::{AutoDeviceMapParams, NonMappedSubModel};
+pub use auto_device_map::{estimate_kv_cache_bytes, AutoDeviceMapParams, NonMappedSubModel};
 
 use std::{
     fmt::{self, Debug},

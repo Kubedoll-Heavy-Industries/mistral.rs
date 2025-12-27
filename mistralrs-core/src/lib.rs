@@ -90,8 +90,9 @@ pub use paged_attention::{
     MemoryGpuConfig, ModelConfigLike, ModelConfigMetadata, PagedAttentionConfig, PagedCacheType,
 };
 pub use pipeline::{
-    chat_template::ChatTemplate, parse_isq_value, AdapterPaths, AnyMoeLoader, AnyMoePipeline,
-    AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, AutoNormalLoader, DeviceMappedModelLoader,
+    chat_template::ChatTemplate, estimate_kv_cache_bytes, parse_isq_value, AdapterPaths,
+    AnyMoeLoader, AnyMoePipeline, AutoDeviceMapParams, AutoEmbeddingLoader, AutoLoader,
+    AutoLoaderBuilder, AutoNormalLoader, AutoVisionLoader, DeviceMappedModelLoader,
     DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType,
     EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths,
     EmbeddingSpecificConfig, GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader,
