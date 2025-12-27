@@ -1,5 +1,8 @@
 use candle_core::{DType, Device, Result, Tensor};
-use mistralrs_paged_attn::{fp8_supported_on_device, kv_scale_update, paged_attention, reshape_and_cache};
+use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache};
+
+#[cfg(all(feature = "cuda", target_family = "unix"))]
+use mistralrs_paged_attn::fp8_supported_on_device;
 
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -29,9 +32,18 @@ impl PagedAttention {
         // Only initialize FP8 KV cache scales when FP8 is supported.
         // Having these as Some when FP8 isn't supported triggers an error in
         // the paged attention kernel.
-        let use_fp8 = match device {
-            Device::Cuda(dev) => fp8_supported_on_device(dev),
-            _ => false,
+        let use_fp8 = {
+            #[cfg(all(feature = "cuda", target_family = "unix"))]
+            {
+                match device {
+                    Device::Cuda(dev) => fp8_supported_on_device(dev),
+                    _ => false,
+                }
+            }
+            #[cfg(not(all(feature = "cuda", target_family = "unix")))]
+            {
+                false
+            }
         };
         let (k_scale, v_scale) = if use_fp8 {
             (
