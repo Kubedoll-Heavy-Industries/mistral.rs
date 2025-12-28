@@ -10,8 +10,9 @@ use crate::{
     get_toml_selected_model_dtype,
     pipeline::{
         AutoLoaderBuilder, DiffusionLoaderBuilder, GGMLLoaderBuilder, GGMLSpecificConfig,
-        GGUFLoaderBuilder, GGUFSpecificConfig, NormalLoaderBuilder, NormalSpecificConfig,
-        VisionLoaderBuilder, VisionSpecificConfig,
+        GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig, GGUFLoaderBuilder,
+        GGUFSpecificConfig, NormalLoaderBuilder, NormalSpecificConfig, VisionLoaderBuilder,
+        VisionSpecificConfig,
     },
     toml_selector::get_toml_selected_model_device_map_params,
     AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig, Loader, ModelDType,
@@ -87,7 +88,8 @@ pub fn get_tgt_non_granular_index(model: &ModelSelected) -> Option<usize> {
         | ModelSelected::VisionPlain { .. }
         | ModelSelected::DiffusionPlain { .. }
         | ModelSelected::Speech { .. }
-        | ModelSelected::Embedding { .. } => None,
+        | ModelSelected::Embedding { .. }
+        | ModelSelected::GGUFEmbedding { .. } => None,
         ModelSelected::XLora {
             tgt_non_granular_index,
             ..
@@ -121,7 +123,8 @@ pub fn get_model_dtype(model: &ModelSelected) -> anyhow::Result<ModelDType> {
         | ModelSelected::LoraGGML { dtype, .. }
         | ModelSelected::Run { dtype, .. }
         | ModelSelected::Speech { dtype, .. }
-        | ModelSelected::Embedding { dtype, .. } => Ok(*dtype),
+        | ModelSelected::Embedding { dtype, .. }
+        | ModelSelected::GGUFEmbedding { dtype, .. } => Ok(*dtype),
         ModelSelected::Toml { file } => {
             let selector: TomlSelector = toml::from_str(
                 &fs::read_to_string(file.clone())
@@ -223,7 +226,8 @@ pub fn get_auto_device_map_params(model: &ModelSelected) -> anyhow::Result<AutoD
         }),
         ModelSelected::DiffusionPlain { .. }
         | ModelSelected::Speech { .. }
-        | ModelSelected::Embedding { .. } => Ok(AutoDeviceMapParams::default_text()),
+        | ModelSelected::Embedding { .. }
+        | ModelSelected::GGUFEmbedding { .. } => Ok(AutoDeviceMapParams::default_text()),
         ModelSelected::Toml { file } => {
             let selector: TomlSelector = toml::from_str(
                 &fs::read_to_string(file.clone())
@@ -716,6 +720,24 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             Some(model_id),
         )
         .build(arch),
+        ModelSelected::GGUFEmbedding {
+            tok_model_id,
+            quantized_model_id,
+            quantized_filename,
+            topology,
+            ..
+        } => GGUFEmbeddingLoaderBuilder::new(
+            tok_model_id,
+            quantized_model_id,
+            quantized_filename
+                .split(GGUF_MULTI_FILE_DELIMITER)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>(),
+            GGUFEmbeddingSpecificConfig {
+                topology: Topology::from_option_path(topology)?,
+            },
+        )
+        .build(),
         ModelSelected::MultiModel { .. } => {
             anyhow::bail!("MultiModel variant should not be used in model loading functions")
         }
