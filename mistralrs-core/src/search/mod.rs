@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 pub mod rag;
 
 use anyhow::Result;
 use html2text::{config, render::PlainDecorator};
-use rayon::prelude::*;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,10 +15,16 @@ use tokenizers::Tokenizer;
 
 use crate::{Function, Tool, ToolType, WebSearchOptions, WebSearchUserLocation};
 
+/// Boxed future type for async search callbacks.
+pub type SearchCallbackFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<SearchResult>>> + Send + 'static>>;
+
 /// Callback used to override how search results are gathered. The returned
 /// vector must be sorted in decreasing order of relevance.
+///
+/// The callback is async to support non-blocking network calls.
 pub type SearchCallback =
-    dyn Fn(&SearchFunctionParameters) -> Result<Vec<SearchResult>> + Send + Sync;
+    dyn Fn(SearchFunctionParameters) -> SearchCallbackFuture + Send + Sync;
 
 pub(crate) fn search_tool_called(name: &str) -> bool {
     name == SEARCH_TOOL_NAME || name == EXTRACT_TOOL_NAME
@@ -113,7 +120,7 @@ impl ExtractResult {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchFunctionParameters {
     pub query: String,
 }
@@ -188,87 +195,106 @@ pub fn get_search_tools(web_search_options: &WebSearchOptions) -> Result<Vec<Too
     Ok(vec![search_tool, extract_tool])
 }
 
-pub fn run_search_tool(params: &SearchFunctionParameters) -> Result<Vec<SearchResult>> {
-    let client = reqwest::blocking::Client::new();
+pub async fn run_search_tool(params: &SearchFunctionParameters) -> Result<Vec<SearchResult>> {
+    let client = reqwest::Client::new();
 
     let encoded_query = urlencoding::encode(&params.query);
     let url = format!("https://html.duckduckgo.com/html/?q={encoded_query}");
 
     let user_agent = format!("mistralrs/{APP_VERSION} ({OS}; {ARCH}; {FAMILY})");
-    let response = client.get(&url).header("User-Agent", &user_agent).send()?;
+    let response = client
+        .get(&url)
+        .header("User-Agent", &user_agent)
+        .send()
+        .await?;
 
     // Check the response status
     if !response.status().is_success() {
         anyhow::bail!("Failed to fetch search results: {}", response.status())
     }
 
-    let html = response.text()?;
+    let html = response.text().await?;
 
-    let document = Html::parse_document(&html);
+    // Parse HTML and extract partials in a separate block to ensure
+    // the non-Send Html type is dropped before async operations
+    let partials: Vec<(String, String, String)> = {
+        let document = Html::parse_document(&html);
+        let result_selector = Selector::parse(".result").unwrap();
+        let title_selector = Selector::parse(".result__title").unwrap();
+        let snippet_selector = Selector::parse(".result__snippet").unwrap();
+        let url_selector = Selector::parse(".result__url").unwrap();
 
-    let result_selector = Selector::parse(".result").unwrap();
-    let title_selector = Selector::parse(".result__title").unwrap();
-    let snippet_selector = Selector::parse(".result__snippet").unwrap();
-    let url_selector = Selector::parse(".result__url").unwrap();
+        document
+            .select(&result_selector)
+            .filter_map(|element| {
+                let title = element
+                    .select(&title_selector)
+                    .next()
+                    .map(|e| e.text().collect::<String>().trim().to_string())
+                    .unwrap_or_default();
+                let description = element
+                    .select(&snippet_selector)
+                    .next()
+                    .map(|e| e.text().collect::<String>().trim().to_string())
+                    .unwrap_or_default();
+                let mut url = element
+                    .select(&url_selector)
+                    .next()
+                    .map(|e| e.text().collect::<String>().trim().to_string())
+                    .unwrap_or_default();
+                if title.is_empty() || description.is_empty() || url.is_empty() {
+                    return None;
+                }
+                if !url.starts_with("http") {
+                    url = format!("https://{url}");
+                }
+                Some((title, description, url))
+            })
+            .collect()
+    };
 
-    // Phase 1: collect title, description, and url serially into a Vec of tuples
-    let partials: Vec<(String, String, String)> = document
-        .select(&result_selector)
-        .filter_map(|element| {
-            let title = element
-                .select(&title_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
-            let description = element
-                .select(&snippet_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
-            let mut url = element
-                .select(&url_selector)
-                .next()
-                .map(|e| e.text().collect::<String>().trim().to_string())
-                .unwrap_or_default();
-            if title.is_empty() || description.is_empty() || url.is_empty() {
-                return None;
+    // Fetch content concurrently using async
+    let client = Arc::new(client);
+    let user_agent = Arc::new(user_agent);
+
+    let fetch_futures: Vec<_> = partials
+        .into_iter()
+        .map(|(title, description, url)| {
+            let client = Arc::clone(&client);
+            let user_agent = Arc::clone(&user_agent);
+            async move {
+                let response = client
+                    .get(&url)
+                    .header("User-Agent", user_agent.as_str())
+                    .send()
+                    .await
+                    .ok()?;
+                let html = response.text().await.ok()?;
+                let content = config::with_decorator(PlainDecorator::new())
+                    .do_decorate()
+                    .string_from_read(html.as_bytes(), 80)
+                    .ok()?;
+                Some(SearchResult {
+                    title,
+                    description,
+                    url,
+                    content,
+                })
             }
-            if !url.starts_with("http") {
-                url = format!("https://{url}");
-            }
-            Some((title, description, url))
         })
         .collect();
 
-    // Phase 2: fetch content in parallel using Rayon
-    let client = Arc::new(client);
-    let results: Vec<SearchResult> = partials
-        .into_par_iter()
-        .filter_map(|(title, description, url)| {
-            let content = match client.get(&url).header("User-Agent", &user_agent).send() {
-                Ok(response) => {
-                    let html = response.text().ok()?;
-                    config::with_decorator(PlainDecorator::new())
-                        .do_decorate()
-                        .string_from_read(html.as_bytes(), 80)
-                        .ok()?
-                }
-                Err(_) => return None,
-            };
-            Some(SearchResult {
-                title,
-                description,
-                url,
-                content,
-            })
-        })
+    let results: Vec<SearchResult> = futures::future::join_all(fetch_futures)
+        .await
+        .into_iter()
+        .flatten()
         .collect();
 
     Ok(results)
 }
 
-pub fn run_extract_tool(params: &ExtractFunctionParameters) -> Result<ExtractResult> {
-    let client = reqwest::blocking::Client::new();
+pub async fn run_extract_tool(params: &ExtractFunctionParameters) -> Result<ExtractResult> {
+    let client = reqwest::Client::new();
 
     let user_agent = format!("mistralrs/{APP_VERSION} ({OS}; {ARCH}; {FAMILY})");
 
@@ -276,8 +302,9 @@ pub fn run_extract_tool(params: &ExtractFunctionParameters) -> Result<ExtractRes
         .get(&params.url)
         .header("User-Agent", &user_agent)
         .send()
+        .await
     {
-        Ok(response) => response.text().ok().and_then(|html| {
+        Ok(response) => response.text().await.ok().and_then(|html| {
             config::with_decorator(PlainDecorator::new())
                 .do_decorate()
                 .string_from_read(html.as_bytes(), 80)
