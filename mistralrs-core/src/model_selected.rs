@@ -742,4 +742,41 @@ pub enum ModelSelected {
         #[serde(default)]
         hf_cache_path: Option<PathBuf>,
     },
+
+    /// Select a GGUF embedding model.
+    GGUFEmbedding {
+        /// `tok_model_id` is the local or remote model ID where you can find a `tokenizer_config.json` file.
+        #[arg(short, long)]
+        tok_model_id: Option<String>,
+
+        /// Quantized model ID to find the `quantized_filename`.
+        /// This may be a HF hub repo or a local path.
+        #[arg(short = 'm', long)]
+        quantized_model_id: String,
+
+        /// Quantized filename(s).
+        /// May be a single filename, or use a delimiter of " " (a single space) for multiple files.
+        #[arg(short = 'f', long)]
+        quantized_filename: String,
+
+        /// Model data type. Defaults to `auto`.
+        #[arg(short, long, default_value_t = ModelDType::Auto, value_parser = parse_model_dtype)]
+        #[serde(default = "default_model_dtype")]
+        dtype: ModelDType,
+
+        /// Path to a topology YAML file.
+        #[arg(long)]
+        #[serde(default)]
+        topology: Option<String>,
+
+        /// Maximum prompt sequence length to expect for this model. This affects automatic device mapping but is not a hard limit.
+        #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)]
+        #[serde(default = "default_max_seq_len")]
+        max_seq_len: usize,
+
+        /// Maximum prompt batch size to expect for this model. This affects automatic device mapping but is not a hard limit.
+        #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
+        #[serde(default = "default_max_batch_size")]
+        max_batch_size: usize,
+    },
 }

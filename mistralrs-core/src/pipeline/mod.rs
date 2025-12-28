@@ -5,6 +5,7 @@ mod diffusion;
 mod embedding;
 mod ggml;
 mod gguf;
+mod gguf_embedding;
 pub mod hooks;
 mod inputs_processor;
 mod isq;
@@ -32,6 +33,9 @@ pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
 pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
+pub use gguf_embedding::{
+    GGUFEmbeddingLoader, GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig,
+};
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;
