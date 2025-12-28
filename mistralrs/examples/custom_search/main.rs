@@ -1,7 +1,7 @@
 use anyhow::Result;
 use mistralrs::{
-    IsqType, RequestBuilder, SearchResult, TextMessageRole, TextMessages, TextModelBuilder,
-    WebSearchOptions,
+    IsqType, RequestBuilder, SearchFunctionParameters, SearchResult, TextMessageRole, TextMessages,
+    TextModelBuilder, WebSearchOptions,
 };
 
 use std::fs;
@@ -49,10 +49,11 @@ async fn main() -> Result<()> {
     let model = TextModelBuilder::new("NousResearch/Hermes-3-Llama-3.1-8B")
         .with_isq(IsqType::Q4K)
         .with_logging()
-        .with_search_callback(Arc::new(|params: &mistralrs::SearchFunctionParameters| {
-            // In a real application there could be network or database calls here – but for the
-            // sake of demonstration we simply perform a local filesystem search.
-            local_search(&params.query)
+        .with_search_callback(Arc::new(|params: SearchFunctionParameters| {
+            // The callback returns a boxed future for async search operations.
+            // For local filesystem searches, we wrap the sync call in an async block.
+            let query = params.query;
+            Box::pin(async move { local_search(&query) })
         }))
         .build()
         .await?;

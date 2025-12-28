@@ -4,7 +4,6 @@ use bm25::{Embedder, EmbedderBuilder, Language, ScoredDocument, Scorer};
 use either::Either;
 use indexmap::IndexMap;
 use tokenizers::InputSequence;
-use tracing::{level_filters::LevelFilter, Dispatch};
 
 use crate::{
     get_mut_arcmutex,
@@ -56,12 +55,6 @@ async fn do_search(
             .tokenizer()
             .expect("A tokenizer is expected for non-diffusion models.");
 
-        // Allow `info` and below; suppress `warn`
-        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
-            .with_max_level(LevelFilter::INFO)
-            .finish();
-        let dispatch = Dispatch::new(subscriber);
-
         // Manage context size by # of tokens. Apply default here.
         let max_results_budget_toks =
             match web_search_options.search_context_size.unwrap_or_default() {
@@ -69,32 +62,29 @@ async fn do_search(
                 SearchContextSize::Medium => 8192_usize,
                 SearchContextSize::Low => 4096_usize,
             };
-        let (results, result_token_lens): (Vec<SearchResult>, Vec<usize>) =
-            tokio::task::block_in_place(|| {
-                tracing::dispatcher::with_default(&dispatch, || {
-                    let base_results = if let Some(cb) = &this.search_callback {
-                        cb(&tool_call_params).unwrap()
-                    } else {
-                        search::run_search_tool(&tool_call_params).unwrap()
-                    };
-                    base_results
-                        .into_iter()
-                        .map(|mut result| {
-                            result = result
-                                .cap_content_len(&tokenizer, max_results_budget_toks)
-                                .unwrap();
-                            let len = {
-                                let inp = InputSequence::Raw(Cow::from(&result.content));
-                                tokenizer
-                                    .encode_fast(inp, false)
-                                    .map(|x| x.len())
-                                    .unwrap_or(usize::MAX)
-                            };
-                            (result, len)
-                        })
-                        .unzip()
-                })
-            });
+        // Fetch search results asynchronously
+        let base_results = if let Some(cb) = &this.search_callback {
+            cb(tool_call_params.clone()).await.unwrap()
+        } else {
+            search::run_search_tool(&tool_call_params).await.unwrap()
+        };
+
+        let (results, result_token_lens): (Vec<SearchResult>, Vec<usize>) = base_results
+            .into_iter()
+            .map(|mut result| {
+                result = result
+                    .cap_content_len(&tokenizer, max_results_budget_toks)
+                    .unwrap();
+                let len = {
+                    let inp = InputSequence::Raw(Cow::from(&result.content));
+                    tokenizer
+                        .encode_fast(inp, false)
+                        .map(|x| x.len())
+                        .unwrap_or(usize::MAX)
+                };
+                (result, len)
+            })
+            .unzip();
 
         let mut combined: Vec<(SearchResult, usize)> = results
             .into_iter()
@@ -259,12 +249,6 @@ async fn do_extraction(
             .tokenizer()
             .expect("A tokenizer is expected for non-diffusion models.");
 
-        // Allow `info` and below; suppress `warn`
-        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
-            .with_max_level(LevelFilter::INFO)
-            .finish();
-        let dispatch = Dispatch::new(subscriber);
-
         // Manage context size by # of tokens. Apply default here.
         let max_results_budget_toks =
             match web_search_options.search_context_size.unwrap_or_default() {
@@ -274,11 +258,7 @@ async fn do_extraction(
             };
 
         let res = {
-            let extract_result = tokio::task::block_in_place(|| {
-                tracing::dispatcher::with_default(&dispatch, || {
-                    search::run_extract_tool(&tool_call_params).unwrap()
-                })
-            });
+            let extract_result = search::run_extract_tool(&tool_call_params).await.unwrap();
             extract_result
                 .cap_content_len(&tokenizer, max_results_budget_toks)
                 .unwrap()
