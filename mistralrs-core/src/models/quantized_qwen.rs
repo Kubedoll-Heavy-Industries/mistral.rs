@@ -487,4 +487,42 @@ impl ModelWeights {
             context_lens,
         )
     }
+
+    /// Forward pass for embeddings - returns hidden states before LM head.
+    /// Used by GGUF embedding pipeline.
+    pub fn forward_hidden_states(
+        &self,
+        x: &Tensor,
+        start_offsets: &[usize],
+    ) -> Result<Tensor> {
+        let mut layer_in = self.tok_embeddings.forward(x)?;
+        let cache = &mut self.cache.normal().0;
+        // For embeddings, we use bidirectional attention (no causal mask)
+        // by passing None for the mask
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(ref mapper) = self.mapper {
+                layer_in = mapper.map(layer_in, i)?;
+            }
+            let x = layer_in;
+            let residual = &x;
+            let x = layer.attention_norm.forward(&x)?;
+            let attn = layer.forward_attn(
+                &x,
+                None, // No causal mask for bidirectional embedding
+                start_offsets,
+                &mut cache[i],
+                None, // No paged attention for embeddings
+            )?;
+            let x = (attn + residual)?;
+
+            // MLP
+            let residual = &x;
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp.forward(&x)?;
+            let x = (x + residual)?;
+            layer_in = x;
+        }
+        // Return hidden states after final norm (before LM head)
+        self.norm.forward(&layer_in)
+    }
 }
