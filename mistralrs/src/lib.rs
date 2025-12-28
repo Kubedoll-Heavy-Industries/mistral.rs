@@ -160,7 +160,9 @@ pub use messages::{
 pub use mistralrs_core::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
-pub use mistralrs_core::{SearchCallback, SearchResult, ToolCallback};
+pub use mistralrs_core::{
+    SearchCallback, SearchCallbackFuture, SearchFunctionParameters, SearchResult, ToolCallback,
+};
 pub use model::{best_device, Model};
 pub use multi_model::MultiModel;
 pub use speculative::TextSpeculativeBuilder;

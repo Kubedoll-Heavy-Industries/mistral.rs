@@ -117,7 +117,7 @@ pub use sampler::{
     CustomLogitsProcessor, DrySamplingParams, SamplingParams, StopTokens, TopLogprob,
 };
 pub use scheduler::{DefaultSchedulerMethod, SchedulerConfig};
-pub use search::{SearchCallback, SearchFunctionParameters, SearchResult};
+pub use search::{SearchCallback, SearchCallbackFuture, SearchFunctionParameters, SearchResult};
 use serde::Serialize;
 pub use speech_models::{utils as speech_utils, SpeechGenerationConfig, SpeechLoaderType};
 use tokio::runtime::Runtime;
