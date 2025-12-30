@@ -236,5 +236,6 @@ pub mod responses;
 pub mod responses_types;
 pub mod speech_generation;
 pub mod streaming;
+pub mod telemetry;
 pub mod types;
 pub mod util;
