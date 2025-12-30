@@ -33,6 +33,11 @@ half.workspace = true
 accelerate-src = { workspace = true, optional = true }
 intel-mkl-src = { workspace = true, optional = true }
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+openinference-semantic-conventions.workspace = true
+openinference-instrumentation.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
 regex-automata.workspace = true

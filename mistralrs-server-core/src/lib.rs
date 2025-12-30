@@ -234,5 +234,6 @@ pub mod openapi_doc;
 pub mod responses;
 pub mod speech_generation;
 pub mod streaming;
+pub mod telemetry;
 pub mod types;
 pub mod util;
