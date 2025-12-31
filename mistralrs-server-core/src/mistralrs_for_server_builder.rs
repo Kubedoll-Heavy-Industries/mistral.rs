@@ -1122,6 +1122,7 @@ async fn init_scheduler_config(
             SchedulerConfig::PagedAttentionMeta {
                 max_num_seqs: args_max_seqs,
                 config: cache_config.clone(),
+                max_prefill_chunk_size: None,
             }
         } else {
             SchedulerConfig::DefaultScheduler {

@@ -22,6 +22,8 @@ pub enum SchedulerConfig {
     PagedAttentionMeta {
         max_num_seqs: usize,
         config: CacheConfig,
+        /// Maximum tokens per prefill chunk. None = no chunking (default).
+        max_prefill_chunk_size: Option<usize>,
     },
 }
 
@@ -34,8 +36,12 @@ impl SchedulerConfig {
             Self::PagedAttentionMeta {
                 max_num_seqs,
                 config,
+                max_prefill_chunk_size,
             } => Arc::new(Mutex::new(PagedAttentionScheduler::new(
-                PagedAttentionSchedulerConfig { max_num_seqs },
+                PagedAttentionSchedulerConfig {
+                    max_num_seqs,
+                    max_prefill_chunk_size,
+                },
                 config,
             ))),
         }
@@ -70,4 +76,9 @@ pub trait Scheduler: Send + Sync {
     /// Set whether prefix caching is enabled. Called by Engine after creation
     /// to synchronize with the global no_prefix_cache setting.
     fn set_prefix_caching_enabled(&mut self, enabled: bool);
+
+    /// Advance prefill chunk offsets for all running sequences in chunked prefill mode.
+    /// Called by the engine after processing a batch of prefill chunks.
+    /// Default implementation does nothing (for schedulers that don't support chunked prefill).
+    fn advance_prefill_chunk_offsets(&mut self) {}
 }

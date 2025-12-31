@@ -418,6 +418,13 @@ pub struct Sequence {
     /// These tokens should be skipped during prefill.
     prefix_cache_len: usize,
 
+    // Chunked prefill
+    /// For chunked prefill: offset into prefill_prompt_toks for the next chunk.
+    /// Starts at 0 and increments by chunk_size each iteration until all tokens are prefilled.
+    prefill_chunk_offset: usize,
+    /// Maximum chunk size for chunked prefill. None = no chunking (process all at once).
+    prefill_chunk_size: Option<usize>,
+
     // Cache
     normal_cache: Vec<Option<KvCache>>,
     normal_draft_cache: Vec<Option<KvCache>>,
@@ -604,6 +611,8 @@ impl Sequence {
             recognizer,
             prefill_prompt_toks: None,
             prefix_cache_len: 0,
+            prefill_chunk_offset: 0,
+            prefill_chunk_size: None,
             suffix,
             prefix,
             cumulative_logprob: 0.,
@@ -752,6 +761,12 @@ impl Sequence {
 
     pub fn get_toks(&self) -> &[u32] {
         if let Some(toks) = &self.prefill_prompt_toks {
+            // If chunked prefill is enabled, return only the current chunk
+            if let Some(chunk_size) = self.prefill_chunk_size {
+                let start = self.prefill_chunk_offset;
+                let end = (start + chunk_size).min(toks.len());
+                return &toks[start..end];
+            }
             return toks;
         }
         &self.tokens
@@ -790,6 +805,63 @@ impl Sequence {
     /// Set the number of prefix tokens that are cached.
     pub fn set_prefix_cache_len(&mut self, len: usize) {
         self.prefix_cache_len = len;
+    }
+
+    /// Get the current chunk offset for chunked prefill.
+    /// This is the index into prefill_prompt_toks where the next chunk starts.
+    pub fn prefill_chunk_offset(&self) -> usize {
+        self.prefill_chunk_offset
+    }
+
+    /// Set the chunk offset for chunked prefill.
+    pub fn set_prefill_chunk_offset(&mut self, offset: usize) {
+        self.prefill_chunk_offset = offset;
+    }
+
+    /// Advance the chunk offset by the given amount.
+    pub fn advance_prefill_chunk_offset(&mut self, amount: usize) {
+        self.prefill_chunk_offset += amount;
+    }
+
+    /// Check if there are more tokens to prefill in chunked mode.
+    /// Returns true if prefill_chunk_offset < total prefill tokens.
+    pub fn has_remaining_prefill(&self) -> bool {
+        if let Some(toks) = &self.prefill_prompt_toks {
+            self.prefill_chunk_offset < toks.len()
+        } else {
+            false
+        }
+    }
+
+    /// Get the tokens for the current prefill chunk.
+    /// Returns a slice of tokens from prefill_chunk_offset to min(offset + chunk_size, total).
+    pub fn get_prefill_chunk(&self, chunk_size: usize) -> Option<Vec<u32>> {
+        if let Some(toks) = &self.prefill_prompt_toks {
+            let start = self.prefill_chunk_offset;
+            if start >= toks.len() {
+                return None;
+            }
+            let end = (start + chunk_size).min(toks.len());
+            Some(toks[start..end].to_vec())
+        } else {
+            None
+        }
+    }
+
+    /// Get the maximum prefill chunk size for this sequence.
+    /// None means no chunking (process all at once).
+    pub fn prefill_chunk_size(&self) -> Option<usize> {
+        self.prefill_chunk_size
+    }
+
+    /// Set the maximum prefill chunk size for this sequence.
+    pub fn set_prefill_chunk_size(&mut self, size: Option<usize>) {
+        self.prefill_chunk_size = size;
+    }
+
+    /// Get the prefill prompt tokens if set.
+    pub fn prefill_prompt_toks(&self) -> Option<&[u32]> {
+        self.prefill_prompt_toks.as_deref()
     }
 
     /// This will also set prompt_len
@@ -1569,5 +1641,220 @@ impl SequenceGroup {
             sender.send(Response::CompletionDone(response)).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper struct for testing chunked prefill without full Sequence construction.
+    /// Mirrors the relevant fields and methods from Sequence.
+    struct ChunkedPrefillState {
+        prefill_prompt_toks: Option<Vec<u32>>,
+        prefill_chunk_offset: usize,
+        prefill_chunk_size: Option<usize>,
+        tokens: Vec<u32>,
+    }
+
+    impl ChunkedPrefillState {
+        fn new(tokens: Vec<u32>) -> Self {
+            Self {
+                prefill_prompt_toks: None,
+                prefill_chunk_offset: 0,
+                prefill_chunk_size: None,
+                tokens,
+            }
+        }
+
+        fn set_prefill_toks(&mut self, toks: Vec<u32>) {
+            self.prefill_prompt_toks = Some(toks);
+        }
+
+        fn set_prefill_chunk_size(&mut self, size: Option<usize>) {
+            self.prefill_chunk_size = size;
+        }
+
+        fn prefill_chunk_offset(&self) -> usize {
+            self.prefill_chunk_offset
+        }
+
+        fn set_prefill_chunk_offset(&mut self, offset: usize) {
+            self.prefill_chunk_offset = offset;
+        }
+
+        fn advance_prefill_chunk_offset(&mut self, amount: usize) {
+            self.prefill_chunk_offset += amount;
+        }
+
+        fn has_remaining_prefill(&self) -> bool {
+            if let Some(toks) = &self.prefill_prompt_toks {
+                self.prefill_chunk_offset < toks.len()
+            } else {
+                false
+            }
+        }
+
+        /// Mirrors Sequence::get_toks() logic for chunked prefill
+        fn get_toks(&self) -> &[u32] {
+            if let Some(toks) = &self.prefill_prompt_toks {
+                if let Some(chunk_size) = self.prefill_chunk_size {
+                    let start = self.prefill_chunk_offset;
+                    let end = (start + chunk_size).min(toks.len());
+                    return &toks[start..end];
+                }
+                return toks;
+            }
+            &self.tokens
+        }
+
+        fn get_prefill_chunk(&self, chunk_size: usize) -> Option<Vec<u32>> {
+            if let Some(toks) = &self.prefill_prompt_toks {
+                let start = self.prefill_chunk_offset;
+                if start >= toks.len() {
+                    return None;
+                }
+                let end = (start + chunk_size).min(toks.len());
+                Some(toks[start..end].to_vec())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Test that chunked prefill correctly slices tokens via get_toks().
+    #[test]
+    fn test_chunked_prefill_get_toks() {
+        let tokens: Vec<u32> = (0..1000).collect();
+        let mut state = ChunkedPrefillState::new(tokens.clone());
+
+        // Set prefill_prompt_toks
+        state.set_prefill_toks(tokens.clone());
+
+        // Without chunking, get_toks() returns all tokens
+        assert_eq!(state.get_toks().len(), 1000);
+
+        // Enable chunking with chunk_size=256
+        state.set_prefill_chunk_size(Some(256));
+
+        // First chunk: tokens[0..256]
+        assert_eq!(state.prefill_chunk_offset(), 0);
+        assert_eq!(state.get_toks().len(), 256);
+        assert_eq!(state.get_toks()[0], 0);
+        assert_eq!(state.get_toks()[255], 255);
+
+        // Advance to second chunk
+        state.advance_prefill_chunk_offset(256);
+        assert_eq!(state.prefill_chunk_offset(), 256);
+        assert_eq!(state.get_toks().len(), 256);
+        assert_eq!(state.get_toks()[0], 256);
+        assert_eq!(state.get_toks()[255], 511);
+
+        // Advance to third chunk
+        state.advance_prefill_chunk_offset(256);
+        assert_eq!(state.prefill_chunk_offset(), 512);
+        assert_eq!(state.get_toks().len(), 256);
+        assert_eq!(state.get_toks()[0], 512);
+
+        // Advance to last chunk (only 232 tokens remaining)
+        state.advance_prefill_chunk_offset(256);
+        assert_eq!(state.prefill_chunk_offset(), 768);
+        assert_eq!(state.get_toks().len(), 232); // 1000 - 768 = 232
+        assert_eq!(state.get_toks()[0], 768);
+        assert_eq!(state.get_toks()[231], 999);
+    }
+
+    /// Test has_remaining_prefill() correctly tracks progress.
+    #[test]
+    fn test_chunked_prefill_has_remaining() {
+        let tokens: Vec<u32> = (0..512).collect();
+        let mut state = ChunkedPrefillState::new(tokens.clone());
+
+        // Without prefill_prompt_toks set, has_remaining_prefill is false
+        assert!(!state.has_remaining_prefill());
+
+        // Set prefill tokens
+        state.set_prefill_toks(tokens);
+
+        // With tokens set, offset=0, has_remaining_prefill is true
+        assert!(state.has_remaining_prefill());
+
+        // Advance past all tokens
+        state.set_prefill_chunk_offset(512);
+        assert!(!state.has_remaining_prefill());
+
+        // Advance past the end (edge case)
+        state.set_prefill_chunk_offset(1000);
+        assert!(!state.has_remaining_prefill());
+    }
+
+    /// Test get_prefill_chunk() returns correct slices.
+    #[test]
+    fn test_get_prefill_chunk() {
+        let tokens: Vec<u32> = (0..100).collect();
+        let mut state = ChunkedPrefillState::new(tokens.clone());
+
+        // Without prefill_prompt_toks, returns None
+        assert!(state.get_prefill_chunk(32).is_none());
+
+        // Set prefill tokens
+        state.set_prefill_toks(tokens);
+
+        // First chunk
+        let chunk = state.get_prefill_chunk(32).unwrap();
+        assert_eq!(chunk.len(), 32);
+        assert_eq!(chunk[0], 0);
+        assert_eq!(chunk[31], 31);
+
+        // Advance and get next chunk
+        state.set_prefill_chunk_offset(32);
+        let chunk = state.get_prefill_chunk(32).unwrap();
+        assert_eq!(chunk.len(), 32);
+        assert_eq!(chunk[0], 32);
+
+        // Last partial chunk
+        state.set_prefill_chunk_offset(80);
+        let chunk = state.get_prefill_chunk(32).unwrap();
+        assert_eq!(chunk.len(), 20); // Only 20 tokens remaining
+        assert_eq!(chunk[0], 80);
+        assert_eq!(chunk[19], 99);
+
+        // Past end returns None
+        state.set_prefill_chunk_offset(100);
+        assert!(state.get_prefill_chunk(32).is_none());
+    }
+
+    /// Test that position offsets are computed correctly for each chunk.
+    #[test]
+    fn test_chunked_prefill_position_offsets() {
+        let tokens: Vec<u32> = (0..1024).collect();
+        let mut state = ChunkedPrefillState::new(tokens.clone());
+        state.set_prefill_toks(tokens);
+        state.set_prefill_chunk_size(Some(256));
+
+        // Simulate the flow: token_offset (prefix cache) + prefill_chunk_offset
+        let token_offset = 0; // No prefix cache in this test
+
+        // First chunk: positions should start at 0
+        let pos_offset = token_offset + state.prefill_chunk_offset();
+        assert_eq!(pos_offset, 0);
+        assert_eq!(state.get_toks().len(), 256);
+
+        // Advance and check second chunk positions
+        state.advance_prefill_chunk_offset(256);
+        let pos_offset = token_offset + state.prefill_chunk_offset();
+        assert_eq!(pos_offset, 256);
+        assert_eq!(state.get_toks().len(), 256);
+        assert_eq!(state.get_toks()[0], 256); // Token at position 256
+
+        // With prefix cache offset
+        let token_offset = 100; // Simulating 100 tokens already in KV cache
+        state.set_prefill_chunk_offset(0);
+        let pos_offset = token_offset + state.prefill_chunk_offset();
+        assert_eq!(pos_offset, 100);
+
+        state.advance_prefill_chunk_offset(256);
+        let pos_offset = token_offset + state.prefill_chunk_offset();
+        assert_eq!(pos_offset, 356); // 100 + 256
     }
 }

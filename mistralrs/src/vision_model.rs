@@ -360,6 +360,7 @@ impl VisionModelBuilder {
                     SchedulerConfig::PagedAttentionMeta {
                         max_num_seqs: self.max_num_seqs,
                         config,
+                        max_prefill_chunk_size: None,
                     }
                 } else {
                     SchedulerConfig::DefaultScheduler {

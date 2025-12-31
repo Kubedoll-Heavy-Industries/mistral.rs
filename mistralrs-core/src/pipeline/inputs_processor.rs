@@ -576,7 +576,8 @@ pub mod text_models_inputs_processor {
         paged_attn_metadata: Option<&mut PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
     ) -> Result<InnerInputProcessorOutput> {
-        let offset = input_seqs[0].token_offset();
+        // For chunked prefill: total offset = prefix cache offset + current chunk offset
+        let offset = input_seqs[0].token_offset() + input_seqs[0].prefill_chunk_offset();
         make_prompt_chunk(
             offset,
             toks,

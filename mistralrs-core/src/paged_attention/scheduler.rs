@@ -39,6 +39,11 @@ pub struct PagedAttentionSchedulerOutput {
 
 pub struct PagedAttentionSchedulerConfig {
     pub max_num_seqs: usize,
+    /// Maximum number of tokens to process in a single prefill iteration.
+    /// When set, long prompts are split into chunks to enable better pipeline
+    /// utilization and reduced time-to-first-token.
+    /// Default: None (process entire prompt in one iteration)
+    pub max_prefill_chunk_size: Option<usize>,
 }
 
 pub struct PagedAttentionScheduler {
@@ -150,6 +155,41 @@ impl PagedAttentionScheduler {
     }
 
     pub fn schedule(&mut self, logger: &IntervalLogger) -> PagedAttentionSchedulerOutput {
+        // === Chunked Prefill: Schedule sequences with remaining prefill chunks ===
+        // Sequences in running queue that are still in RunningPrompt state have more
+        // prefill chunks to process. Schedule them before new prompts.
+        let mut chunked_prefill_seqs: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
+        let mut non_prefill_running: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
+
+        for seq in std::mem::take(&mut self.running) {
+            if get_mut_arcmutex!(seq).is_prompt() && get_mut_arcmutex!(seq).has_remaining_prefill()
+            {
+                chunked_prefill_seqs.push_back(seq);
+            } else {
+                non_prefill_running.push_back(seq);
+            }
+        }
+        self.running = non_prefill_running;
+
+        if !chunked_prefill_seqs.is_empty() {
+            // Schedule chunked prefill sequences for processing.
+            // NOTE: The chunk offset is NOT advanced here. It must be advanced by the
+            // engine/pipeline AFTER the forward pass completes, by calling
+            // advance_prefill_chunk_offsets() on the scheduler or directly on sequences.
+            let scheduled: Vec<_> = chunked_prefill_seqs.clone().into_iter().collect();
+            // Put them back in running for the next iteration
+            self.running.extend(chunked_prefill_seqs);
+
+            logger.set_num_running(self.running.len());
+            logger.set_num_waiting(self.waiting.len());
+
+            return PagedAttentionSchedulerOutput {
+                scheduled,
+                blocks_to_copy: HashMap::new(),
+            };
+        }
+
+        // === Standard Prompt Scheduling ===
         let mut scheduled: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
         let mut for_waiting_again: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
         let mut did_ignore = false;
@@ -235,6 +275,11 @@ impl PagedAttentionScheduler {
                     let non_cached_tokens = all_tokens[cached_tokens..].to_vec();
                     seq_handle.set_prefill_toks(non_cached_tokens);
                 }
+
+                // Set chunked prefill size if configured
+                if let Some(chunk_size) = self.config.max_prefill_chunk_size {
+                    seq_handle.set_prefill_chunk_size(Some(chunk_size));
+                }
             }
 
             let seq = self.waiting.pop_front().unwrap();
@@ -315,9 +360,17 @@ impl PagedAttentionScheduler {
         let bucketed = self.bucket_and_preempt_sequences(running_for_bucket);
         self.running = bucketed;
 
-        self.running
-            .iter()
-            .for_each(|seq| get_mut_arcmutex!(seq).set_state(SequenceState::RunningCompletion));
+        // For chunked prefill: sequences with remaining prefill chunks stay in RunningPrompt.
+        // Only transition to RunningCompletion when prefill is complete.
+        self.running.iter().for_each(|seq| {
+            let mut seq_guard = get_mut_arcmutex!(seq);
+            if seq_guard.has_remaining_prefill() {
+                // Stay in RunningPrompt for next prefill chunk
+                seq_guard.set_state(SequenceState::RunningPrompt);
+            } else {
+                seq_guard.set_state(SequenceState::RunningCompletion);
+            }
+        });
 
         if TERMINATE_ALL_NEXT_STEP.load(Ordering::SeqCst) {
             self.running.iter().for_each(|seq| {
@@ -353,6 +406,24 @@ impl PagedAttentionScheduler {
 
         for (id, logical_blocks) in to_free {
             self._free_with_caching(id, Some(&logical_blocks));
+        }
+    }
+
+    /// Advance prefill chunk offsets for all running sequences that are in chunked prefill mode.
+    /// This should be called by the engine AFTER processing a batch of prefill chunks.
+    pub fn advance_prefill_chunk_offsets(&mut self) {
+        for seq in &self.running {
+            let mut seq_guard = get_mut_arcmutex!(seq);
+            if seq_guard.is_prompt() {
+                if let Some(chunk_size) = seq_guard.prefill_chunk_size() {
+                    if let Some(toks) = seq_guard.prefill_prompt_toks() {
+                        let remaining =
+                            toks.len().saturating_sub(seq_guard.prefill_chunk_offset());
+                        let advance_by = chunk_size.min(remaining);
+                        seq_guard.advance_prefill_chunk_offset(advance_by);
+                    }
+                }
+            }
         }
     }
 }
@@ -482,5 +553,8 @@ impl Scheduler for PagedAttentionScheduler {
     }
     fn set_prefix_caching_enabled(&mut self, enabled: bool) {
         self.set_prefix_caching_enabled_sync(enabled);
+    }
+    fn advance_prefill_chunk_offsets(&mut self) {
+        self.advance_prefill_chunk_offsets()
     }
 }

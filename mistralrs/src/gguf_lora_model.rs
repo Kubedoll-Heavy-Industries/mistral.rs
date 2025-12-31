@@ -72,6 +72,7 @@ impl GgufLoraModelBuilder {
                 SchedulerConfig::PagedAttentionMeta {
                     max_num_seqs: self.gguf_model.max_num_seqs,
                     config,
+                    max_prefill_chunk_size: None,
                 }
             }
             None => SchedulerConfig::DefaultScheduler {

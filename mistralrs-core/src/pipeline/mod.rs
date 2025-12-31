@@ -276,6 +276,8 @@ pub enum ModelCategoryKind {
     Speech,
     /// Embedding model (LiteLLM mode: "embedding")
     Embedding,
+    /// Reranker model (LiteLLM mode: "rerank")
+    Rerank,
 }
 
 impl ModelCategoryKind {
@@ -285,6 +287,7 @@ impl ModelCategoryKind {
             Self::Text | Self::Vision | Self::Audio | Self::Speech => "chat",
             Self::Embedding => "embedding",
             Self::Diffusion => "image",
+            Self::Rerank => "rerank",
         }
     }
 }
@@ -301,6 +304,7 @@ pub enum ModelCategory {
     Audio,
     Speech,
     Embedding,
+    Rerank,
 }
 
 impl std::fmt::Debug for ModelCategory {
@@ -312,6 +316,7 @@ impl std::fmt::Debug for ModelCategory {
             ModelCategory::Audio => write!(f, "ModelCategory::Audio"),
             ModelCategory::Speech => write!(f, "ModelCategory::Speech"),
             ModelCategory::Embedding => write!(f, "ModelCategory::Embedding"),
+            ModelCategory::Rerank => write!(f, "ModelCategory::Rerank"),
         }
     }
 }
@@ -325,13 +330,15 @@ impl PartialEq for ModelCategory {
             (Self::Speech, Self::Speech) => true,
             (Self::Diffusion, Self::Diffusion) => true,
             (Self::Embedding, Self::Embedding) => true,
+            (Self::Rerank, Self::Rerank) => true,
             (
                 Self::Text
                 | Self::Vision { .. }
                 | Self::Diffusion
                 | Self::Audio
                 | Self::Speech
-                | Self::Embedding,
+                | Self::Embedding
+                | Self::Rerank,
                 _,
             ) => false,
         }
@@ -351,6 +358,7 @@ impl ModelCategory {
             Self::Audio => ModelCategoryKind::Audio,
             Self::Speech => ModelCategoryKind::Speech,
             Self::Embedding => ModelCategoryKind::Embedding,
+            Self::Rerank => ModelCategoryKind::Rerank,
         }
     }
 }
