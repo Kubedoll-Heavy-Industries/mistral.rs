@@ -92,6 +92,7 @@ pub mod defaults {
     pub const PAGED_CTXT_LEN: Option<usize> = None;
     pub const PAGED_ATTN_BLOCK_SIZE: Option<usize> = None;
     pub const PAGED_ATTN: Option<bool> = None;
+    pub const MAX_PREFILL_CHUNK_SIZE: Option<usize> = None;
     pub const PAGED_ATTN_CPU: bool = false;
     pub const PAGED_ATTN_CUDA: bool = true;
     pub const PAGED_ATTN_METAL: bool = false;
@@ -212,6 +213,11 @@ pub struct MistralRsForServerBuilder {
     /// Enables or disables PagedAttention. By default, PagedAttention will be enabled for CUDA and disabled for Metal (and is not supported for CPU). Use this to override the default behavior.
     paged_attn: Option<bool>,
 
+    /// Maximum number of tokens to process in a single prefill iteration (chunked prefill).
+    /// When set, long prompts are split into chunks to reduce time-to-first-token and enable
+    /// better pipeline utilization. Default: None (process entire prompt in one iteration).
+    max_prefill_chunk_size: Option<usize>,
+
     /// Use CPU only
     cpu: bool,
 
@@ -236,6 +242,10 @@ pub struct MistralRsForServerBuilder {
     /// Optional layer range for pipeline parallelism.
     /// When set, only layers in this range are loaded (partial layer loading).
     layer_range: Option<std::ops::Range<usize>>,
+
+    /// Optional cross-encoder reranking model configuration.
+    /// When set, enables the `/v1/rerank` endpoint.
+    rerank_model: Option<mistralrs_core::RerankModelConfig>,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -262,6 +272,7 @@ impl Default for MistralRsForServerBuilder {
             paged_ctxt_len: defaults::PAGED_CTXT_LEN,
             paged_attn_block_size: defaults::PAGED_ATTN_BLOCK_SIZE,
             paged_attn: defaults::PAGED_ATTN,
+            max_prefill_chunk_size: defaults::MAX_PREFILL_CHUNK_SIZE,
             cpu: defaults::CPU,
             enable_search: defaults::ENABLE_SEARCH,
             search_embedding_model: defaults::SEARCH_EMBEDDING_MODEL,
@@ -270,6 +281,7 @@ impl Default for MistralRsForServerBuilder {
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
             hook: None,
             layer_range: None,
+            rerank_model: None,
         }
     }
 }
@@ -531,6 +543,24 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Sets the maximum prefill chunk size for chunked prefill scheduling.
+    /// When set, long prompts are split into chunks to reduce TTFT.
+    pub fn with_max_prefill_chunk_size(mut self, max_prefill_chunk_size: usize) -> Self {
+        self.max_prefill_chunk_size = Some(max_prefill_chunk_size);
+        self
+    }
+
+    /// Sets the maximum prefill chunk size if provided.
+    pub fn with_max_prefill_chunk_size_optional(
+        mut self,
+        max_prefill_chunk_size: Option<usize>,
+    ) -> Self {
+        if let Some(size) = max_prefill_chunk_size {
+            self = self.with_max_prefill_chunk_size(size);
+        }
+        self
+    }
+
     /// Sets whether to force CPU-only execution.
     pub fn with_cpu(mut self, cpu: bool) -> Self {
         self.cpu = cpu;
@@ -568,6 +598,33 @@ impl MistralRsForServerBuilder {
     pub fn with_mcp_config_optional(mut self, mcp_config: Option<McpClientConfig>) -> Self {
         if let Some(mcp_config) = mcp_config {
             self = self.with_mcp_config(mcp_config);
+        }
+        self
+    }
+
+    /// Sets the cross-encoder reranking model configuration.
+    ///
+    /// When set, enables the `/v1/rerank` endpoint for document reranking.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use mistralrs_core::RerankModelConfig;
+    ///
+    /// let builder = MistralRsForServerBuilder::new()
+    ///     .with_rerank_model(RerankModelConfig::new("BAAI/bge-reranker-base"));
+    /// ```
+    pub fn with_rerank_model(mut self, config: mistralrs_core::RerankModelConfig) -> Self {
+        self.rerank_model = Some(config);
+        self
+    }
+
+    /// Sets the reranking model configuration if provided.
+    pub fn with_rerank_model_optional(
+        mut self,
+        config: Option<mistralrs_core::RerankModelConfig>,
+    ) -> Self {
+        if let Some(config) = config {
+            self = self.with_rerank_model(config);
         }
         self
     }
@@ -680,7 +737,13 @@ impl MistralRsForServerBuilder {
         )?;
         info!("Model loaded.");
 
-        let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
+        let scheduler_config = init_scheduler_config(
+            &cache_config,
+            &pipeline,
+            self.max_seqs,
+            self.max_prefill_chunk_size,
+        )
+        .await;
 
         let search_embedding_model =
             get_search_embedding_model(self.enable_search, self.search_embedding_model);
@@ -800,7 +863,13 @@ impl MistralRsForServerBuilder {
         );
         pipeline_names.push(first_pipeline_name);
 
-        let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
+        let scheduler_config = init_scheduler_config(
+            &cache_config,
+            &pipeline,
+            self.max_seqs,
+            self.max_prefill_chunk_size,
+        )
+        .await;
         let search_embedding_model =
             get_search_embedding_model(self.enable_search, self.search_embedding_model);
 
@@ -898,6 +967,7 @@ impl MistralRsForServerBuilder {
                 search_callback: self.search_callback.clone(),
                 tool_callbacks: HashMap::new(),
                 tool_callbacks_with_tools: HashMap::new(),
+                rerank_model: self.rerank_model.clone(),
             };
 
             let mut add_model_config = mistralrs_core::AddModelConfig::new(engine_config);
@@ -1115,6 +1185,7 @@ async fn init_scheduler_config(
     cache_config: &Option<PagedAttentionConfig>,
     pipeline: &LoadedPipeline,
     args_max_seqs: usize,
+    max_prefill_chunk_size: Option<usize>,
 ) -> SchedulerConfig {
     if cache_config.is_some() {
         // Handle case where we may have device mapping
@@ -1122,7 +1193,7 @@ async fn init_scheduler_config(
             SchedulerConfig::PagedAttentionMeta {
                 max_num_seqs: args_max_seqs,
                 config: cache_config.clone(),
-                max_prefill_chunk_size: None,
+                max_prefill_chunk_size,
             }
         } else {
             SchedulerConfig::DefaultScheduler {
