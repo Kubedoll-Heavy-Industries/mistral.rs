@@ -641,6 +641,9 @@ impl Engine {
                                 seq.prompt_timestamp = Some(now);
                                 seq.total_prompt_time = Some(now - seq.timestamp());
                             }
+                            // Advance prefill chunk offsets after processing prefill tokens.
+                            // This allows chunked prefill to continue with the next chunk.
+                            scheduler.advance_prefill_chunk_offsets();
                         }
                     }
                 }
