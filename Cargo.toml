@@ -183,9 +183,13 @@ mistralrs = { path = "mistralrs", version = "0.7.0" }
 mistralrs-audio = { path = "mistralrs-audio", version = "0.7.0" }
 mistralrs-mcp = { path = "mistralrs-mcp", version = "0.7.0" }
 
+# Text Embeddings Inference - core traits for embedding/reranking backends
+text-embeddings-backend-core = { git = "https://github.com/Kubedoll-Heavy-Industries/text-embeddings-inference.git", branch = "kubedoll/candle-fork" }
+text-embeddings-backend-candle = { git = "https://github.com/Kubedoll-Heavy-Industries/text-embeddings-inference.git", branch = "kubedoll/candle-fork", default-features = false }
+
 # OpenInference semantic conventions for LLM observability
-openinference-semantic-conventions = { path = "../openinference-rs/openinference-semantic-conventions" }
-openinference-instrumentation = { path = "../openinference-rs/openinference-instrumentation" }
+openinference-semantic-conventions = { git = "https://github.com/Kubedoll-Heavy-Industries/openinference-rs.git", branch = "main" }
+openinference-instrumentation = { git = "https://github.com/Kubedoll-Heavy-Industries/openinference-rs.git", branch = "main" }
 
 [profile.release-with-debug]
 inherits = "release"

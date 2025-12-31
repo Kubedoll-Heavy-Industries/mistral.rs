@@ -111,6 +111,10 @@ mistralrs-mcp = { workspace = true, features = ["utoipa"] }
 statrs.workspace = true
 openai-harmony = "0.0.8"
 
+# TEI crates for BERT-family embedding/reranking models
+text-embeddings-backend-core.workspace = true
+text-embeddings-backend-candle = { workspace = true, optional = true }
+
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
@@ -145,6 +149,7 @@ mkl = ["candle-core/mkl", "candle-nn/mkl"]
 nccl = ["cuda", "mistralrs-quant/nccl"]
 utoipa = ["dep:utoipa"]
 ring = ["mistralrs-quant/ring"]
+tei-backend = ["dep:text-embeddings-backend-candle"]
 
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }

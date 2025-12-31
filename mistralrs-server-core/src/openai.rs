@@ -837,6 +837,87 @@ pub struct EmbeddingResponse {
     pub usage: EmbeddingUsage,
 }
 
+/// Reranking request (Cohere/Jina compatible)
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct RerankRequest {
+    /// Model to use for reranking
+    #[schema(example = "bge-reranker-base")]
+    #[serde(default = "default_model")]
+    pub model: String,
+    /// Query to rank documents against
+    #[schema(example = "What is Deep Learning?")]
+    pub query: String,
+    /// Documents to rerank
+    #[schema(example = json!(["Deep Learning is a subset of machine learning", "Paris is the capital of France"]))]
+    pub documents: Vec<RerankDocument>,
+    /// Number of top results to return (default: return all)
+    #[serde(default)]
+    pub top_n: Option<usize>,
+    /// Whether to return the document text in the response
+    #[serde(default = "default_true")]
+    pub return_documents: bool,
+}
+
+/// A document to rerank - can be a string or an object with text field
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum RerankDocument {
+    /// Plain text document
+    Text(String),
+    /// Document object with text field
+    Object { text: String },
+}
+
+impl RerankDocument {
+    pub fn as_text(&self) -> &str {
+        match self {
+            RerankDocument::Text(s) => s,
+            RerankDocument::Object { text } => text,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Reranking response
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RerankResponse {
+    /// Model used for reranking
+    pub model: String,
+    /// Reranked results sorted by relevance score (descending)
+    pub results: Vec<RerankResult>,
+    /// Usage information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RerankUsage>,
+}
+
+/// A single reranking result
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RerankResult {
+    /// Original index of the document in the input array
+    pub index: usize,
+    /// Relevance score (higher is more relevant)
+    pub relevance_score: f32,
+    /// The document text (only present if return_documents is true)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<RerankResultDocument>,
+}
+
+/// Document in rerank result
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RerankResultDocument {
+    pub text: String,
+}
+
+/// Usage information for reranking
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RerankUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
 /// Image generation request
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct ImageGenerationRequest {

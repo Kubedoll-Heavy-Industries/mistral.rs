@@ -13,12 +13,15 @@ use crate::{
         EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest, EmbeddingResponse,
         EmbeddingUsage, EmbeddingVector, FunctionCalled, Grammar, ImageGenerationRequest,
         JsonSchemaResponseFormat, Message, MessageContent, MessageInnerContent, ModelObject,
-        ModelObjects, ResponseFormat, ResponsesAnnotation, ResponsesChunk, ResponsesContent,
-        ResponsesCreateRequest, ResponsesDelta, ResponsesDeltaContent, ResponsesDeltaOutput,
-        ResponsesError, ResponsesIncompleteDetails, ResponsesInputTokensDetails, ResponsesMessages,
-        ResponsesObject, ResponsesOutput, ResponsesOutputTokensDetails, ResponsesUsage,
-        SpeechGenerationRequest, StopTokens, ToolCall,
+        ModelObjects, RerankDocument, RerankRequest, RerankResponse, RerankResult,
+        RerankResultDocument, RerankUsage, ResponseFormat, ResponsesAnnotation, ResponsesChunk,
+        ResponsesContent, ResponsesCreateRequest, ResponsesDelta, ResponsesDeltaContent,
+        ResponsesDeltaOutput, ResponsesError, ResponsesIncompleteDetails,
+        ResponsesInputTokensDetails, ResponsesMessages, ResponsesObject, ResponsesOutput,
+        ResponsesOutputTokensDetails, ResponsesUsage, SpeechGenerationRequest, StopTokens,
+        ToolCall,
     },
+    reranking::__path_rerank,
     responses::{__path_create_response, __path_delete_response, __path_get_response},
     speech_generation::__path_speech_generation,
 };
@@ -69,7 +72,7 @@ use mistralrs_core::{
 pub fn get_openapi_doc(base_path: Option<&str>) -> utoipa::openapi::OpenApi {
     #[derive(OpenApi)]
     #[openapi(
-        paths(models, health, chatcompletions, completions, embeddings, re_isq, image_generation, speech_generation, create_response, get_response, delete_response),
+        paths(models, health, chatcompletions, completions, embeddings, rerank, re_isq, image_generation, speech_generation, create_response, get_response, delete_response),
         components(schemas(
             ApproximateUserLocation,
             AudioResponseFormat,
@@ -94,6 +97,12 @@ pub fn get_openapi_doc(base_path: Option<&str>) -> utoipa::openapi::OpenApi {
             ModelObject,
             ModelObjects,
             ReIsqRequest,
+            RerankDocument,
+            RerankRequest,
+            RerankResponse,
+            RerankResult,
+            RerankResultDocument,
+            RerankUsage,
             ResponseFormat,
             ResponsesAnnotation,
             ResponsesChunk,

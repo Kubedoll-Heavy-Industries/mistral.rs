@@ -101,6 +101,15 @@ pub enum RequestMessage {
     EmbeddingTokens {
         prompt: Vec<u32>,
     },
+    /// Cross-encoder reranking request
+    Rerank {
+        /// Query to rank documents against
+        query: String,
+        /// Documents to rerank
+        documents: Vec<String>,
+        /// Whether to truncate if input exceeds max length
+        truncate: bool,
+    },
 }
 
 fn default_responder<T>() -> Sender<T> {

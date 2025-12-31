@@ -266,6 +266,13 @@ pub enum Response {
         prompt_tokens: usize,
         total_tokens: usize,
     },
+    // Reranking (cross-encoder scores)
+    Rerank {
+        /// Relevance scores for each document (same order as input)
+        scores: Vec<f32>,
+        prompt_tokens: usize,
+        total_tokens: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +299,12 @@ pub enum ResponseOk {
     // Embeddings
     Embeddings {
         embeddings: Vec<f32>,
+        prompt_tokens: usize,
+        total_tokens: usize,
+    },
+    // Reranking (cross-encoder scores)
+    Rerank {
+        scores: Vec<f32>,
         prompt_tokens: usize,
         total_tokens: usize,
     },
@@ -379,6 +392,15 @@ impl Response {
                 total_tokens,
             } => Ok(ResponseOk::Embeddings {
                 embeddings,
+                prompt_tokens,
+                total_tokens,
+            }),
+            Self::Rerank {
+                scores,
+                prompt_tokens,
+                total_tokens,
+            } => Ok(ResponseOk::Rerank {
+                scores,
                 prompt_tokens,
                 total_tokens,
             }),
