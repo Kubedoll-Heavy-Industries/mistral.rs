@@ -330,7 +330,8 @@ async fn process_embedding_response(
             | Response::CompletionModelError(_, _)
             | Response::ImageGeneration(_)
             | Response::Speech { .. }
-            | Response::Raw { .. } => Err(anyhow!(
+            | Response::Raw { .. }
+            | Response::Rerank { .. } => Err(anyhow!(
                 "Received unexpected response type from embedding request."
             )),
         },

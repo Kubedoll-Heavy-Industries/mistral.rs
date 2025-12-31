@@ -29,6 +29,12 @@ impl Engine {
     pub async fn handle_request(self: Arc<Self>, request: Request) {
         match request {
             Request::Normal(request) => {
+                // Handle reranking separately - it uses TEI's predict() not generation
+                if matches!(&request.messages, RequestMessage::Rerank { .. }) {
+                    self.handle_rerank_request(*request).await;
+                    return;
+                }
+
                 let is_chat = matches!(
                     &request.messages,
                     RequestMessage::Chat { .. } | RequestMessage::VisionChat { .. }
@@ -78,7 +84,8 @@ impl Engine {
             | RequestMessage::ImageGeneration { .. }
             | RequestMessage::SpeechGeneration { .. }
             | RequestMessage::Embedding { .. }
-            | RequestMessage::EmbeddingTokens { .. } => None,
+            | RequestMessage::EmbeddingTokens { .. }
+            | RequestMessage::Rerank { .. } => None,
         };
         let truncate_sequence = request.truncate_sequence;
         if is_chat
@@ -115,6 +122,7 @@ impl Engine {
                 ModelCategory::Embedding,
                 RequestMessage::Embedding { .. } | RequestMessage::EmbeddingTokens { .. },
             ) => (),
+            (ModelCategory::Rerank, RequestMessage::Rerank { .. }) => (),
             _ => {
                 request
                     .response
@@ -229,6 +237,10 @@ impl Engine {
                     .decode(&it, false)
                     .map_err(|e| anyhow::Error::msg(e.to_string()));
                 (it, handle_seq_error!(prompt, request.response))
+            }
+            // Rerank is handled early in handle_request, should never reach here
+            RequestMessage::Rerank { .. } => {
+                unreachable!("Rerank requests are handled by handle_rerank_request")
             }
         };
         if prompt_tokens.is_empty() {
@@ -764,5 +776,72 @@ impl Engine {
             .send(Ok(txt))
             .await
             .expect("Sender disconnected unexpectedly!");
+    }
+
+    /// Handle a reranking request using TEI's cross-encoder predict().
+    ///
+    /// Reranking is handled separately from the standard generation pipeline because:
+    /// 1. It uses classification (predict) rather than generation
+    /// 2. Input is (query, document) pairs, not single prompts
+    /// 3. Output is relevance scores, not generated tokens
+    async fn handle_rerank_request(&self, request: NormalRequest) {
+        let (query, documents, truncate) = match &request.messages {
+            RequestMessage::Rerank {
+                query,
+                documents,
+                truncate,
+            } => (query.clone(), documents.clone(), *truncate),
+            _ => {
+                request
+                    .response
+                    .send(Response::InternalError(
+                        "handle_rerank_request called with non-Rerank message".into(),
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                return;
+            }
+        };
+
+        // Get the rerank backend
+        let backend_guard = self.rerank_backend.lock().await;
+        let backend = match backend_guard.as_ref() {
+            Some(b) => b,
+            None => {
+                request
+                    .response
+                    .send(Response::ValidationError(
+                        "No reranking model loaded. Use set_rerank_model() to load a cross-encoder model."
+                            .into(),
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                return;
+            }
+        };
+
+        // Perform reranking using TEI backend
+        match backend.rerank(&query, &documents, truncate) {
+            Ok(result) => {
+                request
+                    .response
+                    .send(Response::Rerank {
+                        scores: result.scores,
+                        prompt_tokens: result.prompt_tokens,
+                        total_tokens: result.total_tokens,
+                    })
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+            }
+            Err(e) => {
+                request
+                    .response
+                    .send(Response::InternalError(
+                        format!("Reranking failed: {e}").into(),
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+            }
+        }
     }
 }

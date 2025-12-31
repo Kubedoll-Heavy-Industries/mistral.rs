@@ -17,6 +17,7 @@ use crate::{
     handlers::{health, models, re_isq},
     image_generation::image_generation,
     openapi_doc::get_openapi_doc,
+    reranking::rerank,
     responses::{cancel_response, create_response, delete_response, get_response},
     speech_generation::speech_generation,
     types::SharedMistralRsState,
@@ -198,6 +199,7 @@ fn init_router(
         .route("/v1/chat/completions", post(chatcompletions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/rerank", post(rerank))
         .route("/v1/models", get(models))
         .route("/health", get(health))
         .route("/", get(health))

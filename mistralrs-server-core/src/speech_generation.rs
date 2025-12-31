@@ -214,5 +214,6 @@ pub fn match_responses(
         }
         Response::Raw { .. } => unreachable!(),
         Response::Embeddings { .. } => unreachable!(),
+        Response::Rerank { .. } => unreachable!(),
     }
 }

@@ -160,6 +160,7 @@ impl futures::Stream for ChatCompletionStreamer {
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
+                Response::Rerank { .. } => unreachable!(),
             },
             Poll::Pending | Poll::Ready(None) => Poll::Pending,
         }
@@ -653,5 +654,6 @@ pub fn match_responses(state: SharedMistralRsState, response: Response) -> ChatC
         Response::Speech { .. } => unreachable!(),
         Response::Raw { .. } => unreachable!(),
         Response::Embeddings { .. } => unreachable!(),
+        Response::Rerank { .. } => unreachable!(),
     }
 }

@@ -400,6 +400,7 @@ async fn text_interactive_mode(
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
+                Response::Rerank { .. } => unreachable!(),
             }
         }
 
@@ -714,6 +715,7 @@ async fn vision_interactive_mode(
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
+                Response::Rerank { .. } => unreachable!(),
             }
         }
 

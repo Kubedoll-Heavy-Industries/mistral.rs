@@ -520,6 +520,20 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                             .await;
                         return;
                     }
+                    Response::Rerank {
+                        scores,
+                        prompt_tokens,
+                        total_tokens,
+                    } => {
+                        let _ = user_sender
+                            .send(Response::Rerank {
+                                scores,
+                                prompt_tokens,
+                                total_tokens,
+                            })
+                            .await;
+                        return;
+                    }
                 };
 
                 // Did the assistant ask to run a tool?
@@ -656,6 +670,20 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                                     pcm,
                                     rate,
                                     channels,
+                                })
+                                .await;
+                            return;
+                        }
+                        Response::Rerank {
+                            scores,
+                            prompt_tokens,
+                            total_tokens,
+                        } => {
+                            let _ = user_sender
+                                .send(Response::Rerank {
+                                    scores,
+                                    prompt_tokens,
+                                    total_tokens,
                                 })
                                 .await;
                             return;

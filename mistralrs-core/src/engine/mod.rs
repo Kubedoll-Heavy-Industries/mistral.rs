@@ -101,6 +101,63 @@ impl FromStr for SearchEmbeddingModel {
     }
 }
 
+/// Configuration for loading a cross-encoder reranking model.
+///
+/// Reranking models score query-document pairs for relevance ranking.
+/// Common models include `BAAI/bge-reranker-base` and `jinaai/jina-reranker-v2-base-multilingual`.
+///
+/// # Example
+/// ```ignore
+/// let rerank_config = RerankModelConfig {
+///     model_id: "BAAI/bge-reranker-base".to_string(),
+///     revision: None,
+///     token: None,
+///     dtype: Some("float16".to_string()),
+/// };
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RerankModelConfig {
+    /// HuggingFace model ID (e.g., "BAAI/bge-reranker-base")
+    pub model_id: String,
+    /// Optional revision (branch, tag, or commit hash)
+    pub revision: Option<String>,
+    /// Optional HuggingFace token for private models
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Data type: "float32" or "float16" (default: "float32")
+    pub dtype: Option<String>,
+}
+
+impl RerankModelConfig {
+    /// Create a new rerank model configuration
+    pub fn new(model_id: impl Into<String>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            revision: None,
+            token: None,
+            dtype: None,
+        }
+    }
+
+    /// Set the revision (branch, tag, or commit)
+    pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
+        self.revision = Some(revision.into());
+        self
+    }
+
+    /// Set the HuggingFace token
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        self.token = Some(token.into());
+        self
+    }
+
+    /// Set the data type
+    pub fn with_dtype(mut self, dtype: impl Into<String>) -> Self {
+        self.dtype = Some(dtype.into());
+        self
+    }
+}
+
 const SEED: u64 = 0;
 /// Terminate all sequences on the next scheduling step. Be sure to reset this.
 /// This is a global flag for terminating all engines at once (e.g., Ctrl+C).
@@ -170,6 +227,8 @@ pub struct Engine {
     logger: IntervalLogger,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     pending_notify: Arc<Notify>,
+    /// Optional TEI-based reranking backend for cross-encoder scoring
+    rerank_backend: Arc<Mutex<Option<crate::tei_backend::RerankBackend>>>,
 }
 
 impl Drop for Engine {
@@ -196,6 +255,7 @@ impl Engine {
         search_callback: Option<Arc<search::SearchCallback>>,
         tool_callbacks: tools::ToolCallbacks,
         tool_callbacks_with_tools: tools::ToolCallbacksWithTools,
+        rerank_model: Option<RerankModelConfig>,
     ) -> anyhow::Result<Self> {
         no_kv_cache |= get_mut_arcmutex!(pipeline).get_metadata().no_kv_cache;
 
@@ -209,6 +269,22 @@ impl Engine {
                 search_embedding_model,
                 &get_mut_arcmutex!(pipeline).device(),
             )?),
+            None => None,
+        };
+
+        // Load reranking backend if configured
+        let rerank_backend = match rerank_model {
+            Some(config) => {
+                tracing::info!("Loading reranking model: {}", config.model_id);
+                let backend = crate::tei_backend::RerankBackend::from_hf(
+                    &config.model_id,
+                    config.revision.as_deref(),
+                    config.token.as_deref(),
+                    config.dtype.as_deref(),
+                )?;
+                tracing::info!("Reranking model loaded successfully");
+                Some(backend)
+            }
             None => None,
         };
 
@@ -242,6 +318,7 @@ impl Engine {
             logger: IntervalLogger::new(Duration::from_secs(5)),
             handles: Arc::new(Mutex::new(Vec::new())),
             pending_notify: Arc::new(Notify::new()),
+            rerank_backend: Arc::new(Mutex::new(rerank_backend)),
         })
     }
 
@@ -256,6 +333,37 @@ impl Engine {
         } else {
             Some(pipeline.get_metadata().max_seq_len)
         }
+    }
+
+    /// Load a reranking model from HuggingFace Hub
+    ///
+    /// # Arguments
+    /// * `model_id` - HuggingFace model ID (e.g., "BAAI/bge-reranker-base")
+    /// * `revision` - Optional revision (branch, tag, or commit)
+    /// * `token` - Optional HuggingFace token for private models
+    /// * `dtype` - Data type ("float32" or "float16")
+    pub async fn set_rerank_model(
+        &self,
+        model_id: impl Into<String>,
+        revision: Option<&str>,
+        token: Option<&str>,
+        dtype: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let backend =
+            crate::tei_backend::RerankBackend::from_hf(model_id, revision, token, dtype)?;
+        let mut guard = self.rerank_backend.lock().await;
+        *guard = Some(backend);
+        Ok(())
+    }
+
+    /// Check if a reranking model is loaded
+    pub async fn has_rerank_model(&self) -> bool {
+        self.rerank_backend.lock().await.is_some()
+    }
+
+    /// Get the rerank backend for direct access
+    pub fn rerank_backend(&self) -> &Arc<Mutex<Option<crate::tei_backend::RerankBackend>>> {
+        &self.rerank_backend
     }
 
     pub async fn run(self: Arc<Self>) {

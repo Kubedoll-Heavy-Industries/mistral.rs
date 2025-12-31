@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use mistralrs_core::{
-    initialize_logging, McpClientConfig, ModelSelected, PagedCacheType, SearchEmbeddingModel,
-    TokenSource,
+    initialize_logging, McpClientConfig, ModelSelected, PagedCacheType, RerankModelConfig,
+    SearchEmbeddingModel, TokenSource,
 };
 use rust_mcp_sdk::schema::LATEST_PROTOCOL_VERSION;
 use std::collections::HashMap;
@@ -143,6 +143,19 @@ struct Args {
     /// Select which built-in search embedding model to load (e.g., `embedding_gemma`).
     #[arg(long = "search-embedding-model")]
     search_embedding_model: Option<SearchEmbeddingModel>,
+
+    /// HuggingFace model ID for cross-encoder reranking (e.g., "BAAI/bge-reranker-base").
+    /// When set, enables the `/v1/rerank` endpoint.
+    #[arg(long = "rerank-model")]
+    rerank_model: Option<String>,
+
+    /// Revision for the reranking model (branch, tag, or commit).
+    #[arg(long = "rerank-revision")]
+    rerank_revision: Option<String>,
+
+    /// Data type for the reranking model ("float32" or "float16").
+    #[arg(long = "rerank-dtype")]
+    rerank_dtype: Option<String>,
 
     /// Enable thinking for interactive mode and models that support it.
     #[arg(long = "enable-thinking")]
@@ -370,6 +383,17 @@ async fn main() -> Result<()> {
                 builder = builder.with_search_embedding_model(model);
             }
 
+            if let Some(model_id) = &args.rerank_model {
+                let mut config = RerankModelConfig::new(model_id);
+                if let Some(rev) = &args.rerank_revision {
+                    config = config.with_revision(rev);
+                }
+                if let Some(dtype) = &args.rerank_dtype {
+                    config = config.with_dtype(dtype);
+                }
+                builder = builder.with_rerank_model(config);
+            }
+
             builder.build_multi_model().await?
         }
         model => {
@@ -399,6 +423,17 @@ async fn main() -> Result<()> {
 
             if let Some(model) = args.search_embedding_model {
                 builder = builder.with_search_embedding_model(model);
+            }
+
+            if let Some(model_id) = &args.rerank_model {
+                let mut config = RerankModelConfig::new(model_id);
+                if let Some(rev) = &args.rerank_revision {
+                    config = config.with_revision(rev);
+                }
+                if let Some(dtype) = &args.rerank_dtype {
+                    config = config.with_dtype(dtype);
+                }
+                builder = builder.with_rerank_model(config);
             }
 
             builder.build().await?
