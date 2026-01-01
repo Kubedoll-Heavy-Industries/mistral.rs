@@ -779,4 +779,17 @@ pub enum ModelSelected {
         #[serde(default = "default_max_batch_size")]
         max_batch_size: usize,
     },
+
+    /// Select a reranking (cross-encoder) model using TEI backend.
+    Rerank {
+        /// Model ID to load from. This may be a HF hub repo or a local path.
+        /// Examples: "BAAI/bge-reranker-base", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        #[arg(short, long)]
+        model_id: String,
+
+        /// Model data type. Defaults to `auto`.
+        #[arg(short, long, default_value_t = ModelDType::Auto, value_parser = parse_model_dtype)]
+        #[serde(default = "default_model_dtype")]
+        dtype: ModelDType,
+    },
 }
