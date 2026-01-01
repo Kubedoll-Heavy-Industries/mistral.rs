@@ -32,8 +32,8 @@ use crate::utils::progress::ProgressScopeGuard;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::xlora_models::NonGranularState;
 use crate::{
-    get_mut_arcmutex, get_paths_gguf, DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting,
-    LocalModelPaths, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    get_mut_arcmutex, get_paths_gguf, DeviceMapSetting, LocalModelPaths, PagedAttentionConfig,
+    Pipeline, Topology, TryIntoDType,
 };
 use crate::{
     models::quantized_llama::ModelWeights as QLlama,
@@ -331,25 +331,23 @@ impl Loader for GGUFLoader {
         let arch = model.arch();
 
         // If auto, convert to Map
-        let num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
-        // Skip auto device mapping when layer_range is specified (pipeline parallelism).
-        // Each pipeline stage's layers should fit on its assigned GPU without CPU offloading.
-        // Auto mapping is designed for single-node scenarios and doesn't account for partial layer loading.
-        let skip_auto_map = self.config.layer_range.is_some();
-        if let DeviceMapSetting::Auto(params) = mapper.clone() {
-            if skip_auto_map {
+        let total_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
+
+        // For pipeline parallelism, compute device map for only the loaded layers
+        let (num_layers, layer_range_for_sizes) = match &self.config.layer_range {
+            Some(range) => {
+                let end = range.end.min(total_layers);
+                let start = range.start.min(end);
                 info!(
-                    "Pipeline parallelism: skipping auto device mapping, using primary device for all {} layers in range {:?}",
-                    self.config.layer_range.as_ref().map(|r| r.len()).unwrap_or(num_layers),
-                    self.config.layer_range
+                    "Pipeline parallelism: computing device map for {} layers (range {:?} of {} total)",
+                    end - start, range, total_layers
                 );
-                mapper = DeviceMapSetting::Map(DeviceMapMetadata::from_num_device_layers(vec![
-                    DeviceLayerMapMetadata {
-                        ordinal: 0,
-                        layers: num_layers,
-                    },
-                ]));
-            } else {
+                (end - start, Some(start..end))
+            }
+            None => (total_layers, None),
+        };
+
+        if let DeviceMapSetting::Auto(params) = mapper.clone() {
             let devices = device_map::get_all_similar_devices(device)?;
             // Initial dtype
             let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
@@ -359,8 +357,14 @@ impl Loader for GGUFLoader {
                 arch,
             };
 
-            let layer_sizes_in_bytes =
+            // Get layer sizes, slicing to loaded range for pipeline parallelism
+            let all_layer_sizes =
                 model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1, None)?;
+            let layer_sizes_in_bytes = match &layer_range_for_sizes {
+                Some(range) => all_layer_sizes[range.clone()].to_vec(),
+                None => all_layer_sizes,
+            };
+
             let non_mapped_size_in_bytes =
                 model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None)?;
             let total_model_size_in_bytes =
@@ -378,7 +382,6 @@ impl Loader for GGUFLoader {
                 paged_attn_config.as_ref(),
             )?;
             mapper = DeviceMapSetting::Map(new);
-            }
         }
 
         #[cfg(feature = "cuda")]

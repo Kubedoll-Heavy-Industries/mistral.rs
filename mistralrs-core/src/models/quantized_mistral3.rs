@@ -735,10 +735,9 @@ impl ModelWeights {
         });
 
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use global layer index for mapper (accounts for partial layer loading)
-            let global_layer_idx = self.layer_start + i;
+            // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
-                layer_in = mapper.map(layer_in, global_layer_idx)?;
+                layer_in = mapper.map(layer_in, i)?;
             }
 
             let x = layer.attention_norm.forward(&layer_in)?;
