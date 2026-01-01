@@ -93,6 +93,9 @@ pub async fn interactive_mode(
         Ok(ModelCategory::Embedding) => error!(
             "Embedding models do not support interactive mode. Use the server or Python/Rust APIs."
         ),
+        Ok(ModelCategory::Rerank) => error!(
+            "Rerank models do not support interactive mode. Use the server or Python/Rust APIs."
+        ),
         Err(e) => eprintln!("Error getting model category: {e}"),
     }
 }
