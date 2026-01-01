@@ -15,6 +15,7 @@ mod macros;
 mod normal;
 mod paths;
 mod processing;
+mod rerank;
 mod response;
 mod sampling;
 mod speculative;
@@ -31,6 +32,7 @@ pub use auto::{AutoLoader, AutoLoaderBuilder};
 use chat_template::ChatTemplate;
 pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
 pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
+pub use rerank::{RerankInputs, RerankLoader, RerankPipeline};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
 pub use gguf_embedding::{
@@ -394,6 +396,11 @@ pub enum ForwardInputsResult {
     Embeddings {
         embeddings: Tensor,
     },
+    /// Reranking scores - relevance scores for query-document pairs.
+    /// Shape: [batch_size] where each element is a relevance score.
+    Rerank {
+        scores: Tensor,
+    },
     CausalGeneration {
         logits: Tensor,
     },
@@ -415,6 +422,9 @@ impl ForwardInputsResult {
             }),
             Self::Embeddings { embeddings } => Ok(Self::Embeddings {
                 embeddings: embeddings.i(bs_idx)?,
+            }),
+            Self::Rerank { scores } => Ok(Self::Rerank {
+                scores: scores.i(bs_idx)?,
             }),
             Self::RawLogits { logits } => Ok(Self::RawLogits {
                 logits: logits.i(bs_idx)?,
@@ -444,6 +454,9 @@ impl ForwardInputsResult {
             }),
             Self::Embeddings { embeddings } => Ok(Self::Embeddings {
                 embeddings: embeddings.to_device(device)?,
+            }),
+            Self::Rerank { scores } => Ok(Self::Rerank {
+                scores: scores.to_device(device)?,
             }),
             Self::Image { .. } => Ok(self.clone()),
             Self::Speech { .. } => Ok(self.clone()),
@@ -615,7 +628,8 @@ pub trait Pipeline:
 
                 match &logits[0] {
                     ForwardInputsResult::RawLogits { .. }
-                    | ForwardInputsResult::Embeddings { .. } => unreachable!(),
+                    | ForwardInputsResult::Embeddings { .. }
+                    | ForwardInputsResult::Rerank { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {
                         self.sample_causal_gen(
                             input_seqs,
@@ -817,7 +831,8 @@ pub trait Pipeline:
 
                 match &logits[0] {
                     ForwardInputsResult::RawLogits { .. }
-                    | ForwardInputsResult::Embeddings { .. } => unreachable!(),
+                    | ForwardInputsResult::Embeddings { .. }
+                    | ForwardInputsResult::Rerank { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {
                         self.sample_causal_gen(
                             input_seqs,

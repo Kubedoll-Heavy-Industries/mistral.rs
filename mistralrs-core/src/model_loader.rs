@@ -11,8 +11,8 @@ use crate::{
     pipeline::{
         AutoLoaderBuilder, DiffusionLoaderBuilder, GGMLLoaderBuilder, GGMLSpecificConfig,
         GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig, GGUFLoaderBuilder,
-        GGUFSpecificConfig, NormalLoaderBuilder, NormalSpecificConfig, VisionLoaderBuilder,
-        VisionSpecificConfig,
+        GGUFSpecificConfig, NormalLoaderBuilder, NormalSpecificConfig, RerankLoader,
+        VisionLoaderBuilder, VisionSpecificConfig,
     },
     toml_selector::get_toml_selected_model_device_map_params,
     AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig, Loader, ModelDType,
@@ -89,7 +89,8 @@ pub fn get_tgt_non_granular_index(model: &ModelSelected) -> Option<usize> {
         | ModelSelected::DiffusionPlain { .. }
         | ModelSelected::Speech { .. }
         | ModelSelected::Embedding { .. }
-        | ModelSelected::GGUFEmbedding { .. } => None,
+        | ModelSelected::GGUFEmbedding { .. }
+        | ModelSelected::Rerank { .. } => None,
         ModelSelected::XLora {
             tgt_non_granular_index,
             ..
@@ -124,7 +125,8 @@ pub fn get_model_dtype(model: &ModelSelected) -> anyhow::Result<ModelDType> {
         | ModelSelected::Run { dtype, .. }
         | ModelSelected::Speech { dtype, .. }
         | ModelSelected::Embedding { dtype, .. }
-        | ModelSelected::GGUFEmbedding { dtype, .. } => Ok(*dtype),
+        | ModelSelected::GGUFEmbedding { dtype, .. }
+        | ModelSelected::Rerank { dtype, .. } => Ok(*dtype),
         ModelSelected::Toml { file } => {
             let selector: TomlSelector = toml::from_str(
                 &fs::read_to_string(file.clone())
@@ -227,7 +229,8 @@ pub fn get_auto_device_map_params(model: &ModelSelected) -> anyhow::Result<AutoD
         ModelSelected::DiffusionPlain { .. }
         | ModelSelected::Speech { .. }
         | ModelSelected::Embedding { .. }
-        | ModelSelected::GGUFEmbedding { .. } => Ok(AutoDeviceMapParams::default_text()),
+        | ModelSelected::GGUFEmbedding { .. }
+        | ModelSelected::Rerank { .. } => Ok(AutoDeviceMapParams::default_text()),
         ModelSelected::Toml { file } => {
             let selector: TomlSelector = toml::from_str(
                 &fs::read_to_string(file.clone())
@@ -738,6 +741,13 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             },
         )
         .build(),
+        ModelSelected::Rerank { model_id, dtype } => {
+            let dtype_str = match dtype {
+                ModelDType::Auto | ModelDType::BF16 | ModelDType::F32 => None,
+                ModelDType::F16 => Some("float16".to_string()),
+            };
+            Box::new(RerankLoader::new(model_id, dtype_str))
+        }
         ModelSelected::MultiModel { .. } => {
             anyhow::bail!("MultiModel variant should not be used in model loading functions")
         }
