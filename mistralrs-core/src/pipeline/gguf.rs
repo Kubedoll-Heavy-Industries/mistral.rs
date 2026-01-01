@@ -18,6 +18,7 @@ use crate::kv_cache::{FullCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
+    ModelConfigMetadata,
 };
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
 use crate::pipeline::loaders::DeviceMappedModelLoader;
@@ -402,6 +403,18 @@ impl Loader for GGUFLoader {
         // This check is not really necessary because `get_device_layers` should prevent it.
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
         if mapping_uses_cpu {
+            // For pipeline parallelism, fail if layers don't fit on GPU.
+            // CPU offloading doesn't work with distributed pipeline execution.
+            if let Some(ref range) = self.config.layer_range {
+                anyhow::bail!(
+                    "Pipeline parallelism: layers {}..{} don't fit on available GPU(s). \
+                     The coordinator assigned {} layers to this node, but they require CPU offloading. \
+                     Either increase GPU memory, reduce model size, or adjust pipeline stage splits.",
+                    range.start,
+                    range.end.min(total_layers),
+                    num_layers
+                );
+            }
             warn!("Device mapping contains a mix of GPU and CPU. There is no CPU support for PagedAttention, disabling PagedAttention.");
             paged_attn_config = None;
         }
@@ -498,19 +511,45 @@ impl Loader for GGUFLoader {
         };
 
         let (cache_config, cache_engine) = if let Some(paged_attn_config) = paged_attn_config {
-            let model_config: &dyn ModelConfigLike = &model_config_metadata;
+            // For pipeline parallelism, adjust num_layers to loaded layers only.
+            // This ensures PagedAttention allocates KV cache proportional to this node's layers,
+            // not the full model's layers.
+            let paged_attn_model_config: Box<dyn ModelConfigLike> =
+                if let Some(ref range) = self.config.layer_range {
+                    Box::new(ModelConfigMetadata {
+                        max_seq_len: model_config_metadata.max_seq_len(),
+                        num_layers: range.len(),
+                        hidden_size: model_config_metadata.hidden_size(),
+                        num_kv_heads: model_config_metadata.num_kv_heads(),
+                        num_attn_heads: model_config_metadata.num_attn_heads(),
+                        sliding_window: None,
+                        k_head_dim: model_config_metadata.k_head_dim(),
+                        v_head_dim: model_config_metadata.v_head_dim(),
+                    })
+                } else {
+                    Box::new(ModelConfigMetadata {
+                        max_seq_len: model_config_metadata.max_seq_len(),
+                        num_layers: model_config_metadata.num_layers(),
+                        hidden_size: model_config_metadata.hidden_size(),
+                        num_kv_heads: model_config_metadata.num_kv_heads(),
+                        num_attn_heads: model_config_metadata.num_attn_heads(),
+                        sliding_window: None,
+                        k_head_dim: model_config_metadata.k_head_dim(),
+                        v_head_dim: model_config_metadata.v_head_dim(),
+                    })
+                };
             let cache_config = calculate_cache_config(
                 paged_attn_config.mem_gpu,
                 paged_attn_config.block_size,
                 internal_dtype,
                 paged_attn_config.cache_type,
-                model_config,
+                paged_attn_model_config.as_ref(),
                 device,
                 &layer_devices,
                 silent,
             )?;
             let cache_engine = CacheEngine::new(
-                model_config,
+                paged_attn_model_config.as_ref(),
                 &cache_config,
                 internal_dtype,
                 device,

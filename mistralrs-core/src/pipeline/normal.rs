@@ -21,7 +21,10 @@ use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
-use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
+use crate::paged_attention::{
+    calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
+    ModelConfigMetadata,
+};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::isq::UqffFullSer;
 use crate::pipeline::loaders::auto_device_map;
@@ -922,12 +925,41 @@ impl Loader for NormalLoader {
         };
 
         let (cache_config, cache_engine) = if let Some(paged_attn_config) = paged_attn_config {
+            // For pipeline parallelism, adjust num_layers to loaded layers only.
+            // This ensures PagedAttention allocates KV cache proportional to this node's layers,
+            // not the full model's layers.
+            let base_config = model.config();
+            let paged_attn_model_config: Box<dyn ModelConfigLike> =
+                if let Some(ref range) = self.config.layer_range {
+                    Box::new(ModelConfigMetadata {
+                        max_seq_len: base_config.max_seq_len(),
+                        num_layers: range.len(),
+                        hidden_size: base_config.hidden_size(),
+                        num_kv_heads: base_config.num_kv_heads(),
+                        num_attn_heads: base_config.num_attn_heads(),
+                        sliding_window: None,
+                        k_head_dim: base_config.k_head_dim(),
+                        v_head_dim: base_config.v_head_dim(),
+                    })
+                } else {
+                    Box::new(ModelConfigMetadata {
+                        max_seq_len: base_config.max_seq_len(),
+                        num_layers: base_config.num_layers(),
+                        hidden_size: base_config.hidden_size(),
+                        num_kv_heads: base_config.num_kv_heads(),
+                        num_attn_heads: base_config.num_attn_heads(),
+                        sliding_window: None,
+                        k_head_dim: base_config.k_head_dim(),
+                        v_head_dim: base_config.v_head_dim(),
+                    })
+                };
+
             let cache_config = calculate_cache_config(
                 paged_attn_config.mem_gpu,
                 paged_attn_config.block_size,
                 dtype,
                 paged_attn_config.cache_type,
-                model.config(),
+                paged_attn_model_config.as_ref(),
                 &device,
                 &pipeline_mapper
                     .get_unique_devices()
@@ -943,7 +975,7 @@ impl Loader for NormalLoader {
                 layer_devices.push(device);
             }
             let cache_engine = CacheEngine::new(
-                model.config(),
+                paged_attn_model_config.as_ref(),
                 &cache_config,
                 dtype,
                 model.device(),
