@@ -109,8 +109,8 @@ struct Runner {
 static NEXT_REQUEST_ID: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
 
 fn wrap_search_callback(cb: PyObject) -> Arc<SearchCallback> {
-    Arc::new(move |params: &SearchFunctionParameters| {
-        Python::with_gil(|py| {
+    Arc::new(move |params: SearchFunctionParameters| {
+        let result = Python::with_gil(|py| {
             let obj = cb.call1(py, (params.query.clone(),))?;
             let list = obj.downcast_bound::<PyList>(py)?;
             let mut results = Vec::new();
@@ -128,7 +128,8 @@ fn wrap_search_callback(cb: PyObject) -> Arc<SearchCallback> {
             }
             Ok(results)
         })
-        .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()))
+        .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()));
+        Box::pin(async move { result })
     })
 }
 
@@ -1272,6 +1273,7 @@ impl Runner {
                     Response::Speech { .. } => unreachable!(),
                     Response::Raw { .. } => unreachable!(),
                     Response::Embeddings { .. } => unreachable!(),
+                    Response::Rerank { .. } => unreachable!(),
                 }
             }
         })
@@ -1406,6 +1408,11 @@ impl Runner {
                             "Received raw logits response from embeddings request.",
                         ))
                     }
+                    Response::Rerank { .. } => {
+                        return Err(PyApiErr::from(
+                            "Received rerank response from embeddings request.",
+                        ))
+                    }
                 }
             }
 
@@ -1517,6 +1524,7 @@ impl Runner {
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
+                Response::Rerank { .. } => unreachable!(),
             }
         })
     }
@@ -2037,6 +2045,7 @@ impl Runner {
                     Response::Speech { .. } => unreachable!(),
                     Response::Raw { .. } => unreachable!(),
                     Response::Embeddings { .. } => unreachable!(),
+                    Response::Rerank { .. } => unreachable!(),
                 }
             }
         })
@@ -2145,6 +2154,7 @@ impl Runner {
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
+                Response::Rerank { .. } => unreachable!(),
             }
         })
     }
