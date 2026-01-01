@@ -141,6 +141,8 @@ pub struct ModelWeights {
     pub max_seq_len: usize,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     dtype: DType,
+    /// Starting layer index for pipeline parallelism
+    layer_start: usize,
 }
 
 fn precomput_freqs_cis(
@@ -227,7 +229,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         mapper: Box<dyn DeviceMapper + Send + Sync>,
         attention_mechanism: AttentionImplementation,
         dtype: DType,
-        _layer_range: Option<std::ops::Range<usize>>,
+        layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self> {
         // Parameter extraction from metadata.
         let metadata = ContentMetadata {
@@ -244,6 +246,22 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
+        // Determine layer range for partial loading (pipeline parallelism)
+        let total_layers = block_count;
+        let layer_range = layer_range.unwrap_or(0..total_layers);
+        let layer_start = layer_range.start;
+        let layer_end = layer_range.end.min(total_layers);
+        let num_loaded_layers = layer_end - layer_start;
+
+        if layer_start > 0 || layer_end < total_layers {
+            tracing::info!(
+                "Pipeline parallelism: loading layers {}..{} of {} total",
+                layer_start,
+                layer_end,
+                total_layers
+            );
+        }
+
         let (cos, sin) = precomput_freqs_cis(rope_dim, 10_000., device, max_seq_len, dtype)?;
 
         let tok_embeddings = ct.tensor("token_embd.weight", device)?;
@@ -254,11 +272,12 @@ impl ModelConfig::FromGGUF for ModelWeights {
             ln_eps,
         )?;
         let output = QLinear::new(&mut ct, "output", device)?;
-        let mut layers = Vec::with_capacity(block_count);
+        let mut layers = Vec::with_capacity(num_loaded_layers);
         let head_dim = embedding_length / head_count;
 
+        // Only load layers in the specified range
         for layer_idx in NiceProgressBar::<_, 'b'>(
-            0..block_count,
+            layer_start..layer_end,
             "Loading repeating layers",
             &new_multi_progress(),
         ) {
@@ -334,10 +353,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
             output_norm,
             output,
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(block_count, max_seq_len)),
+            cache: EitherCache::Normal(NormalCache::new(num_loaded_layers, max_seq_len)),
             max_seq_len,
             mapper,
             dtype,
+            layer_start,
         })
     }
 }
@@ -368,7 +388,9 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            xs = self.mapper.map(xs, i)?;
+            // Use global layer index for mapper (accounts for partial layer loading)
+            let global_layer_idx = self.layer_start + i;
+            xs = self.mapper.map(xs, global_layer_idx)?;
             let residual = &xs;
             let xs_norm = xs.apply(&layer.attn_norm)?;
             let attn_outputs = layer.forward_attn(
