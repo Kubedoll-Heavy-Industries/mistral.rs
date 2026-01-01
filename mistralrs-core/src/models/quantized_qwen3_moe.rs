@@ -11,7 +11,7 @@ use crate::layers_masker::PastKvLenCache;
 use crate::ops::{TopKLastDimOp, TopKOutput};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
-use crate::pipeline::{extract_logits, EitherCache, KvCache, NormalCache};
+use crate::pipeline::{extract_logits, EitherCache, HookContainer, KvCache, NormalCache};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -207,6 +207,10 @@ pub struct ModelWeights {
     dtype: DType,
     /// Starting layer index for pipeline parallelism
     layer_start: usize,
+    /// Total layers in the full model (for hooks)
+    total_layers: usize,
+    /// Pipeline hook for distributed inference
+    hook: Option<HookContainer>,
 }
 
 #[derive(Debug, Clone)]
@@ -516,11 +520,33 @@ impl ModelConfig::FromGGUF for ModelWeights {
             mapper: Some(mapper),
             dtype,
             layer_start,
+            total_layers,
+            hook: None,
         })
     }
 }
 
 impl ModelWeights {
+    /// Check if this is the first pipeline stage (has embedding layer).
+    pub fn is_first_stage(&self) -> bool {
+        self.layer_start == 0
+    }
+
+    /// Check if this is the last pipeline stage (has lm_head).
+    pub fn is_last_stage(&self) -> bool {
+        self.layer_start + self.layers.len() >= self.total_layers
+    }
+
+    /// Set the pipeline hook for distributed inference.
+    pub fn set_hook(&mut self, hook: HookContainer) {
+        self.hook = Some(hook);
+    }
+
+    /// Get a reference to the pipeline hook.
+    pub fn get_hook(&self) -> Option<&HookContainer> {
+        self.hook.as_ref()
+    }
+
     pub fn forward(
         &self,
         x: &Tensor,
@@ -546,10 +572,23 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
+            // Use global layer index for hooks
+            let global_layer_idx = self.layer_start + i;
+
             // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
             }
+
+            // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
+            if let Some(ref hook) = self.hook {
+                if let Some(injected) =
+                    hook.call_layer_input(global_layer_idx, &layer_in, self.total_layers)?
+                {
+                    layer_in = injected;
+                }
+            }
+
             let x = layer_in;
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;
@@ -570,8 +609,16 @@ impl ModelWeights {
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
-            let x = (x + residual)?;
-            layer_in = x;
+            layer_in = (x + residual)?;
+
+            // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
+            if let Some(ref hook) = self.hook {
+                if let Some(replacement) =
+                    hook.call_layer_output(global_layer_idx, &layer_in, self.total_layers)?
+                {
+                    layer_in = replacement;
+                }
+            }
         }
         let x = self.norm.forward(&layer_in)?;
         extract_logits(

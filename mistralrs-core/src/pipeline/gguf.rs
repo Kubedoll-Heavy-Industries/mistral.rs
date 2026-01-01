@@ -1,8 +1,8 @@
 use super::llg::build_llg_factory;
 use super::{
     get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
-    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, PrettyName, QuantizationKind,
-    TokenSource,
+    CacheManager, GeneralMetadata, HookContainer, Loader, ModelKind, ModelPaths, PrettyName,
+    QuantizationKind, TokenSource,
 };
 use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
@@ -74,6 +74,41 @@ enum Model {
     Qwen(QQwen),
     Qwen3(QQwen3),
     Qwen3MoE(QQwen3MoE),
+}
+
+impl Model {
+    /// Set pipeline hook for distributed inference.
+    fn set_hook(&mut self, hook: HookContainer) {
+        match self {
+            Model::Llama(m) => m.set_hook(hook),
+            Model::Mistral3(m) => m.set_hook(hook),
+            Model::Phi2(m) => m.set_hook(hook),
+            Model::Phi3(m) => m.set_hook(hook),
+            Model::Starcoder2(m) => m.set_hook(hook),
+            Model::Qwen(m) => m.set_hook(hook),
+            Model::Qwen3(m) => m.set_hook(hook),
+            Model::Qwen3MoE(m) => m.set_hook(hook),
+            // XLora models don't support hooks yet
+            Model::XLoraLlama(_) | Model::XLoraPhi3(_) => {
+                tracing::warn!("XLora models do not support pipeline hooks yet");
+            }
+        }
+    }
+
+    /// Check if this model supports hooks.
+    fn supports_hooks(&self) -> bool {
+        match self {
+            Model::Llama(_)
+            | Model::Mistral3(_)
+            | Model::Phi2(_)
+            | Model::Phi3(_)
+            | Model::Starcoder2(_)
+            | Model::Qwen(_)
+            | Model::Qwen3(_)
+            | Model::Qwen3MoE(_) => true,
+            Model::XLoraLlama(_) | Model::XLoraPhi3(_) => false,
+        }
+    }
 }
 
 pub struct GGUFPipeline {
@@ -869,6 +904,12 @@ impl Pipeline for GGUFPipeline {
     }
     fn category(&self) -> ModelCategory {
         ModelCategory::Text
+    }
+    fn set_hook(&mut self, hook: HookContainer) {
+        self.model.set_hook(hook);
+    }
+    fn supports_hooks(&self) -> bool {
+        self.model.supports_hooks()
     }
 }
 

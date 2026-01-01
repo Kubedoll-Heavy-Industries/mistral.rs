@@ -10,7 +10,7 @@ use crate::layers::{CausalMasker, MatMul, QLinear, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
-use crate::pipeline::{EitherCache, KvCache, NormalCache};
+use crate::pipeline::{EitherCache, HookContainer, KvCache, NormalCache};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -146,6 +146,10 @@ pub struct ModelWeights {
     dtype: DType,
     /// Starting layer index for pipeline parallelism
     layer_start: usize,
+    /// Total layers in the full model (for hooks)
+    total_layers: usize,
+    /// Pipeline hook for distributed inference
+    hook: Option<HookContainer>,
 }
 
 // starcoder2 `llm` fields:
@@ -368,11 +372,33 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len: context_window,
             dtype,
             layer_start,
+            total_layers,
+            hook: None,
         })
     }
 }
 
 impl ModelWeights {
+    /// Check if this is the first pipeline stage (has embedding layer).
+    pub fn is_first_stage(&self) -> bool {
+        self.layer_start == 0
+    }
+
+    /// Check if this is the last pipeline stage (has lm_head).
+    pub fn is_last_stage(&self) -> bool {
+        self.layer_start + self.layers.len() >= self.total_layers
+    }
+
+    /// Set the pipeline hook for distributed inference.
+    pub fn set_hook(&mut self, hook: HookContainer) {
+        self.hook = Some(hook);
+    }
+
+    /// Get a reference to the pipeline hook.
+    pub fn get_hook(&self) -> Option<&HookContainer> {
+        self.hook.as_ref()
+    }
+
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -398,10 +424,23 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
+            // Use global layer index for hooks
+            let global_layer_idx = self.layer_start + i;
+
             // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
                 xs = mapper.map(xs, i)?;
             }
+
+            // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
+            if let Some(ref hook) = self.hook {
+                if let Some(injected) =
+                    hook.call_layer_input(global_layer_idx, &xs, self.total_layers)?
+                {
+                    xs = injected;
+                }
+            }
+
             let residual = &xs;
             let ys = xs.apply(&layer.attn_norm)?;
             let ys = layer.forward_attn(
@@ -419,7 +458,16 @@ impl ModelWeights {
             let residual = &ys;
             let ys = ys.apply(&layer.ffn_norm)?;
             let ys = layer.mlp.forward(&ys)?;
-            xs = (ys + residual)?
+            xs = (ys + residual)?;
+
+            // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
+            if let Some(ref hook) = self.hook {
+                if let Some(replacement) =
+                    hook.call_layer_output(global_layer_idx, &xs, self.total_layers)?
+                {
+                    xs = replacement;
+                }
+            }
         }
         let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;
         MatMul.qmatmul(&xs, &self.output)
