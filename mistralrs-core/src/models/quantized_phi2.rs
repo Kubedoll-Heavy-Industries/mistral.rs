@@ -388,9 +388,8 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use global layer index for mapper (accounts for partial layer loading)
-            let global_layer_idx = self.layer_start + i;
-            xs = self.mapper.map(xs, global_layer_idx)?;
+            // Use local index for device mapping (device map is computed for loaded layers only)
+            xs = self.mapper.map(xs, i)?;
             let residual = &xs;
             let xs_norm = xs.apply(&layer.attn_norm)?;
             let attn_outputs = layer.forward_attn(

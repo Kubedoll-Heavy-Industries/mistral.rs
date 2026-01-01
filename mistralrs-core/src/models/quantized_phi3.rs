@@ -407,10 +407,9 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use global layer index for mapper (accounts for partial layer loading)
-            let global_layer_idx = self.layer_start + i;
+            // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
-                xs = mapper.map(xs, global_layer_idx)?;
+                xs = mapper.map(xs, i)?;
             }
             let residual = &xs;
             let ys = xs.apply(&layer.attn_norm)?;
