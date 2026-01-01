@@ -398,6 +398,8 @@ pub struct ModelWeights {
     pub max_seq_len: usize,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
+    /// Starting layer index for pipeline parallelism
+    layer_start: usize,
 }
 
 /// Mistral3 GGUF properties
@@ -492,7 +494,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         mapper: Box<dyn DeviceMapper + Send + Sync>,
         attention_mechanism: AttentionImplementation,
         dtype: DType,
-        _layer_range: Option<std::ops::Range<usize>>,
+        layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self> {
         let metadata = ContentMetadata {
             path_prefix: "mistral3",
@@ -513,6 +515,22 @@ impl ModelConfig::FromGGUF for ModelWeights {
             attn_temperature_scale,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
+        // Determine layer range for partial loading (pipeline parallelism)
+        let total_layers = block_count;
+        let layer_range = layer_range.unwrap_or(0..total_layers);
+        let layer_start = layer_range.start;
+        let layer_end = layer_range.end.min(total_layers);
+        let num_loaded_layers = layer_end - layer_start;
+
+        if layer_start > 0 || layer_end < total_layers {
+            tracing::info!(
+                "Pipeline parallelism: loading layers {}..{} of {} total",
+                layer_start,
+                layer_end,
+                total_layers
+            );
+        }
+
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
         let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
@@ -522,7 +540,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             ct.tensor("output.weight", device)?
         };
 
-        let mut layers = Vec::with_capacity(block_count);
+        let mut layers = Vec::with_capacity(num_loaded_layers);
         let head_dim = key_length;
 
         tracing::info!(
@@ -543,9 +561,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         // Create rotary embeddings with YaRN if configured
         // The temperature_scale from GGUF is the coefficient for YaRN mscale formula
+        // Only create RoPE embeddings for loaded layers
         let mscale_coefficient = attn_temperature_scale.unwrap_or(0.1);
         let mut ropes = HashMap::new();
-        for layer_idx in 0..block_count {
+        for layer_idx in layer_start..layer_end {
             let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
             if !ropes.contains_key(&layer_device.location()) {
                 let mut rope = if let Some(ref yarn) = yarn_config {
@@ -584,8 +603,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
         // Standard softmax scale - temperature scaling is applied via YaRN mscale to RoPE embeddings
         let softmax_scale = 1f32 / (head_dim as f32).sqrt();
 
+        // Only load layers in the specified range
         for layer_idx in NiceProgressBar::<_, 'b'>(
-            0..block_count,
+            layer_start..layer_end,
             "Loading repeating layers",
             &new_multi_progress(),
         ) {
@@ -667,7 +687,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             });
         }
 
-        let cache = EitherCache::Normal(NormalCache::new(block_count, max_seq_len));
+        let cache = EitherCache::Normal(NormalCache::new(num_loaded_layers, max_seq_len));
 
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
@@ -682,6 +702,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len,
             mapper: Some(mapper),
             dtype,
+            layer_start,
         })
     }
 }
@@ -714,8 +735,10 @@ impl ModelWeights {
         });
 
         for (i, layer) in self.layers.iter().enumerate() {
+            // Use global layer index for mapper (accounts for partial layer loading)
+            let global_layer_idx = self.layer_start + i;
             if let Some(ref mapper) = self.mapper {
-                layer_in = mapper.map(layer_in, i)?;
+                layer_in = mapper.map(layer_in, global_layer_idx)?;
             }
 
             let x = layer.attention_norm.forward(&layer_in)?;
