@@ -115,6 +115,9 @@ openai-harmony = "0.0.8"
 text-embeddings-backend-core.workspace = true
 text-embeddings-backend-candle = { workspace = true, optional = true }
 
+# NVIDIA profiling (optional, for Nsight Systems)
+nvtx = { workspace = true, optional = true }
+
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
@@ -150,6 +153,7 @@ nccl = ["cuda", "mistralrs-quant/nccl"]
 utoipa = ["dep:utoipa"]
 ring = ["mistralrs-quant/ring"]
 tei-backend = ["dep:text-embeddings-backend-candle"]
+profiling-cuda = ["cuda", "dep:nvtx"]
 
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }

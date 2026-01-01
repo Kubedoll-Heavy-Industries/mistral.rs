@@ -5,7 +5,7 @@ use std::{ops::Deref, pin::Pin, task::Poll, time::Duration};
 use anyhow::{Context, Result};
 use axum::{
     extract::{Json, State},
-    http::{self},
+    http,
     response::{
         sse::{Event, KeepAlive, KeepAliveStream},
         IntoResponse, Sse,
@@ -35,6 +35,7 @@ use crate::{
         ResponseFormat,
     },
     streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
+    telemetry::record_token_usage,
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
 };
@@ -570,6 +571,15 @@ pub async fn parse_request(
     request_body = ChatCompletionRequest,
     responses((status = 200, description = "Chat completions"))
 )]
+#[tracing::instrument(
+    name = "chat_completion",
+    skip(state, oairequest),
+    fields(
+        otel.kind = "server",
+        llm.model_name = %oairequest.model,
+        openinference.span.kind = "LLM"
+    )
+)]
 pub async fn chatcompletions(
     State(state): ExtractedMistralRsState,
     Json(oairequest): Json<ChatCompletionRequest>,
@@ -595,7 +605,18 @@ pub async fn chatcompletions(
     if is_streaming {
         ChatCompletionResponder::Sse(create_streamer(rx, state, None, None))
     } else {
-        process_non_streaming_response(&mut rx, state).await
+        let response = process_non_streaming_response(&mut rx, state).await;
+
+        // Record token usage on the span for non-streaming responses
+        if let ChatCompletionResponder::Json(ref json_resp) = response {
+            record_token_usage(
+                &tracing::Span::current(),
+                json_resp.usage.prompt_tokens,
+                json_resp.usage.completion_tokens,
+            );
+        }
+
+        response
     }
 }
 

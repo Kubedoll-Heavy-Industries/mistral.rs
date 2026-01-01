@@ -34,6 +34,7 @@ mod device_map;
 mod engine;
 mod lora;
 mod model_loader;
+pub mod profiling;
 mod moe;
 mod ops;
 pub use model_loader::{

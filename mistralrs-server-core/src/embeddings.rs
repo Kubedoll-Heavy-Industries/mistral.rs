@@ -62,6 +62,15 @@ impl IntoResponse for EmbeddingResponder {
     request_body = EmbeddingRequest,
     responses((status = 200, description = "Embeddings", body = EmbeddingResponse))
 )]
+#[tracing::instrument(
+    name = "embeddings",
+    skip(state, oairequest),
+    fields(
+        otel.kind = "server",
+        llm.model_name = %oairequest.model,
+        openinference.span.kind = "EMBEDDING"
+    )
+)]
 pub async fn embeddings(
     State(state): ExtractedMistralRsState,
     Json(oairequest): Json<EmbeddingRequest>,

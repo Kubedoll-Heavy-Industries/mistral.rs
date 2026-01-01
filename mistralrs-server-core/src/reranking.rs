@@ -52,6 +52,15 @@ impl IntoResponse for RerankResponder {
     request_body = RerankRequest,
     responses((status = 200, description = "Reranking results", body = RerankResponse))
 )]
+#[tracing::instrument(
+    name = "rerank",
+    skip(state, request),
+    fields(
+        otel.kind = "server",
+        llm.model_name = %request.model,
+        openinference.span.kind = "RERANKER"
+    )
+)]
 pub async fn rerank(
     State(state): ExtractedMistralRsState,
     Json(request): Json<RerankRequest>,
