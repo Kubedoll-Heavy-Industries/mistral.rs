@@ -218,7 +218,11 @@ impl Pipeline for RerankPipeline {
         // Convert scores to tensor
         let scores = Tensor::from_vec(result.scores, (documents.len(),), &self.device)?;
 
-        Ok(ForwardInputsResult::Rerank { scores })
+        Ok(ForwardInputsResult::Rerank {
+            scores,
+            prompt_tokens: result.prompt_tokens,
+            total_tokens: result.total_tokens,
+        })
     }
 
     async fn sample_causal_gen(

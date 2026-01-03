@@ -16,11 +16,10 @@ use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 use std::time::Instant;
 use std::{
-    cell::RefCell,
     error::Error,
     fs::OpenOptions,
     io::Write,
-    sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
+    sync::{atomic::AtomicBool, Arc, RwLock},
     thread::{self, JoinHandle},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -157,8 +156,6 @@ pub struct EngineConfig {
     pub search_callback: Option<Arc<SearchCallback>>,
     pub tool_callbacks: tools::ToolCallbacks,
     pub tool_callbacks_with_tools: tools::ToolCallbacksWithTools,
-    /// Optional reranking model configuration for cross-encoder scoring
-    pub rerank_model: Option<RerankModelConfig>,
 }
 
 impl Default for EngineConfig {
@@ -173,7 +170,6 @@ impl Default for EngineConfig {
             search_callback: None,
             tool_callbacks: HashMap::new(),
             tool_callbacks_with_tools: HashMap::new(),
-            rerank_model: None,
         }
     }
 }
@@ -243,7 +239,6 @@ struct RebootState {
     tool_callbacks: tools::ToolCallbacks,
     tool_callbacks_with_tools: tools::ToolCallbacksWithTools,
     mcp_client_config: Option<McpClientConfig>,
-    rerank_model: Option<RerankModelConfig>,
 }
 
 #[derive(Debug)]
@@ -284,7 +279,6 @@ pub struct MistralRsBuilder {
     tool_callbacks: tools::ToolCallbacks,
     tool_callbacks_with_tools: tools::ToolCallbacksWithTools,
     mcp_client_config: Option<McpClientConfig>,
-    rerank_model: Option<RerankModelConfig>,
 }
 
 impl MistralRsBuilder {
@@ -311,7 +305,6 @@ impl MistralRsBuilder {
             tool_callbacks: HashMap::new(),
             tool_callbacks_with_tools: HashMap::new(),
             mcp_client_config: None,
-            rerank_model: None,
         }
     }
     pub fn with_log(mut self, log: String) -> Self {
@@ -377,18 +370,6 @@ impl MistralRsBuilder {
     /// Configure MCP client to connect to external MCP servers.
     pub fn with_mcp_client(mut self, config: McpClientConfig) -> Self {
         self.mcp_client_config = Some(config);
-        self
-    }
-
-    /// Configure a cross-encoder reranking model for the `/v1/rerank` endpoint.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let builder = MistralRsBuilder::new(pipeline, method, true, None)
-    ///     .with_rerank_model(RerankModelConfig::new("BAAI/bge-reranker-base"));
-    /// ```
-    pub fn with_rerank_model(mut self, config: RerankModelConfig) -> Self {
-        self.rerank_model = Some(config);
         self
     }
 
@@ -476,7 +457,6 @@ impl MistralRs {
                         config.search_callback.clone(),
                         config.tool_callbacks.clone(),
                         config.tool_callbacks_with_tools.clone(),
-                        config.rerank_model,
                     )
                     .expect("Engine creation failed.");
                     Arc::new(engine).run().await;
@@ -501,7 +481,6 @@ impl MistralRs {
                         config.search_callback.clone(),
                         config.tool_callbacks.clone(),
                         config.tool_callbacks_with_tools.clone(),
-                        config.rerank_model,
                     )
                     .expect("Engine creation failed.");
                     Arc::new(engine).run().await;
@@ -533,7 +512,6 @@ impl MistralRs {
             tool_callbacks,
             mut tool_callbacks_with_tools,
             mcp_client_config,
-            rerank_model,
         } = config;
 
         mistralrs_quant::cublaslt::maybe_init_cublas_lt_wrapper(
@@ -610,7 +588,6 @@ impl MistralRs {
             tool_callbacks: tool_callbacks.clone(),
             tool_callbacks_with_tools: tool_callbacks_with_tools.clone(),
             mcp_client_config: mcp_client_config.clone(),
-            rerank_model: rerank_model.clone(),
         };
 
         // Create the engine configuration
@@ -624,7 +601,6 @@ impl MistralRs {
             search_callback,
             tool_callbacks,
             tool_callbacks_with_tools,
-            rerank_model,
         };
 
         // Create the engine instance
@@ -751,7 +727,6 @@ impl MistralRs {
                 search_callback: reboot_state.search_callback.clone(),
                 tool_callbacks: reboot_state.tool_callbacks.clone(),
                 tool_callbacks_with_tools: reboot_state.tool_callbacks_with_tools.clone(),
-                rerank_model: reboot_state.rerank_model.clone(),
             };
             let new_engine_instance = Self::create_engine_instance(
                 reboot_state.pipeline.clone(),
@@ -925,7 +900,6 @@ impl MistralRs {
             tool_callbacks: config.engine_config.tool_callbacks.clone(),
             tool_callbacks_with_tools: config.engine_config.tool_callbacks_with_tools.clone(),
             mcp_client_config: config.mcp_client_config.clone(),
-            rerank_model: config.engine_config.rerank_model.clone(),
         };
 
         let engine_instance =

@@ -2,14 +2,15 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::Device;
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, paged_attn_supported,
     parse_isq_value, AutoDeviceMapParams, DefaultSchedulerMethod, DeviceLayerMapMetadata,
     DeviceMapMetadata, DeviceMapSetting, HookContainer, Loader, LoaderBuilder, McpClientConfig,
     MemoryGpuConfig, MistralRsBuilder, ModelSelected, PagedAttentionConfig, PagedCacheType,
-    SchedulerConfig, SearchCallback, SearchEmbeddingModel, TokenSource,
+    SchedulerConfig, SearchCallback, SearchEmbeddingModel, SpeculativeConfig, SpeculativeLoader,
+    TokenSource,
 };
 use tracing::{info, warn};
 
@@ -243,9 +244,13 @@ pub struct MistralRsForServerBuilder {
     /// When set, only layers in this range are loaded (partial layer loading).
     layer_range: Option<std::ops::Range<usize>>,
 
-    /// Optional cross-encoder reranking model configuration.
-    /// When set, enables the `/v1/rerank` endpoint.
-    rerank_model: Option<mistralrs_core::RerankModelConfig>,
+    /// Speculative decoding: draft model selector.
+    /// When set along with speculative_gamma, enables speculative decoding.
+    speculative_draft_model: Option<ModelSelected>,
+
+    /// Speculative decoding: gamma (number of tokens to speculate).
+    /// Default: 5.
+    speculative_gamma: usize,
 }
 
 impl Default for MistralRsForServerBuilder {
@@ -281,7 +286,8 @@ impl Default for MistralRsForServerBuilder {
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
             hook: None,
             layer_range: None,
-            rerank_model: None,
+            speculative_draft_model: None,
+            speculative_gamma: 5,
         }
     }
 }
@@ -602,33 +608,6 @@ impl MistralRsForServerBuilder {
         self
     }
 
-    /// Sets the cross-encoder reranking model configuration.
-    ///
-    /// When set, enables the `/v1/rerank` endpoint for document reranking.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use mistralrs_core::RerankModelConfig;
-    ///
-    /// let builder = MistralRsForServerBuilder::new()
-    ///     .with_rerank_model(RerankModelConfig::new("BAAI/bge-reranker-base"));
-    /// ```
-    pub fn with_rerank_model(mut self, config: mistralrs_core::RerankModelConfig) -> Self {
-        self.rerank_model = Some(config);
-        self
-    }
-
-    /// Sets the reranking model configuration if provided.
-    pub fn with_rerank_model_optional(
-        mut self,
-        config: Option<mistralrs_core::RerankModelConfig>,
-    ) -> Self {
-        if let Some(config) = config {
-            self = self.with_rerank_model(config);
-        }
-        self
-    }
-
     /// Sets a pipeline hook for distributed inference.
     ///
     /// The hook will intercept layer activations during forward passes,
@@ -654,6 +633,31 @@ impl MistralRsForServerBuilder {
         self
     }
 
+    /// Enables speculative decoding with the given draft model and gamma.
+    ///
+    /// The draft model should be a smaller, faster model from the same family.
+    /// Gamma is the number of tokens to speculatively generate before verification.
+    ///
+    /// **Note**: Speculative decoding does NOT support PagedAttention.
+    /// When enabled, paged attention will be automatically disabled.
+    pub fn with_speculative(mut self, draft_model: ModelSelected, gamma: usize) -> Self {
+        self.speculative_draft_model = Some(draft_model);
+        self.speculative_gamma = gamma;
+        self
+    }
+
+    /// Optionally enables speculative decoding.
+    pub fn with_speculative_optional(
+        mut self,
+        draft_model: Option<ModelSelected>,
+        gamma: usize,
+    ) -> Self {
+        if let Some(draft) = draft_model {
+            self = self.with_speculative(draft, gamma);
+        }
+        self
+    }
+
     /// Builds the configured mistral.rs instance.
     ///
     /// ### Examples
@@ -668,115 +672,27 @@ impl MistralRsForServerBuilder {
     ///     .build()
     ///     .await?;
     /// ```
-    pub async fn build(self) -> Result<SharedMistralRsState> {
-        // Determine if we're in single-model or multi-model mode
-        if !self.models.is_empty() {
-            self.build_multi_model().await
-        } else {
-            self.build_single_model().await
-        }
-    }
-
-    /// Build a single-model instance (legacy mode)
-    async fn build_single_model(mut self) -> Result<SharedMistralRsState> {
-        let model = self.model.context("Model was None")?;
-
-        let tgt_non_granular_index = get_tgt_non_granular_index(&model);
-        let dtype = get_model_dtype(&model)?;
-        let auto_device_map_params = get_auto_device_map_params(&model)?;
-
-        if tgt_non_granular_index.is_some() {
-            self.max_seqs = 1;
-        }
-
-        let max_seq_len = auto_device_map_params.max_seq_len();
-
-        let device = if let Some(device) = self.device {
-            device
-        } else {
-            init_device(self.cpu, self.seed)?
-        };
-
-        let mapper = init_mapper(&self.num_device_layers, &auto_device_map_params);
-        let paged_attn = configure_paged_attn(&device, self.paged_attn);
-
-        let cache_config = init_cache_config(
-            self.paged_attn_block_size,
-            self.paged_attn_gpu_mem,
-            self.paged_attn_gpu_mem_usage,
-            self.paged_ctxt_len,
-            self.paged_cache_type,
-            !paged_attn,
-            max_seq_len,
-        )?;
-
-        // Configure this last to prevent arg moves
-        let loader: Box<dyn Loader> = LoaderBuilder::new(model)
-            .with_no_kv_cache(self.no_kv_cache)
-            .with_chat_template(self.chat_template)
-            .with_jinja_explicit(self.jinja_explicit)
-            .with_layer_range_optional(self.layer_range.clone())
-            .build()?;
-
-        mistralrs_instance_info(&*loader);
-
-        let isq = self
-            .in_situ_quant
-            .as_ref()
-            .and_then(|isq| parse_isq_value(isq, Some(&device)).ok());
-
-        let pipeline: LoadedPipeline = loader.load_model_from_hf(
-            None,
-            self.token_source,
-            &dtype,
-            &device,
-            false,
-            mapper,
-            isq,
-            cache_config,
-        )?;
-        info!("Model loaded.");
-
-        let scheduler_config = init_scheduler_config(
-            &cache_config,
-            &pipeline,
-            self.max_seqs,
-            self.max_prefill_chunk_size,
-        )
-        .await;
-
-        let search_embedding_model =
-            get_search_embedding_model(self.enable_search, self.search_embedding_model);
-
-        let mut builder = MistralRsBuilder::new(
-            pipeline,
-            scheduler_config,
-            !self.interactive_mode,
-            search_embedding_model,
-        )
-        .with_opt_log(self.log)
-        .with_no_kv_cache(self.no_kv_cache)
-        .with_prefix_cache_n(self.prefix_cache_n);
-
-        // Add MCP client configuration if provided
-        if let Some(mcp_config) = self.mcp_client_config {
-            builder = builder.with_mcp_client(mcp_config);
-        }
-
-        // Add pipeline hook for distributed inference if provided
-        if let Some(hook) = self.hook {
-            builder = builder.with_hook(hook);
-        }
-
-        let mistralrs = builder.build().await;
-
-        Ok(mistralrs)
-    }
-
-    /// Build a multi-model instance
-    pub async fn build_multi_model(mut self) -> Result<SharedMistralRsState> {
+    pub async fn build(mut self) -> Result<SharedMistralRsState> {
+        // Normalize legacy single-model API to multi-model
         if self.models.is_empty() {
-            anyhow::bail!("No models configured for multi-model mode");
+            if let Some(model) = self.model.take() {
+                // Convert legacy model to ModelConfig with builder-level overrides
+                let mut config = ModelConfig::new("default".to_string(), model);
+                config.chat_template = self.chat_template.clone();
+                config.jinja_explicit = self.jinja_explicit.clone();
+                config.num_device_layers = self.num_device_layers.clone();
+                config.in_situ_quant = self.in_situ_quant.clone();
+                self.models.push(config);
+            }
+        }
+
+        self.build_impl().await
+    }
+
+    /// Internal build implementation - handles both single and multi-model cases.
+    async fn build_impl(mut self) -> Result<SharedMistralRsState> {
+        if self.models.is_empty() {
+            anyhow::bail!("No models configured - use .set_model() or .add_model()");
         }
 
         // Use the first model as the base configuration
@@ -800,7 +716,7 @@ impl MistralRsForServerBuilder {
         };
 
         // Create the first model's pipeline
-        let loader: Box<dyn Loader> = LoaderBuilder::new(model)
+        let target_loader: Box<dyn Loader> = LoaderBuilder::new(model)
             .with_no_kv_cache(self.no_kv_cache)
             .with_chat_template(
                 first_model
@@ -817,7 +733,7 @@ impl MistralRsForServerBuilder {
             .with_layer_range_optional(self.layer_range.clone())
             .build()?;
 
-        mistralrs_instance_info(&*loader);
+        mistralrs_instance_info(&*target_loader);
 
         let mapper = init_mapper(
             &first_model
@@ -828,7 +744,7 @@ impl MistralRsForServerBuilder {
         );
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
 
-        let cache_config = init_cache_config(
+        let mut cache_config = init_cache_config(
             self.paged_attn_block_size,
             self.paged_attn_gpu_mem,
             self.paged_attn_gpu_mem_usage,
@@ -837,6 +753,36 @@ impl MistralRsForServerBuilder {
             !paged_attn,
             max_seq_len,
         )?;
+
+        // Wrap with SpeculativeLoader if configured (single-model only)
+        let loader: Box<dyn Loader> = if let Some(draft_model) = self.speculative_draft_model.take() {
+            if self.models.len() > 1 {
+                anyhow::bail!("Speculative decoding is not supported with multiple models");
+            }
+            info!(
+                gamma = self.speculative_gamma,
+                "Enabling speculative decoding with draft model"
+            );
+            // Speculative decoding doesn't support PagedAttention
+            if cache_config.is_some() {
+                warn!("Speculative decoding does not support PagedAttention - disabling paged attention");
+                cache_config = None;
+            }
+            let draft_loader: Box<dyn Loader> = LoaderBuilder::new(draft_model)
+                .with_no_kv_cache(self.no_kv_cache)
+                .with_chat_template(self.chat_template.clone())
+                .with_jinja_explicit(self.jinja_explicit.clone())
+                .build()?;
+            Box::new(SpeculativeLoader {
+                target: target_loader,
+                draft: draft_loader,
+                config: SpeculativeConfig {
+                    gamma: self.speculative_gamma,
+                },
+            })
+        } else {
+            target_loader
+        };
 
         let isq = first_model
             .in_situ_quant
@@ -972,7 +918,6 @@ impl MistralRsForServerBuilder {
                 search_callback: self.search_callback.clone(),
                 tool_callbacks: HashMap::new(),
                 tool_callbacks_with_tools: HashMap::new(),
-                rerank_model: self.rerank_model.clone(),
             };
 
             let mut add_model_config = mistralrs_core::AddModelConfig::new(engine_config);
