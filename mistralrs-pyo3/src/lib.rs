@@ -10,10 +10,9 @@ use requests::{
 };
 use serde_json::Value;
 use std::{
-    cell::RefCell,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 use stream::ChatCompletionStreamer;
 use tokio::{runtime::Runtime, sync::mpsc::channel};
@@ -105,8 +104,6 @@ pub struct SpeechGenerationResponse {
 struct Runner {
     runner: Arc<MistralRs>,
 }
-
-static NEXT_REQUEST_ID: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
 
 fn wrap_search_callback(cb: PyObject) -> Arc<SearchCallback> {
     Arc::new(move |params: SearchFunctionParameters| {
@@ -1213,13 +1210,7 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: {
-                    let l = NEXT_REQUEST_ID.lock().unwrap();
-                    let last = &mut *l.borrow_mut();
-                    let last_v = *last;
-                    *last += 1;
-                    last_v
-                },
+                id: uuid::Uuid::now_v7(),
                 messages,
                 sampling_params: SamplingParams {
                     temperature: request.temperature,
@@ -1248,6 +1239,7 @@ impl Runner {
                 web_search_options: request.web_search_options.clone(),
                 model_id: model_id.clone(),
                 truncate_sequence: request.truncate_sequence,
+                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
@@ -1309,16 +1301,9 @@ impl Runner {
 
             let mut enqueue = |message: RequestMessage| -> PyApiResult<()> {
                 let (tx, rx) = channel(1);
-                let request_id = {
-                    let l = NEXT_REQUEST_ID.lock().unwrap();
-                    let last = &mut *l.borrow_mut();
-                    let last_v = *last;
-                    *last += 1;
-                    last_v
-                };
 
                 let model_request = _Request::Normal(Box::new(NormalRequest {
-                    id: request_id,
+                    id: uuid::Uuid::now_v7(),
                     messages: message,
                     sampling_params: SamplingParams::deterministic(),
                     response: tx,
@@ -1333,6 +1318,7 @@ impl Runner {
                     web_search_options: None,
                     model_id: model_id.clone(),
                     truncate_sequence,
+                    pipeline_continue_op_id: None,
                 }));
 
                 sender
@@ -1464,13 +1450,7 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: {
-                    let l = NEXT_REQUEST_ID.lock().unwrap();
-                    let last = &mut *l.borrow_mut();
-                    let last_v = *last;
-                    *last += 1;
-                    last_v
-                },
+                id: uuid::Uuid::now_v7(),
                 messages: RequestMessage::Completion {
                     text: request.prompt.clone(),
                     echo_prompt: request.echo_prompt,
@@ -1503,6 +1483,7 @@ impl Runner {
                 web_search_options: None,
                 model_id: model_id.clone(),
                 truncate_sequence: request.truncate_sequence,
+                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
@@ -1548,7 +1529,7 @@ impl Runner {
         let (tx, mut rx) = channel(1);
 
         let request = _Request::Normal(Box::new(NormalRequest {
-            id: 0,
+            id: uuid::Uuid::nil(),
             messages: RequestMessage::ImageGeneration {
                 prompt: prompt.to_string(),
                 format: response_format,
@@ -1567,6 +1548,7 @@ impl Runner {
             web_search_options: None,
             model_id: model_id.clone(),
             truncate_sequence: false,
+            pipeline_continue_op_id: None,
         }));
 
         let sender = self.runner.get_sender(model_id.as_deref())?;
@@ -1596,7 +1578,7 @@ impl Runner {
         let (tx, mut rx) = channel(1);
 
         let request = _Request::Normal(Box::new(NormalRequest {
-            id: 0,
+            id: uuid::Uuid::nil(),
             messages: RequestMessage::SpeechGeneration { prompt },
             sampling_params: SamplingParams::deterministic(),
             response: tx,
@@ -1611,6 +1593,7 @@ impl Runner {
             web_search_options: None,
             model_id: model_id.clone(),
             truncate_sequence: false,
+            pipeline_continue_op_id: None,
         }));
 
         let sender = self.runner.get_sender(model_id.as_deref())?;
@@ -1985,13 +1968,7 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: {
-                    let l = NEXT_REQUEST_ID.lock().unwrap();
-                    let last = &mut *l.borrow_mut();
-                    let last_v = *last;
-                    *last += 1;
-                    last_v
-                },
+                id: uuid::Uuid::now_v7(),
                 messages,
                 sampling_params: SamplingParams {
                     temperature: request.temperature,
@@ -2020,6 +1997,7 @@ impl Runner {
                 web_search_options: request.web_search_options.clone(),
                 model_id: Some(model_id.clone()),
                 truncate_sequence: request.truncate_sequence,
+                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
@@ -2094,13 +2072,7 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: {
-                    let l = NEXT_REQUEST_ID.lock().unwrap();
-                    let last = &mut *l.borrow_mut();
-                    let last_v = *last;
-                    *last += 1;
-                    last_v
-                },
+                id: uuid::Uuid::now_v7(),
                 messages: RequestMessage::Completion {
                     text: request.prompt.clone(),
                     echo_prompt: request.echo_prompt,
@@ -2133,6 +2105,7 @@ impl Runner {
                 web_search_options: None,
                 model_id: Some(model_id.clone()),
                 truncate_sequence: request.truncate_sequence,
+                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));

@@ -1,7 +1,7 @@
 use crate::{
-    pipeline::NormalCache,
+    pipeline::{ForwardInputsResult, NormalCache, RerankInputs},
     prefix_cacher::MatchingCache,
-    request::{DetokenizationRequest, NormalRequest, TokenizationRequest},
+    request::{DetokenizationRequest, NormalRequest, PipelineContinueRequest, TokenizationRequest},
     sequence::SeqStepType,
     tools::{ToolCallingMatcher, ToolChoice},
     ModelCategory, RequestMessage, Response,
@@ -56,6 +56,7 @@ impl Engine {
             }
             Request::Tokenize(req) => self.tokenize_text(req).await,
             Request::Detokenize(req) => self.detokenize_text(req).await,
+            Request::PipelineContinue(req) => self.handle_pipeline_continue(req).await,
             Request::Terminate => (),
             Request::TerminateAllSeqsNextStep => {
                 TERMINATE_ALL_NEXT_STEP.store(true, Ordering::SeqCst)
@@ -563,6 +564,7 @@ impl Engine {
                 seq_preallocated_cache,
                 request.return_raw_logits,
                 eos_toks,
+                request.pipeline_continue_op_id,
             );
 
             // Only "track" a new sequence if it is a traditional one
@@ -773,7 +775,7 @@ impl Engine {
             .expect("Sender disconnected unexpectedly!");
     }
 
-    /// Handle a reranking request using TEI's cross-encoder predict().
+    /// Handle a reranking request using the Pipeline interface.
     ///
     /// Reranking is handled separately from the standard generation pipeline because:
     /// 1. It uses classification (predict) rather than generation
@@ -798,33 +800,64 @@ impl Engine {
             }
         };
 
-        // Get the rerank backend
-        let backend_guard = self.rerank_backend.lock().await;
-        let backend = match backend_guard.as_ref() {
-            Some(b) => b,
-            None => {
-                request
-                    .response
-                    .send(Response::ValidationError(
-                        "No reranking model loaded. Use set_rerank_model() to load a cross-encoder model."
-                            .into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                return;
-            }
-        };
+        // Validate model category
+        let mut pipeline = get_mut_arcmutex!(self.pipeline);
+        if !matches!(pipeline.category(), ModelCategory::Rerank) {
+            request
+                .response
+                .send(Response::ValidationError(
+                    "Loaded model is not a reranker. Use ModelSelected::Rerank to load a cross-encoder model."
+                        .into(),
+                ))
+                .await
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
+            return;
+        }
 
-        // Perform reranking using TEI backend
-        match backend.rerank(&query, &documents, truncate) {
-            Ok(result) => {
+        // Perform reranking using Pipeline::forward_inputs()
+        let inputs = Box::new(RerankInputs {
+            query,
+            documents,
+            truncate,
+        });
+
+        match pipeline.forward_inputs(inputs, false) {
+            Ok(ForwardInputsResult::Rerank {
+                scores,
+                prompt_tokens,
+                total_tokens,
+            }) => {
+                // Convert tensor to Vec<f32>
+                let scores_vec = match scores.to_vec1::<f32>() {
+                    Ok(v) => v,
+                    Err(e) => {
+                        request
+                            .response
+                            .send(Response::InternalError(
+                                format!("Failed to convert scores: {e}").into(),
+                            ))
+                            .await
+                            .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                        return;
+                    }
+                };
+
                 request
                     .response
                     .send(Response::Rerank {
-                        scores: result.scores,
-                        prompt_tokens: result.prompt_tokens,
-                        total_tokens: result.total_tokens,
+                        scores: scores_vec,
+                        prompt_tokens,
+                        total_tokens,
                     })
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+            }
+            Ok(_) => {
+                request
+                    .response
+                    .send(Response::InternalError(
+                        "RerankPipeline returned unexpected result type".into(),
+                    ))
                     .await
                     .unwrap_or_else(|_| warn!("Receiver disconnected"));
             }
@@ -838,5 +871,48 @@ impl Engine {
                     .unwrap_or_else(|_| warn!("Receiver disconnected"));
             }
         }
+    }
+
+    /// Handle pipeline continuation request for non-first pipeline stages.
+    ///
+    /// When a non-first stage receives activations from the previous stage,
+    /// this triggers a minimal forward pass. The distributed hook intercepts
+    /// at layer 0 and injects the received activations.
+    ///
+    /// For KV cache preservation: The first forward pass for an op_id resets the cache
+    /// (prompt processing). Subsequent forward passes reuse the cache (decode steps).
+    async fn handle_pipeline_continue(&self, request: PipelineContinueRequest) {
+
+        // Create a NormalRequest with the correct number of dummy tokens
+        // to ensure attention mask is created with the right dimensions.
+        // The hook will intercept at layer 0 and replace with actual activations.
+        let mut sampling_params = crate::sampler::SamplingParams::deterministic();
+        sampling_params.max_len = Some(1); // Single forward pass only
+
+        // Create seq_len dummy tokens so attention mask matches activation shape
+        let dummy_tokens = vec![0u32; request.seq_len];
+
+        let minimal_request = NormalRequest {
+            messages: RequestMessage::CompletionTokens(dummy_tokens),
+            sampling_params,
+            response: request.response,
+            return_logprobs: false,
+            is_streaming: false,
+            id: request.op_id,
+            constraint: crate::Constraint::None,
+            suffix: None,
+            logits_processors: None,
+            return_raw_logits: true, // We want raw logits for the response
+            web_search_options: None,
+            model_id: request.model_id,
+            tools: None,
+            tool_choice: None,
+            truncate_sequence: false,
+            // Set op_id for KV cache preservation across decode steps
+            pipeline_continue_op_id: Some(request.op_id),
+        };
+
+        // Process through normal request path - hook will intercept and handle
+        self.add_request(minimal_request).await;
     }
 }

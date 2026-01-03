@@ -83,7 +83,7 @@ impl Model {
             response: tx,
             return_logprobs: request.return_logprobs(),
             is_streaming: true,
-            id: 0,
+            id: uuid::Uuid::nil(),
             constraint: request.take_constraint(),
             suffix: None,
             tools,
@@ -93,6 +93,7 @@ impl Model {
             web_search_options: request.take_web_search_options(),
             model_id: None,
             truncate_sequence,
+            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -121,7 +122,7 @@ impl Model {
             response: tx,
             return_logprobs: request.return_logprobs(),
             is_streaming: false,
-            id: 0,
+            id: uuid::Uuid::nil(),
             constraint: request.take_constraint(),
             suffix: None,
             tools,
@@ -131,6 +132,7 @@ impl Model {
             web_search_options: request.take_web_search_options(),
             model_id: None,
             truncate_sequence,
+            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -168,7 +170,7 @@ impl Model {
             response: tx,
             return_logprobs: request.return_logprobs(),
             is_streaming: false,
-            id: 0,
+            id: uuid::Uuid::nil(),
             constraint: request.take_constraint(),
             suffix: None,
             tools,
@@ -178,6 +180,7 @@ impl Model {
             web_search_options: request.take_web_search_options(),
             model_id: None,
             truncate_sequence,
+            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -206,7 +209,7 @@ impl Model {
         let (tx, mut rx) = channel(1);
 
         let request = Request::Normal(Box::new(NormalRequest {
-            id: 0,
+            id: uuid::Uuid::nil(),
             messages: RequestMessage::ImageGeneration {
                 prompt: prompt.to_string(),
                 format: response_format,
@@ -225,6 +228,7 @@ impl Model {
             web_search_options: None,
             model_id: None,
             truncate_sequence: false,
+            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -251,7 +255,7 @@ impl Model {
         let (tx, mut rx) = channel(1);
 
         let request = Request::Normal(Box::new(NormalRequest {
-            id: 0,
+            id: uuid::Uuid::nil(),
             messages: RequestMessage::SpeechGeneration {
                 prompt: prompt.to_string(),
             },
@@ -268,6 +272,7 @@ impl Model {
             web_search_options: None,
             model_id: None,
             truncate_sequence: false,
+            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -309,7 +314,7 @@ impl Model {
                 let (tx, mut rx) = channel(1);
 
                 let request = Request::Normal(Box::new(NormalRequest {
-                    id: 0,
+                    id: uuid::Uuid::nil(),
                     messages: message,
                     sampling_params: SamplingParams::deterministic(),
                     response: tx,
@@ -324,6 +329,7 @@ impl Model {
                     web_search_options: None,
                     model_id: None,
                     truncate_sequence,
+                    pipeline_continue_op_id: None,
                 }));
 
                 runner

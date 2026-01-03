@@ -3141,6 +3141,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid 1.19.0",
  "walkdir",
 ]
 
@@ -3339,6 +3340,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+ "uuid 1.19.0",
 ]
 
 [[package]]
@@ -3390,6 +3392,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid 1.19.0",
 ]
 
 [[package]]

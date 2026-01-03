@@ -465,6 +465,11 @@ pub struct Sequence {
 
     // Harmony format parsing context (for GPT-OSS models)
     harmony_context: Option<HarmonyContext>,
+
+    /// Pipeline parallelism op_id for KV cache preservation.
+    /// If Some, this request is part of a pipeline continuation and the cache
+    /// should NOT be reset if this op_id has already done its first forward.
+    pipeline_continue_op_id: Option<uuid::Uuid>,
 }
 
 impl BlockEngineSequence for Sequence {
@@ -560,6 +565,8 @@ impl Sequence {
         //
         return_raw_logits: bool,
         eos_tokens: Vec<u32>,
+        // Pipeline parallelism
+        pipeline_continue_op_id: Option<uuid::Uuid>,
     ) -> Self {
         let prompt_len = tokens.len();
         let mut custom_metadata = if let Some(block_size) = block_size {
@@ -635,6 +642,7 @@ impl Sequence {
             total_prompt_time: None,
             waitlisted_count: 0,
             harmony_context: None,
+            pipeline_continue_op_id,
         }
     }
 
@@ -783,6 +791,11 @@ impl Sequence {
 
     pub fn token_offset(&self) -> usize {
         self.token_offset
+    }
+
+    /// Get the pipeline continuation op_id, if this is a pipeline continue request.
+    pub fn pipeline_continue_op_id(&self) -> Option<uuid::Uuid> {
+        self.pipeline_continue_op_id
     }
 
     /// Set the token offset for prefix caching.

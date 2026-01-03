@@ -128,6 +128,7 @@ async fn cross_encoder_rerank(
         web_search_options: None,
         model_id: model_id.map(|m| m.to_string()),
         truncate_sequence: false,
+        pipeline_continue_op_id: None,
     }));
 
     send_request_with_model(&state, rerank_request, model_id)

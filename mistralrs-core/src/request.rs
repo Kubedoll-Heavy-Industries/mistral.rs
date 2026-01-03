@@ -190,7 +190,7 @@ pub struct NormalRequest {
     pub response: Sender<Response>,
     pub return_logprobs: bool,
     pub is_streaming: bool,
-    pub id: usize,
+    pub id: uuid::Uuid,
     pub constraint: Constraint,
     pub suffix: Option<String>,
     pub tools: Option<Vec<Tool>>,
@@ -202,6 +202,11 @@ pub struct NormalRequest {
     pub model_id: Option<String>,
     #[serde(default)]
     pub truncate_sequence: bool,
+    /// Pipeline parallelism op_id for KV cache preservation.
+    /// If Some, this request is part of a pipeline continuation and the cache
+    /// should NOT be reset if this op_id has already done its first forward.
+    #[serde(skip)]
+    pub pipeline_continue_op_id: Option<uuid::Uuid>,
 }
 
 impl NormalRequest {
@@ -209,7 +214,7 @@ impl NormalRequest {
         messages: RequestMessage,
         sampling_params: SamplingParams,
         response: Sender<Response>,
-        id: usize,
+        id: uuid::Uuid,
         tools: Option<Vec<Tool>>,
         tool_choice: Option<ToolChoice>,
     ) -> Self {
@@ -229,6 +234,7 @@ impl NormalRequest {
             web_search_options: None,
             model_id: None,
             truncate_sequence: false,
+            pipeline_continue_op_id: None,
         }
     }
 }
@@ -259,6 +265,26 @@ pub struct DetokenizationRequest {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+/// Request for pipeline continuation on non-first stages.
+///
+/// When a non-first pipeline stage receives activations from the previous stage,
+/// it sends this request to trigger forward() on the model. The distributed hook
+/// will intercept at layer 0 and inject the received activations.
+pub struct PipelineContinueRequest {
+    /// Operation ID for correlation with the activation.
+    pub op_id: uuid::Uuid,
+    /// Channel for response (logits from this stage).
+    #[serde(default = "default_responder")]
+    #[serde(skip)]
+    pub response: Sender<Response>,
+    /// Model ID to target.
+    pub model_id: Option<String>,
+    /// Sequence length from the received activation.
+    /// Used to create the correct number of dummy tokens for attention mask.
+    pub seq_len: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 /// A request to the Engine, encapsulating the various parameters as well as
 /// the `mpsc` response `Sender` used to return the [`Response`].
 pub enum Request {
@@ -266,6 +292,9 @@ pub enum Request {
     ReIsq(IsqType),
     Tokenize(TokenizationRequest),
     Detokenize(DetokenizationRequest),
+    /// Pipeline continuation request for non-first stages.
+    /// Triggers forward() so the distributed hook can inject received activations.
+    PipelineContinue(PipelineContinueRequest),
     // Sending a terminate request causes the `run` function to return to the thread created in `MistralRs::new`,
     // and then Engine will be dropped.
     Terminate,
@@ -296,6 +325,9 @@ impl Debug for Request {
             }
             Request::Detokenize(req) => {
                 write!(f, "Tokenization Request {:?}", req.tokens)
+            }
+            Request::PipelineContinue(req) => {
+                write!(f, "Pipeline Continue Request op_id={}", req.op_id)
             }
             Request::Terminate => write!(f, "Termination Request"),
             Request::TerminateAllSeqsNextStep => write!(f, "Terminate All Seqs Next Step"),

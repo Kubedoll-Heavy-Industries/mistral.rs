@@ -42,7 +42,7 @@ async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(T
         response: tx,
         return_logprobs: false,
         is_streaming: false,
-        id: 0,
+        id: uuid::Uuid::nil(),
         constraint: Constraint::None,
         suffix: None,
         tools: None,

@@ -36,6 +36,7 @@ url.workspace = true
 data-url.workspace = true
 anyhow.workspace = true
 itertools.workspace = true
+uuid.workspace = true
 
 [build-dependencies]
 pyo3-build-config.workspace = true

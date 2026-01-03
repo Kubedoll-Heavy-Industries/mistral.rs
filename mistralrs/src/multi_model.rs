@@ -79,7 +79,7 @@ impl MultiModel {
             response: tx,
             return_logprobs: request.return_logprobs(),
             is_streaming: false,
-            id: 0,
+            id: uuid::Uuid::nil(),
             constraint: request.take_constraint(),
             suffix: None,
             tools,
@@ -89,6 +89,7 @@ impl MultiModel {
             web_search_options: request.take_web_search_options(),
             model_id: model_id.map(|s| s.to_string()),
             truncate_sequence,
+            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(model_id)?.send(request).await?;

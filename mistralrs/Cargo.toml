@@ -30,6 +30,7 @@ clap.workspace = true
 walkdir.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [features]
 cuda = ["mistralrs-core/cuda"]

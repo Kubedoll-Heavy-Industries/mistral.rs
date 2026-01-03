@@ -130,6 +130,25 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
                             continue;
                         }
                         Request::TerminateAllSeqsNextStep => Request::TerminateAllSeqsNextStep,
+                        Request::PipelineContinue(mut x) => {
+                            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+                            x.response = sender;
+                            let req = Request::PipelineContinue(x);
+
+                            if request_sender.send(req).await.is_err() {
+                                tracing::error!("Daemon channel closed for PipelineContinue request");
+                                continue;
+                            }
+                            match receiver.recv().await {
+                                Some(resp) => {
+                                    if let Err(e) = resp.as_result() {
+                                        tracing::error!("PipelineContinue response error: {e}");
+                                    }
+                                }
+                                None => tracing::error!("PipelineContinue response channel closed"),
+                            }
+                            continue;
+                        }
                     };
 
                     if request_sender.send(req).await.is_err() {
@@ -194,6 +213,16 @@ pub fn ring_daemon_replicator(request_sender: Sender<Request>) {
                             continue;
                         }
                         Request::TerminateAllSeqsNextStep => Request::TerminateAllSeqsNextStep,
+                        Request::PipelineContinue(mut x) => {
+                            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+                            x.response = sender;
+                            let req = Request::PipelineContinue(x);
+
+                            request_sender.send(req).await.unwrap();
+                            let resp = receiver.recv().await.unwrap();
+                            resp.as_result().unwrap();
+                            continue;
+                        }
                     };
 
                     request_sender.send(req).await.unwrap();

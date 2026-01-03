@@ -383,18 +383,7 @@ async fn main() -> Result<()> {
                 builder = builder.with_search_embedding_model(model);
             }
 
-            if let Some(model_id) = &args.rerank_model {
-                let mut config = RerankModelConfig::new(model_id);
-                if let Some(rev) = &args.rerank_revision {
-                    config = config.with_revision(rev);
-                }
-                if let Some(dtype) = &args.rerank_dtype {
-                    config = config.with_dtype(dtype);
-                }
-                builder = builder.with_rerank_model(config);
-            }
-
-            builder.build_multi_model().await?
+            builder.build().await?
         }
         model => {
             // Single-model mode

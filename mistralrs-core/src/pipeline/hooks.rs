@@ -106,6 +106,33 @@ pub trait PipelineHook: Send + Sync {
     fn during_decode(&self) -> bool {
         true
     }
+
+    /// Wait for response logits from the pipeline's last stage.
+    ///
+    /// Called by non-last stages after sending their activation to the next stage.
+    /// This blocks until the last stage processes and returns the final logits.
+    ///
+    /// # Returns
+    /// * `Ok(Some(logits))` - Logits from the last stage
+    /// * `Ok(None)` - No response expected (last stage or no PP)
+    /// * `Err(e)` - Pipeline communication error
+    ///
+    /// # Default Implementation
+    /// Returns `Ok(None)` - override for distributed inference.
+    fn wait_for_response_logits(&self) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    /// Check if this hook is for a non-last pipeline stage.
+    ///
+    /// If true, the model should skip lm_head and instead wait for
+    /// response logits from the last stage.
+    ///
+    /// # Default Implementation
+    /// Returns false - override for distributed inference.
+    fn is_pipeline_non_last_stage(&self) -> bool {
+        false
+    }
 }
 
 /// A no-op hook that does nothing (for when hooks are disabled).
@@ -185,6 +212,24 @@ impl HookContainer {
                 hook.on_layer_input(layer_idx, &activation)
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Check if this is a non-last pipeline stage that should skip lm_head.
+    pub fn is_pipeline_non_last_stage(&self) -> bool {
+        self.hook
+            .as_ref()
+            .map(|h| h.is_pipeline_non_last_stage())
+            .unwrap_or(false)
+    }
+
+    /// Wait for response logits from the last pipeline stage.
+    ///
+    /// Only call this if `is_pipeline_non_last_stage()` returns true.
+    pub fn wait_for_response_logits(&self) -> Result<Option<Tensor>> {
+        match &self.hook {
+            Some(hook) => hook.wait_for_response_logits(),
+            None => Ok(None),
         }
     }
 }

@@ -90,6 +90,7 @@ pub fn parse_request(
             Some(oairequest.model.clone())
         },
         truncate_sequence: false,
+        pipeline_continue_op_id: None,
     })))
 }
 

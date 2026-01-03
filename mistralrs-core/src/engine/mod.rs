@@ -229,6 +229,9 @@ pub struct Engine {
     pending_notify: Arc<Notify>,
     /// Optional TEI-based reranking backend for cross-encoder scoring
     rerank_backend: Arc<Mutex<Option<crate::tei_backend::RerankBackend>>>,
+    /// Track pipeline parallelism op_ids that have completed their first forward pass.
+    /// Used to preserve KV cache for subsequent decode steps on non-first pipeline stages.
+    pipeline_first_forward_done: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
 }
 
 impl Drop for Engine {
@@ -318,7 +321,7 @@ impl Engine {
             logger: IntervalLogger::new(Duration::from_secs(5)),
             handles: Arc::new(Mutex::new(Vec::new())),
             pending_notify: Arc::new(Notify::new()),
-            rerank_backend: Arc::new(Mutex::new(rerank_backend)),
+            pipeline_first_forward_done: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -554,8 +557,29 @@ impl Engine {
 
                             // This comes from prefix caching
                             // The invariant where all token offsets are the same is handled by the scheduler
+                            //
+                            // For pipeline parallelism: if this is a continuation request (non-first
+                            // stage receiving activations), we need to preserve the KV cache for
+                            // subsequent decode steps. On the first forward for an op_id, we reset
+                            // the cache. On subsequent forwards, we use Nothing to preserve it.
+                            // Note: We use Nothing instead of In because the sequence doesn't have
+                            // cached data to clone - the cache lives in the model's NormalCache.
                             let pre_op = if scheduled.prompt[0].token_offset() != 0 {
                                 CacheInstruction::In
+                            } else if let Some(op_id) = scheduled.prompt[0].pipeline_continue_op_id() {
+                                // Pipeline parallelism: check if this op_id has already done its first forward
+                                let mut done_set = self.pipeline_first_forward_done.lock().unwrap();
+                                if done_set.contains(&op_id) {
+                                    // Subsequent forward for this op_id - preserve cache (do nothing)
+                                    CacheInstruction::Nothing
+                                } else {
+                                    // First forward for this op_id - reset cache and mark as done
+                                    done_set.insert(op_id);
+                                    CacheInstruction::Reset {
+                                        load_preallocated_cache: false,
+                                        reset_non_granular: false,
+                                    }
+                                }
                             } else {
                                 CacheInstruction::Reset {
                                     load_preallocated_cache: true,
@@ -593,6 +617,11 @@ impl Engine {
                         self.logger.add_tokens_processed(total_processed_tokens);
 
                         for seq in scheduled.prompt.iter_mut() {
+                            // Skip sequences already marked Done (e.g., by send_raw_responses
+                            // when return_raw_logits is true for pipeline parallelism)
+                            if seq.is_finished_paged_attn() {
+                                continue;
+                            }
                             match seq.sequence_stepping_type() {
                                 SeqStepType::OneShot => {
                                     seq.set_state(SequenceState::Done(StopReason::GeneratedImage))
