@@ -378,6 +378,9 @@ impl MistralRsBuilder {
     /// The hook will intercept layer activations during forward passes,
     /// enabling pipeline parallelism across multiple nodes.
     pub fn with_hook(self, hook: HookContainer) -> Self {
+        // Mark that a PP hook is attached (skips dummy run)
+        distributed::set_pipeline_parallel_hook();
+
         // Set the hook on the pipeline immediately
         if let Ok(mut pipeline) = self.pipeline.try_lock() {
             pipeline.set_hook(hook);
@@ -629,8 +632,9 @@ impl MistralRs {
         let is_multi_threaded = tokio::runtime::Handle::try_current()
             .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread);
 
-        // Do a dummy run
+        // Do a dummy run to warm up caches (skip when PP hook is attached - would block)
         if !distributed::is_daemon()
+            && !distributed::has_pipeline_parallel_hook()
             && is_multi_threaded
             && matches!(
                 engine_instance.category,

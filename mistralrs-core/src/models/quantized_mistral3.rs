@@ -805,9 +805,6 @@ impl ModelWeights {
             }
         }
 
-        // Pipeline parallelism: non-last stages skip lm_head and wait for response
-        crate::pp_await_response_logits!(self);
-
         let layer_in = layer_in.to_device(&self.device)?;
         let x = self.norm.forward(&layer_in)?;
         let logits = MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?;

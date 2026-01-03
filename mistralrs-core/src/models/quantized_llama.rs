@@ -771,9 +771,6 @@ impl ModelWeights {
             }
         }
 
-        // PP: Non-last stages wait for response logits from last stage
-        crate::pp_await_response_logits!(self);
-
         // Last stage (or no PP): run final norm and lm_head
         let layer_in = layer_in.to_device(&self.device)?;
         let x = self.norm.forward(&layer_in)?;
