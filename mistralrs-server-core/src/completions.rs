@@ -263,6 +263,7 @@ pub fn parse_request(
                 Some(oairequest.model.clone())
             },
             truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
+            pipeline_continue_op_id: None,
         })),
         is_streaming,
     ))

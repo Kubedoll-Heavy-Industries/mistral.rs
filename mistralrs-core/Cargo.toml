@@ -74,7 +74,7 @@ base64.workspace = true
 bytemuck_derive.workspace = true
 mistralrs-paged-attn = { workspace = true, optional = true }
 mistralrs-quant.workspace = true
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true }
 utoipa = { workspace = true, optional = true }
 schemars.workspace = true
 serde_yaml.workspace = true

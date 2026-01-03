@@ -889,6 +889,11 @@ impl MistralRsForServerBuilder {
             builder = builder.with_mcp_client(mcp_config);
         }
 
+        // Add pipeline hook for distributed inference if provided
+        if let Some(hook) = self.hook.clone() {
+            builder = builder.with_hook(hook);
+        }
+
         let mistralrs = builder.build().await;
 
         // Load additional models

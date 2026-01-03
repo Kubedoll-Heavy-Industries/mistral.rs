@@ -415,7 +415,8 @@ impl ModelWeights {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let (_b_sz, seq_len) = input_ids.dims2()?;
-        let mut xs = self.tok_embeddings.forward(input_ids)?;
+        // PP: Get embedding for first stage, or placeholder for non-first stages
+        let mut xs = crate::pp_get_layer_input!(self, input_ids, DType::F32);
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
             input_ids,
@@ -479,6 +480,11 @@ impl ModelWeights {
                 }
             }
         }
+
+        // PP: Non-last stages wait for response logits from last stage
+        crate::pp_await_response_logits!(self);
+
+        // Last stage (or no PP): run final norm and lm_head
         let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;
         MatMul.qmatmul(&xs, &self.output)
     }

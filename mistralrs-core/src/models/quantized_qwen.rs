@@ -484,7 +484,18 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        let mut layer_in = self.tok_embeddings.forward(x)?;
+        // For pipeline parallelism: non-first stages don't use tok_embeddings.
+        // Instead, the hook will inject the activation at the first local layer.
+        // Create a placeholder that will be replaced by the hook.
+        let mut layer_in = if self.is_first_stage() {
+            self.tok_embeddings.forward(x)?
+        } else {
+            // Placeholder tensor - will be replaced by hook at first local layer.
+            // Use F32 to match dequantized embedding output dtype (dequantize returns F32).
+            let (batch, seq_len) = x.dims2()?;
+            let embed_dim = self.tok_embeddings.embeddings().dim(1)?;
+            Tensor::zeros((batch, seq_len, embed_dim), DType::F32, &self.device)?
+        };
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_causal_mask_matrix(
             x,
@@ -550,6 +561,27 @@ impl ModelWeights {
                 }
             }
         }
+
+        // Pipeline parallelism: non-last stages skip lm_head and wait for response
+        if let Some(ref hook) = self.hook {
+            if hook.is_pipeline_non_last_stage() {
+                tracing::debug!(
+                    layer_start = self.layer_start,
+                    layer_end = self.layer_start + self.layers.len(),
+                    "Pipeline non-last stage: waiting for response logits from last stage"
+                );
+                // Wait for the last stage to process and return logits
+                if let Some(response_logits) = hook.wait_for_response_logits()? {
+                    return Ok(response_logits);
+                }
+                // If no response, something went wrong with the pipeline
+                candle_core::bail!(
+                    "Pipeline non-last stage expected response logits but received none"
+                );
+            }
+        }
+
+        // Last stage (or no PP): run final norm and lm_head
         let x = self.norm.forward(&layer_in)?;
         extract_logits(
             &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,

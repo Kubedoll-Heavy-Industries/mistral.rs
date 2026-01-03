@@ -964,3 +964,85 @@ macro_rules! lora_model_loader {
         )?
     }};
 }
+
+// =============================================================================
+// Pipeline Parallelism (PP) Macros
+// =============================================================================
+
+/// Get the initial layer input for pipeline parallelism.
+///
+/// For the first stage, this returns the embedded input tokens.
+/// For non-first stages, this returns a placeholder tensor that will be
+/// replaced by the hook when activations arrive from the previous stage.
+///
+/// # Arguments
+/// * `$self` - The model instance (must have `is_first_stage()`, `tok_embeddings`, `device`)
+/// * `$x` - The input tensor (token IDs for first stage, dummy for non-first)
+/// * `$dtype` - The dtype for the placeholder tensor (e.g., `DType::F32`)
+///
+/// # Example
+/// ```ignore
+/// let mut layer_in = pp_get_layer_input!(self, x, DType::F32);
+/// ```
+#[doc(hidden)]
+#[macro_export]
+macro_rules! pp_get_layer_input {
+    ($self:expr, $x:expr, $dtype:expr) => {{
+        if $self.is_first_stage() {
+            $self.tok_embeddings.forward($x)?
+        } else {
+            // Placeholder tensor - will be replaced by hook at first local layer.
+            // The hook injects the actual activation from the previous pipeline stage.
+            let (batch, seq_len) = $x.dims2()?;
+            let embed_dim = $self.tok_embeddings.embeddings().dim(1)?;
+            candle_core::Tensor::zeros((batch, seq_len, embed_dim), $dtype, &$self.device)?
+        }
+    }};
+}
+
+/// Handle response logits for non-last pipeline stages.
+///
+/// For non-last stages in pipeline parallelism, this waits for the last stage
+/// to compute and return the logits, then returns early with those logits.
+/// For the last stage (or non-PP), this does nothing and execution continues
+/// to the normal lm_head processing.
+///
+/// # Arguments
+/// * `$self` - The model instance (must have `hook` field)
+///
+/// # Returns
+/// * Returns early with `Ok(response_logits)` if this is a non-last stage
+/// * Does nothing if this is the last stage or no pipeline parallelism
+///
+/// # Example
+/// ```ignore
+/// // After the layer loop, before lm_head:
+/// pp_await_response_logits!($self);
+///
+/// // This code only runs for last stage:
+/// let x = self.norm.forward(&layer_in)?;
+/// extract_logits(...)
+/// ```
+#[doc(hidden)]
+#[macro_export]
+macro_rules! pp_await_response_logits {
+    ($self:expr) => {{
+        if let Some(ref hook) = $self.hook {
+            if hook.is_pipeline_non_last_stage() {
+                tracing::debug!(
+                    layer_start = $self.layer_start,
+                    layer_end = $self.layer_start + $self.layers.len(),
+                    "Pipeline non-last stage: waiting for response logits from last stage"
+                );
+                // Wait for the last stage to process and return logits
+                if let Some(response_logits) = hook.wait_for_response_logits()? {
+                    return Ok(response_logits);
+                }
+                // If no response, something went wrong with the pipeline
+                candle_core::bail!(
+                    "Pipeline non-last stage expected response logits but received none"
+                );
+            }
+        }
+    }};
+}

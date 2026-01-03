@@ -3,8 +3,7 @@ use candle_core::Device;
 use engine::Engine;
 pub use engine::{
     get_engine_terminate_flag, reset_engine_terminate_flag, should_terminate_engine_sequences,
-    EngineInstruction, RerankModelConfig, SearchEmbeddingModel, ENGINE_INSTRUCTIONS,
-    TERMINATE_ALL_NEXT_STEP,
+    EngineInstruction, SearchEmbeddingModel, ENGINE_INSTRUCTIONS, TERMINATE_ALL_NEXT_STEP,
 };
 use hf_hub::Cache;
 pub use lora::Ordering;
@@ -119,8 +118,9 @@ pub use pipeline::{
 };
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
-    LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request, RequestMessage,
-    SearchContextSize, TokenizationRequest, WebSearchOptions, WebSearchUserLocation,
+    LlguidanceGrammar, MessageContent, NormalRequest, PipelineContinueRequest, ReasoningEffort,
+    Request, RequestMessage, SearchContextSize, TokenizationRequest, WebSearchOptions,
+    WebSearchUserLocation,
 };
 pub use response::*;
 pub use sampler::{
@@ -228,7 +228,6 @@ pub struct MistralRs {
     log: Option<String>,
     id: String,
     creation_time: u64,
-    next_request_id: Mutex<RefCell<usize>>,
 }
 
 #[derive(Clone)]
@@ -667,7 +666,7 @@ impl MistralRs {
             tokio::task::block_in_place(|| {
                 let (tx, mut rx) = channel(1);
                 let req = Request::Normal(Box::new(NormalRequest {
-                    id: 0,
+                    id: uuid::Uuid::nil(),
                     messages: RequestMessage::Completion {
                         text: "hello".to_string(),
                         echo_prompt: false,
@@ -689,6 +688,7 @@ impl MistralRs {
                     web_search_options: None,
                     model_id: None,
                     truncate_sequence: false,
+                    pipeline_continue_op_id: None,
                 }));
                 info!("Beginning dummy run.");
                 let start = Instant::now();
@@ -725,7 +725,6 @@ impl MistralRs {
                 .duration_since(UNIX_EPOCH)
                 .expect("Time travel has occurred!")
                 .as_secs(),
-            next_request_id: Mutex::new(RefCell::new(1)),
         })
     }
 
@@ -887,12 +886,8 @@ impl MistralRs {
         }
     }
 
-    pub fn next_request_id(&self) -> usize {
-        let l = self.next_request_id.lock().unwrap();
-        let last = &mut *l.borrow_mut();
-        let last_v = *last;
-        *last += 1;
-        last_v
+    pub fn next_request_id(&self) -> uuid::Uuid {
+        uuid::Uuid::now_v7()
     }
 
     /// Add a new model engine to the MistralRs instance

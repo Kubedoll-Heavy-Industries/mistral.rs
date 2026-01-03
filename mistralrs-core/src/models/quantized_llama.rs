@@ -705,7 +705,8 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        let mut layer_in = self.tok_embeddings.forward(x)?;
+        // PP: Get embedding for first stage, or placeholder for non-first stages
+        let mut layer_in = crate::pp_get_layer_input!(self, x, DType::F32);
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_causal_mask_matrix(
             x,
@@ -769,6 +770,11 @@ impl ModelWeights {
                 }
             }
         }
+
+        // PP: Non-last stages wait for response logits from last stage
+        crate::pp_await_response_logits!(self);
+
+        // Last stage (or no PP): run final norm and lm_head
         let layer_in = layer_in.to_device(&self.device)?;
         let x = self.norm.forward(&layer_in)?;
         extract_logits(

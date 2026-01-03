@@ -592,5 +592,6 @@ fn new_dummy_seq(
         None,
         false,
         eos_toks,
+        None, // pipeline_continue_op_id
     )
 }
