@@ -530,23 +530,7 @@ impl ModelWeights {
         }
 
         // Pipeline parallelism: non-last stages skip lm_head and wait for response
-        if let Some(ref hook) = self.hook {
-            if hook.is_pipeline_non_last_stage() {
-                tracing::debug!(
-                    layer_start = self.layer_start,
-                    layer_end = self.layer_start + self.layers.len(),
-                    "Pipeline non-last stage: waiting for response logits from last stage"
-                );
-                // Wait for the last stage to process and return logits
-                if let Some(response_logits) = hook.wait_for_response_logits()? {
-                    return Ok(response_logits);
-                }
-                // If no response, something went wrong with the pipeline
-                candle_core::bail!(
-                    "Pipeline non-last stage expected response logits but received none"
-                );
-            }
-        }
+        crate::pp_await_response_logits!(self);
 
         // Last stage (or no PP): run final norm and lm_head
         let x = self.norm.forward(&layer_in)?;
