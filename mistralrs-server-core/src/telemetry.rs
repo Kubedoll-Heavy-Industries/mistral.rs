@@ -219,6 +219,7 @@ pub fn record_timing(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::TraceContextExt;
 
     #[test]
     fn test_default_config() {

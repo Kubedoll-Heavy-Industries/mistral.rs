@@ -400,6 +400,8 @@ pub enum ForwardInputsResult {
     /// Shape: [batch_size] where each element is a relevance score.
     Rerank {
         scores: Tensor,
+        prompt_tokens: usize,
+        total_tokens: usize,
     },
     CausalGeneration {
         logits: Tensor,
@@ -423,8 +425,14 @@ impl ForwardInputsResult {
             Self::Embeddings { embeddings } => Ok(Self::Embeddings {
                 embeddings: embeddings.i(bs_idx)?,
             }),
-            Self::Rerank { scores } => Ok(Self::Rerank {
+            Self::Rerank {
+                scores,
+                prompt_tokens,
+                total_tokens,
+            } => Ok(Self::Rerank {
                 scores: scores.i(bs_idx)?,
+                prompt_tokens: *prompt_tokens,
+                total_tokens: *total_tokens,
             }),
             Self::RawLogits { logits } => Ok(Self::RawLogits {
                 logits: logits.i(bs_idx)?,
@@ -455,8 +463,14 @@ impl ForwardInputsResult {
             Self::Embeddings { embeddings } => Ok(Self::Embeddings {
                 embeddings: embeddings.to_device(device)?,
             }),
-            Self::Rerank { scores } => Ok(Self::Rerank {
+            Self::Rerank {
+                scores,
+                prompt_tokens,
+                total_tokens,
+            } => Ok(Self::Rerank {
                 scores: scores.to_device(device)?,
+                prompt_tokens: *prompt_tokens,
+                total_tokens: *total_tokens,
             }),
             Self::Image { .. } => Ok(self.clone()),
             Self::Speech { .. } => Ok(self.clone()),
