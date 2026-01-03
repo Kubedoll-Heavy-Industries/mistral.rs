@@ -13,10 +13,28 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::Command;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::Sender;
 use tracing::info;
+
+/// Global flag indicating a pipeline parallelism hook is attached.
+/// When set, the dummy run should be skipped as it would block waiting
+/// for responses from other pipeline stages that don't exist yet.
+static HAS_PIPELINE_PARALLEL_HOOK: AtomicBool = AtomicBool::new(false);
+
+/// Mark that a pipeline parallelism hook has been attached.
+/// Called when `MistralRsBuilder::with_hook()` sets a distributed hook.
+pub fn set_pipeline_parallel_hook() {
+    HAS_PIPELINE_PARALLEL_HOOK.store(true, Ordering::Release);
+}
+
+/// Check if a pipeline parallelism hook is attached.
+/// Used to skip the dummy run which would block on PP hooks.
+pub fn has_pipeline_parallel_hook() -> bool {
+    HAS_PIPELINE_PARALLEL_HOOK.load(Ordering::Acquire)
+}
 
 use crate::device_map::DeviceMapper;
 use crate::pipeline::{DeviceMappedModelLoader, IsqModelLoader};

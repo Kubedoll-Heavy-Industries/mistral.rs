@@ -562,9 +562,6 @@ impl ModelWeights {
             }
         }
 
-        // Pipeline parallelism: non-last stages skip lm_head and wait for response
-        crate::pp_await_response_logits!(self);
-
         // Last stage (or no PP): run final norm and lm_head
         let x = self.norm.forward(&layer_in)?;
         extract_logits(

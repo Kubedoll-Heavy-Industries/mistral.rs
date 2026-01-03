@@ -1156,6 +1156,10 @@ impl MetadataMixin for NormalPipeline {
 
 #[async_trait::async_trait]
 impl Pipeline for NormalPipeline {
+    fn get_hook(&self) -> Option<&crate::pipeline::HookContainer> {
+        self.model.get_hook()
+    }
+
     fn forward_inputs(
         &mut self,
         inputs: Box<dyn Any>,

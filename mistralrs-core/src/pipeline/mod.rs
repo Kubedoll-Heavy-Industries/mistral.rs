@@ -499,6 +499,14 @@ pub trait Pipeline:
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error>;
 
+    /// Get the pipeline hook if one is configured.
+    ///
+    /// Default returns None. Pipelines that support hooks should override this
+    /// to return a reference to their hook container.
+    fn get_hook(&self) -> Option<&HookContainer> {
+        None
+    }
+
     /// Returns the total of model execution time.
     #[allow(clippy::too_many_arguments)]
     async fn step(
@@ -558,6 +566,17 @@ pub trait Pipeline:
 
                     let start = Instant::now();
                     let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
+
+                    // For PP first stage: replace forward result with external logits from last stage
+                    // The forward pass ran our layers and sent activations via hook; now we await
+                    // the response logits from the last stage which did lm_head + final layers.
+                    let raw_logits = if self.get_hook().is_some_and(|h| h.needs_external_logits()) {
+                        let external_logits = self.get_hook().unwrap().receive_response_logits()?;
+                        ForwardInputsResult::CausalGeneration { logits: external_logits }
+                    } else {
+                        raw_logits
+                    };
+
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
 
@@ -776,6 +795,15 @@ pub trait Pipeline:
 
                     let start = Instant::now();
                     let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
+
+                    // For PP first stage: replace forward result with external logits from last stage
+                    let raw_logits = if self.get_hook().is_some_and(|h| h.needs_external_logits()) {
+                        let external_logits = self.get_hook().unwrap().receive_response_logits()?;
+                        ForwardInputsResult::CausalGeneration { logits: external_logits }
+                    } else {
+                        raw_logits
+                    };
+
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
 

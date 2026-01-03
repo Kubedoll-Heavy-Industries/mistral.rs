@@ -481,9 +481,6 @@ impl ModelWeights {
             }
         }
 
-        // PP: Non-last stages wait for response logits from last stage
-        crate::pp_await_response_logits!(self);
-
         // Last stage (or no PP): run final norm and lm_head
         let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;
         MatMul.qmatmul(&xs, &self.output)

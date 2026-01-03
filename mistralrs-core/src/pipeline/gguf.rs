@@ -109,6 +109,22 @@ impl Model {
             Model::XLoraLlama(_) | Model::XLoraPhi3(_) => false,
         }
     }
+
+    /// Get pipeline hook for distributed inference.
+    fn get_hook(&self) -> Option<&HookContainer> {
+        match self {
+            Model::Llama(m) => m.get_hook(),
+            Model::Mistral3(m) => m.get_hook(),
+            Model::Phi2(m) => m.get_hook(),
+            Model::Phi3(m) => m.get_hook(),
+            Model::Starcoder2(m) => m.get_hook(),
+            Model::Qwen(m) => m.get_hook(),
+            Model::Qwen3(m) => m.get_hook(),
+            Model::Qwen3MoE(m) => m.get_hook(),
+            // XLora models don't support hooks yet
+            Model::XLoraLlama(_) | Model::XLoraPhi3(_) => None,
+        }
+    }
 }
 
 pub struct GGUFPipeline {
@@ -809,6 +825,10 @@ impl MetadataMixin for GGUFPipeline {
 
 #[async_trait::async_trait]
 impl Pipeline for GGUFPipeline {
+    fn get_hook(&self) -> Option<&crate::pipeline::HookContainer> {
+        self.model.get_hook()
+    }
+
     fn forward_inputs(
         &mut self,
         inputs: Box<dyn Any>,

@@ -107,31 +107,36 @@ pub trait PipelineHook: Send + Sync {
         true
     }
 
-    /// Wait for response logits from the pipeline's last stage.
+    /// Whether this hook provides external logits for sampling.
     ///
-    /// Called by non-last stages after sending their activation to the next stage.
-    /// This blocks until the last stage processes and returns the final logits.
+    /// Returns true for PP first stage (but not last stage) that receives
+    /// logits from the last stage via transport layer instead of computing
+    /// them locally.
     ///
-    /// # Returns
-    /// * `Ok(Some(logits))` - Logits from the last stage
-    /// * `Ok(None)` - No response expected (last stage or no PP)
-    /// * `Err(e)` - Pipeline communication error
-    ///
-    /// # Default Implementation
-    /// Returns `Ok(None)` - override for distributed inference.
-    fn wait_for_response_logits(&self) -> Result<Option<Tensor>> {
-        Ok(None)
+    /// When this returns true, the pipeline should call `receive_response_logits()`
+    /// after forward pass to get logits for sampling instead of using the
+    /// local forward() result.
+    fn needs_external_logits(&self) -> bool {
+        false
     }
 
-    /// Check if this hook is for a non-last pipeline stage.
+    /// Receive response logits from the last pipeline stage.
     ///
-    /// If true, the model should skip lm_head and instead wait for
-    /// response logits from the last stage.
+    /// This is called by the pipeline code on the first stage (but not last)
+    /// to get logits for sampling instead of using the local forward() result.
     ///
-    /// # Default Implementation
-    /// Returns false - override for distributed inference.
-    fn is_pipeline_non_last_stage(&self) -> bool {
-        false
+    /// Blocks until logits arrive from the transport layer.
+    ///
+    /// Default implementation returns an error. Override in hooks that
+    /// support external logits (i.e., where `needs_external_logits()` returns true).
+    ///
+    /// # Returns
+    /// - `Ok(Tensor)` - The logits tensor for sampling [batch, seq_len, vocab_size]
+    /// - `Err` - If not configured for logits or channel closed
+    fn receive_response_logits(&self) -> Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "receive_response_logits not supported by this hook".to_string(),
+        ))
     }
 }
 
@@ -215,21 +220,23 @@ impl HookContainer {
         }
     }
 
-    /// Check if this is a non-last pipeline stage that should skip lm_head.
-    pub fn is_pipeline_non_last_stage(&self) -> bool {
-        self.hook
-            .as_ref()
-            .map(|h| h.is_pipeline_non_last_stage())
-            .unwrap_or(false)
+    /// Check if the hook needs external logits for sampling.
+    ///
+    /// Returns true for PP first stage that receives logits from the last stage.
+    pub fn needs_external_logits(&self) -> bool {
+        self.hook.as_ref().is_some_and(|h| h.needs_external_logits())
     }
 
-    /// Wait for response logits from the last pipeline stage.
+    /// Receive response logits from the last pipeline stage.
     ///
-    /// Only call this if `is_pipeline_non_last_stage()` returns true.
-    pub fn wait_for_response_logits(&self) -> Result<Option<Tensor>> {
+    /// Blocks until logits arrive. Only valid when `needs_external_logits()` is true.
+    pub fn receive_response_logits(&self) -> Result<Tensor> {
         match &self.hook {
-            Some(hook) => hook.wait_for_response_logits(),
-            None => Ok(None),
+            Some(hook) if hook.needs_external_logits() => hook.receive_response_logits(),
+            Some(_) => Err(candle_core::Error::Msg(
+                "Hook does not support external logits".to_string(),
+            )),
+            None => Err(candle_core::Error::Msg("No hook configured".to_string())),
         }
     }
 }
