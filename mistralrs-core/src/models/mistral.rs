@@ -641,6 +641,10 @@ impl Model {
                 }
             }
         }
+
+        // Pipeline parallelism: non-last stages skip lm_head and wait for response
+        crate::pp_await_response_logits!(self);
+
         let xs = xs.to_device(&self.device)?;
         let mut xs = xs.apply(&self.norm)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
