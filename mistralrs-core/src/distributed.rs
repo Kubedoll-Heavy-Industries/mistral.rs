@@ -129,7 +129,7 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
                         }
                         Request::Normal(mut x) => {
                             let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-                            x.is_streaming = false;
+                            x.input.exec.is_streaming = false;
                             x.response = sender;
                             let req = Request::Normal(x);
 
@@ -164,6 +164,14 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
                                     }
                                 }
                                 None => tracing::error!("PipelineContinue response channel closed"),
+                            }
+                            continue;
+                        }
+                        Request::PipelineCleanup { request_id } => {
+                            // Forward cleanup request - no response expected
+                            let req = Request::PipelineCleanup { request_id };
+                            if request_sender.send(req).await.is_err() {
+                                tracing::error!("Daemon channel closed for PipelineCleanup request");
                             }
                             continue;
                         }
@@ -221,7 +229,7 @@ pub fn ring_daemon_replicator(request_sender: Sender<Request>) {
                         }
                         Request::Normal(mut x) => {
                             let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-                            x.is_streaming = false;
+                            x.input.exec.is_streaming = false;
                             x.response = sender;
                             let req = Request::Normal(x);
 
@@ -239,6 +247,12 @@ pub fn ring_daemon_replicator(request_sender: Sender<Request>) {
                             request_sender.send(req).await.unwrap();
                             let resp = receiver.recv().await.unwrap();
                             resp.as_result().unwrap();
+                            continue;
+                        }
+                        Request::PipelineCleanup { request_id } => {
+                            // Forward cleanup request - no response expected
+                            let req = Request::PipelineCleanup { request_id };
+                            request_sender.send(req).await.unwrap();
                             continue;
                         }
                     };

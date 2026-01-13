@@ -1,13 +1,18 @@
 use crate::{
-    pipeline::{ForwardInputsResult, NormalCache, RerankInputs},
+    pipeline::{CacheBackendMetadata, CacheInstruction, ForwardInputsResult, NormalCache, RerankInputs},
     prefix_cacher::MatchingCache,
-    request::{DetokenizationRequest, NormalRequest, PipelineContinueRequest, TokenizationRequest},
-    sequence::SeqStepType,
+    request::{
+        DetokenizationRequest, DetokenizeRequest, InferenceExec, InferenceInput, InferenceOperation,
+        NormalRequest, PipelineContinueRequest, TokenizationRequest, TokenizeRequest,
+    },
+    sequence::{SeqStepType, SequenceRecognizer, SequenceState},
     tools::{ToolCallingMatcher, ToolChoice},
-    ModelCategory, RequestMessage, Response,
+    Constraint, ModelCategory, Response, SamplingParams,
 };
 use candle_core::Tensor;
 use either::Either;
+use rand::SeedableRng;
+use rand_isaac::Isaac64Rng;
 use std::{
     ops::Deref,
     sync::{atomic::Ordering, Arc},
@@ -30,18 +35,21 @@ impl Engine {
         match request {
             Request::Normal(request) => {
                 // Handle reranking separately - it uses TEI's predict() not generation
-                if matches!(&request.messages, RequestMessage::Rerank { .. }) {
+                if matches!(&request.input.op, InferenceOperation::Rerank { .. }) {
                     self.handle_rerank_request(*request).await;
                     return;
                 }
 
-                let is_chat = matches!(
-                    &request.messages,
-                    RequestMessage::Chat { .. } | RequestMessage::VisionChat { .. }
-                );
+                let is_chat = matches!(&request.input.op, InferenceOperation::Chat { .. });
                 let has_tooling =
                     !self.tool_callbacks.is_empty() || !self.tool_callbacks_with_tools.is_empty();
-                let has_search = request.web_search_options.is_some();
+                let has_search = match &request.input.op {
+                    InferenceOperation::Chat {
+                        web_search_options,
+                        ..
+                    } => web_search_options.is_some(),
+                    _ => false,
+                };
 
                 if is_chat && (has_search || has_tooling) {
                     search_request::search_request(self.clone(), *request).await;
@@ -57,6 +65,9 @@ impl Engine {
             Request::Tokenize(req) => self.tokenize_text(req).await,
             Request::Detokenize(req) => self.detokenize_text(req).await,
             Request::PipelineContinue(req) => self.handle_pipeline_continue(req).await,
+            Request::PipelineCleanup { request_id } => {
+                self.handle_pipeline_cleanup(request_id).await
+            }
             Request::Terminate => (),
             Request::TerminateAllSeqsNextStep => {
                 TERMINATE_ALL_NEXT_STEP.store(true, Ordering::SeqCst)
@@ -64,31 +75,77 @@ impl Engine {
         }
     }
 
-    pub(super) async fn add_request(&self, request: NormalRequest) {
-        let is_chat = matches!(
-            request.messages,
-            RequestMessage::Chat { .. } | RequestMessage::VisionChat { .. }
+    async fn handle_chat(
+        &self,
+        messages: Vec<indexmap::IndexMap<String, crate::request::MessageContent>>,
+        thinking: Option<crate::request::ThinkingMode>,
+        tools: Vec<crate::Tool>,
+        response: &tokio::sync::mpsc::Sender<Response>,
+    ) -> (Vec<u32>, String) {
+        let pipeline = &*get_mut_arcmutex!(self.pipeline);
+        let template = pipeline.get_processor().process(
+            pipeline,
+            messages,
+            true,
+            true,
+            thinking,
+            tools,
         );
-        let echo_prompt = matches!(
-            request.messages,
-            RequestMessage::Completion {
-                echo_prompt: true,
-                ..
+        match template {
+            Ok((toks, txt)) => (toks, txt),
+            Err(e) => {
+                response
+                    .send(Response::InternalError(e.into()))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                (vec![], String::new())
             }
+        }
+    }
+
+    async fn handle_text_generation(
+        &self,
+        text: String,
+        response: &tokio::sync::mpsc::Sender<Response>,
+    ) -> Option<(Vec<u32>, String)> {
+        let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
+            response
+                .send(Response::ValidationError(
+                    "Completion requests require the pipeline to have a tokenizer".into(),
+                ))
+                .await
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
+            return None;
+        };
+
+        let prompt = tokenizer
+            .encode_fast(text.clone(), true)
+            .map_err(anyhow::Error::msg);
+        let tokenized = match prompt {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                response
+                    .send(Response::InternalError(e.into()))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                return None;
+            }
+        };
+        Some((tokenized, text))
+    }
+
+    pub(super) async fn add_request(&self, request: NormalRequest) {
+        let is_chat = matches!(request.input.op, InferenceOperation::Chat { .. });
+        let echo_prompt = matches!(
+            request.input.op,
+            InferenceOperation::Completion { echo_prompt, .. } if echo_prompt
         );
 
-        let best_of = match request.messages {
-            RequestMessage::Completion { best_of, .. } => best_of,
-            RequestMessage::Chat { .. }
-            | RequestMessage::CompletionTokens(_)
-            | RequestMessage::VisionChat { .. }
-            | RequestMessage::ImageGeneration { .. }
-            | RequestMessage::SpeechGeneration { .. }
-            | RequestMessage::Embedding { .. }
-            | RequestMessage::EmbeddingTokens { .. }
-            | RequestMessage::Rerank { .. } => None,
+        let best_of = match &request.input.op {
+            InferenceOperation::Completion { best_of, .. } => *best_of,
+            _ => None,
         };
-        let truncate_sequence = request.truncate_sequence;
+        let truncate_sequence = request.input.exec.truncate_sequence;
         if is_chat
             && !get_mut_arcmutex!(self.pipeline)
                 .get_chat_template()
@@ -96,34 +153,33 @@ impl Engine {
                 .is_some_and(|ch_t| ch_t.has_chat_template())
         {
             request
-                    .response
-                    .send(Response::ValidationError(
-                        "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                .response
+                .send(Response::ValidationError(
+                    "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into(),
+                ))
+                .await
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
             return;
         }
 
         // Verify the model's category matches the messages received.
         match (
             get_mut_arcmutex!(self.pipeline).category(),
-            &request.messages,
+            &request.input.op,
         ) {
             (
                 ModelCategory::Text | ModelCategory::Vision { .. },
-                RequestMessage::Chat { .. }
-                | RequestMessage::VisionChat { .. }
-                | RequestMessage::Completion { .. }
-                | RequestMessage::CompletionTokens(_),
+                InferenceOperation::Chat { .. }
+                | InferenceOperation::Completion { .. }
+                | InferenceOperation::CompletionTokens { .. },
             ) => (),
-            (ModelCategory::Diffusion, RequestMessage::ImageGeneration { .. }) => (),
-            (ModelCategory::Speech, RequestMessage::SpeechGeneration { .. }) => (),
+            (ModelCategory::Diffusion, InferenceOperation::ImageGeneration { .. }) => (),
+            (ModelCategory::Speech, InferenceOperation::SpeechGeneration { .. }) => (),
             (
                 ModelCategory::Embedding,
-                RequestMessage::Embedding { .. } | RequestMessage::EmbeddingTokens { .. },
+                InferenceOperation::Embedding { .. } | InferenceOperation::EmbeddingTokens { .. },
             ) => (),
-            (ModelCategory::Rerank, RequestMessage::Rerank { .. }) => (),
+            (ModelCategory::Rerank, InferenceOperation::Rerank { .. }) => (),
             _ => {
                 request
                     .response
@@ -136,94 +192,106 @@ impl Engine {
             }
         }
 
-        let images = match request.messages {
-            RequestMessage::VisionChat { ref images, .. } => Some(images.clone()),
-            _ => None,
+        let (images, audios) = match &request.input.op {
+            InferenceOperation::Chat { attachments, .. } => {
+                let mut images = Vec::new();
+                let mut audios = Vec::new();
+                for attachment in attachments {
+                    match attachment {
+                        crate::request::ChatAttachment::Image(image) => images.push(image.clone()),
+                        crate::request::ChatAttachment::Audio(audio) => audios.push(audio.clone()),
+                    }
+                }
+                (
+                    (!images.is_empty()).then_some(images),
+                    (!audios.is_empty()).then_some(audios),
+                )
+            }
+            _ => (None, None),
         };
 
-        let audios = match request.messages {
-            RequestMessage::VisionChat { ref audios, .. } => Some(audios.clone()),
-            _ => None,
+        let tool_choice = match &request.input.op {
+            InferenceOperation::Chat { tool_choice, .. }
+            | InferenceOperation::Completion { tool_choice, .. }
+            | InferenceOperation::CompletionTokens { tool_choice, .. } => {
+                tool_choice.clone().unwrap_or(ToolChoice::Auto)
+            }
+            _ => ToolChoice::Auto,
         };
 
         let matcher = Arc::new(handle_seq_error!(
-            ToolCallingMatcher::new(request.tool_choice.unwrap_or(ToolChoice::Auto),),
+            ToolCallingMatcher::new(tool_choice,),
             request.response
         ));
 
-        let image_generation_format = match &request.messages {
-            RequestMessage::ImageGeneration { format, .. } => Some(*format),
+        let image_generation_format = match &request.input.op {
+            InferenceOperation::ImageGeneration { format, .. } => Some(*format),
             _ => None,
         };
 
-        let seq_step_type = match &request.messages {
-            RequestMessage::ImageGeneration { .. }
-            | RequestMessage::SpeechGeneration { .. }
-            | RequestMessage::Embedding { .. }
-            | RequestMessage::EmbeddingTokens { .. } => SeqStepType::OneShot,
+        let seq_step_type = match &request.input.op {
+            InferenceOperation::ImageGeneration { .. }
+            | InferenceOperation::SpeechGeneration { .. }
+            | InferenceOperation::Embedding { .. }
+            | InferenceOperation::EmbeddingTokens { .. }
+            | InferenceOperation::Rerank { .. } => SeqStepType::OneShot,
             _ => SeqStepType::PromptAndDecode,
         };
 
-        let diffusion_params = match &request.messages {
-            RequestMessage::ImageGeneration {
+        let diffusion_params = match &request.input.op {
+            InferenceOperation::ImageGeneration {
                 generation_params, ..
             } => Some(generation_params.clone()),
             _ => None,
         };
         let mut added_seq = false;
 
-        let (mut prompt_tokens, prompt_text) = match request.messages {
-            RequestMessage::Chat {
+        let (mut prompt_tokens, prompt_text) = match &request.input.op {
+            InferenceOperation::Chat {
                 messages,
-                enable_thinking,
-                reasoning_effort,
-            }
-            | RequestMessage::VisionChat {
-                images: _,
-                audios: _,
-                messages,
-                enable_thinking,
-                reasoning_effort,
+                thinking,
+                tools,
+                ..
             } => {
-                let pipeline = &*get_mut_arcmutex!(self.pipeline);
-                let tools = request.tools.unwrap_or_default();
-                let template = pipeline.get_processor().process(
-                    pipeline,
-                    messages,
-                    true,
-                    true,
-                    enable_thinking,
-                    reasoning_effort,
+                let tools = tools.clone().unwrap_or_default();
+                self.handle_chat(
+                    messages.clone(),
+                    thinking.clone(),
                     tools,
-                );
-                handle_seq_error!(template, request.response)
+                    &request.response,
+                )
+                .await
             }
-            RequestMessage::Completion { text, .. }
-            | RequestMessage::Embedding { prompt: text } => {
+            InferenceOperation::Completion { text, .. }
+            | InferenceOperation::Embedding { prompt: text } => {
+                let Some((prompt_tokens, prompt_text)) =
+                    self.handle_text_generation(text.clone(), &request.response).await
+                else {
+                    return;
+                };
+                (prompt_tokens, prompt_text)
+            }
+            InferenceOperation::ImageGeneration { prompt, .. }
+            | InferenceOperation::SpeechGeneration { prompt } => (vec![u32::MAX], prompt.clone()),
+            InferenceOperation::CompletionTokens { tokens: it, .. } => {
+                let it = it.clone();
                 let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
                     request
                         .response
                         .send(Response::ValidationError(
-                            "Completion requests require the pipeline to have a tokenizer".into(),
+                            "Completion requests w/ raw tokens require the pipeline to have a tokenizer".into(),
                         ))
                         .await
                         .unwrap_or_else(|_| warn!("Receiver disconnected"));
                     return;
                 };
                 let prompt = tokenizer
-                    .encode_fast(text.clone(), true)
-                    .map_err(anyhow::Error::msg);
-                (
-                    handle_seq_error!(prompt, request.response)
-                        .get_ids()
-                        .to_vec(),
-                    text,
-                )
+                    .decode(&it, false)
+                    .map_err(|e| anyhow::Error::msg(e.to_string()));
+                (it, handle_seq_error!(prompt, request.response))
             }
-            RequestMessage::ImageGeneration { prompt, .. }
-            | RequestMessage::SpeechGeneration { prompt } => (vec![u32::MAX], prompt),
-            RequestMessage::CompletionTokens(it)
-            | RequestMessage::EmbeddingTokens { prompt: it } => {
+            InferenceOperation::EmbeddingTokens { prompt: it } => {
+                let it = it.clone();
                 let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
                     request
                         .response
@@ -240,7 +308,7 @@ impl Engine {
                 (it, handle_seq_error!(prompt, request.response))
             }
             // Rerank is handled early in handle_request, should never reach here
-            RequestMessage::Rerank { .. } => {
+            InferenceOperation::Rerank { .. } => {
                 unreachable!("Rerank requests are handled by handle_rerank_request")
             }
         };
@@ -280,10 +348,14 @@ impl Engine {
                 // Reserve space for generation tokens
                 // If user specified max_len (generation length), reserve that many tokens (capped to max_len)
                 // Otherwise, reserve just 1 token minimum to allow at least some generation
-                let sampling_max = if let Some(sampling_max) = request.sampling_params.max_len {
-                    sampling_max.min(max_len)
-                } else {
-                    1
+                let sampling_max = match &request.input.op {
+                    InferenceOperation::Chat { sampling_params, .. }
+                    | InferenceOperation::Completion { sampling_params, .. }
+                    | InferenceOperation::CompletionTokens { sampling_params, .. } => sampling_params
+                        .max_len
+                        .unwrap_or(1)
+                        .min(max_len),
+                    _ => 1,
                 };
 
                 // Calculate how many prompt tokens to keep: max_len - sampling_max
@@ -305,18 +377,47 @@ impl Engine {
             }
         }
 
-        let topk = request
-            .sampling_params
-            .top_k
-            .map(|x| x as i64)
-            .unwrap_or(-1);
-        let topp = request.sampling_params.top_p.unwrap_or(1.0);
-        let minp = request.sampling_params.min_p.unwrap_or(0.0);
+        let sampling_params = match &request.input.op {
+            InferenceOperation::Chat { sampling_params, .. }
+            | InferenceOperation::Completion { sampling_params, .. }
+            | InferenceOperation::CompletionTokens { sampling_params, .. } => sampling_params,
+            _ => &SamplingParams::deterministic(),
+        };
+
+        let constraint = match &request.input.op {
+            InferenceOperation::Chat { constraint, .. }
+            | InferenceOperation::Completion { constraint, .. }
+            | InferenceOperation::CompletionTokens { constraint, .. } => constraint,
+            _ => &Constraint::None,
+        };
+
+        let suffix = match &request.input.op {
+            InferenceOperation::Completion { suffix, .. }
+            | InferenceOperation::CompletionTokens { suffix, .. } => suffix.clone(),
+            _ => None,
+        };
+
+        let return_raw_logits = match &request.input.op {
+            InferenceOperation::Chat {
+                return_raw_logits, ..
+            }
+            | InferenceOperation::Completion {
+                return_raw_logits, ..
+            }
+            | InferenceOperation::CompletionTokens {
+                return_raw_logits, ..
+            } => *return_raw_logits,
+            _ => false,
+        };
+
+        let topk = sampling_params.top_k.map(|x| x as i64).unwrap_or(-1);
+        let topp = sampling_params.top_p.unwrap_or(1.0);
+        let minp = sampling_params.min_p.unwrap_or(0.0);
         let num_hidden_layers = get_mut_arcmutex!(self.pipeline)
             .get_metadata()
             .num_hidden_layers;
 
-        let (stop_toks, stop_strings) = match request.sampling_params.stop_toks {
+        let (stop_toks, stop_strings) = match sampling_params.stop_toks {
             None => (vec![], vec![]),
             Some(StopTokens::Ids(ref i)) => {
                 let tok_env = {
@@ -389,8 +490,8 @@ impl Engine {
         };
 
         let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
-            request.sampling_params.n_choices,
-            request.is_streaming,
+            sampling_params.n_choices,
+            request.input.exec.is_streaming,
             is_chat,
             best_of,
         )));
@@ -398,25 +499,36 @@ impl Engine {
         let tokenizer = get_mut_arcmutex!(self.pipeline).tokenizer();
 
         let sampler = Sampler::new(
-            Some(request.sampling_params.temperature.unwrap_or(1.0)),
-            request.sampling_params.top_n_logprobs,
+            Some(sampling_params.temperature.unwrap_or(1.0)),
+            sampling_params.top_n_logprobs,
             tokenizer,
-            request.sampling_params.frequency_penalty,
-            request.sampling_params.presence_penalty,
-            request.sampling_params.repetition_penalty,
-            request.sampling_params.dry_params,
+            sampling_params.frequency_penalty,
+            sampling_params.presence_penalty,
+            sampling_params.repetition_penalty,
+            sampling_params.dry_params.clone(),
             topk,
             topp,
             minp,
-            request.logits_processors.unwrap_or_default(),
+            match &request.input.op {
+                InferenceOperation::Chat {
+                    logits_processors, ..
+                }
+                | InferenceOperation::Completion {
+                    logits_processors, ..
+                }
+                | InferenceOperation::CompletionTokens {
+                    logits_processors, ..
+                } => logits_processors.clone().unwrap_or_default(),
+                _ => vec![],
+            },
         );
         let sampler = handle_seq_error!(sampler, request.response);
 
-        if request.sampling_params.n_choices == 0 {
+        if sampling_params.n_choices == 0 {
             request
                 .response
                 .send(Response::ValidationError(
-                    "Number of choices must be greater than 0.".into(),
+                    "n_choices must be greater than 0".into(),
                 ))
                 .await
                 .unwrap_or_else(|_| warn!("Receiver disconnected"));
@@ -424,12 +536,12 @@ impl Engine {
         }
 
         // Add sequences
-        for response_index in 0..request.sampling_params.n_choices {
+        for response_index in 0..sampling_params.n_choices {
             let factory = get_mut_arcmutex!(self.pipeline)
                 .get_metadata()
                 .llg_factory
                 .clone();
-            let recognizer = match Self::build_sequence_recognizer(&factory, &request.constraint) {
+            let recognizer = match Self::build_sequence_recognizer(&factory, constraint) {
                 Ok(recognizer) => recognizer,
                 Err(err) => {
                     request
@@ -537,19 +649,27 @@ impl Engine {
                 prompt_text.clone(),
                 *get_mut_arcmutex!(self.id).deref(),
                 now.as_millis(),
+                request.id, // UUID request_id for pipeline parallelism
                 num_hidden_layers,
                 request.response.clone(),
                 sampler.clone(),
                 stop_toks.clone(),
                 stop_strings.clone(),
-                request.sampling_params.max_len,
-                request.return_logprobs,
+                sampling_params.max_len,
+                match &request.input.op {
+                    InferenceOperation::Chat { return_logprobs, .. }
+                    | InferenceOperation::Completion { return_logprobs, .. }
+                    | InferenceOperation::CompletionTokens { return_logprobs, .. } => {
+                        *return_logprobs
+                    }
+                    _ => false,
+                },
                 get_mut_arcmutex!(self.pipeline).get_metadata().is_xlora,
                 group.clone(),
                 response_index,
                 now.as_secs(),
                 recognizer,
-                request.suffix.clone(),
+                suffix.clone(),
                 if echo_prompt {
                     Some(prompt_text.clone())
                 } else {
@@ -563,10 +683,36 @@ impl Engine {
                 seq_step_type,
                 diffusion_params.clone(),
                 seq_preallocated_cache,
-                request.return_raw_logits,
+                return_raw_logits,
                 eos_toks,
-                request.pipeline_continue_op_id,
             );
+
+            // Pipeline continuation: configure the Sequence for PP non-first stages.
+            // Use sequence_position to set token_offset for correct RoPE position calculation.
+            if let Ok(mut meta) = self.pipeline_continue_meta.lock() {
+                if let Some(pipeline_meta) = meta.remove(&request.id) {
+                    // Set the total prompt length for prefill/decode boundary detection
+                    seq.set_prompt_len(pipeline_meta.initial_seq_len);
+                    // Set token_offset for correct position calculation in RoPE
+                    // During decode, sequence_position equals total tokens processed,
+                    // so token_offset ensures RoPE uses the correct position.
+                    seq.set_token_offset(pipeline_meta.sequence_position);
+
+                    // CRITICAL: Set prefill_chunk_size to enable KV cache preservation.
+                    // The engine uses prefill_chunk_size.is_some() to identify sequences
+                    // that need their KV cache cached/injected across decode steps.
+                    // Value doesn't affect chunking behavior here - just enables the flag.
+                    seq.set_prefill_chunk_size(Some(prompt_tokens.len()));
+
+                    tracing::debug!(
+                        %request.id,
+                        initial_seq_len = pipeline_meta.initial_seq_len,
+                        sequence_position = pipeline_meta.sequence_position,
+                        token_count = prompt_tokens.len(),
+                        "Configured Sequence for pipeline continuation"
+                    );
+                }
+            }
 
             // Only "track" a new sequence if it is a traditional one
             if matches!(seq_step_type, SeqStepType::PromptAndDecode) {
@@ -592,9 +738,6 @@ impl Engine {
                         if let Err(e) = seq.enable_harmony_mode() {
                             warn!("Failed to enable Harmony mode: {e}");
                         }
-                    } else if chat_template.uses_think_tags() {
-                        // Enable think tag mode if the chat template uses <think> tags
-                        seq.enable_think_tag_mode();
                     }
                 }
             }
@@ -668,6 +811,67 @@ impl Engine {
                 None => seq,
             };
 
+            // For pipeline parallelism: set pending tokens on hook before adding sequence
+            // This applies to BOTH initial requests (first stage) AND continuation requests (later stages)
+            let pipeline = get_mut_arcmutex!(self.pipeline);
+            if let Some(hook_container) = pipeline.get_hook() {
+                // Extract tokens from the sequence and set them on the hook
+                // This allows the hook to propagate tokens with activations for sparse KV cache
+                if let Some(hook) = hook_container.get() {
+                    hook.set_pending_tokens(prompt_tokens.clone());
+                    tracing::debug!(
+                        token_count = prompt_tokens.len(),
+                        "Tokens set on hook for pipeline parallelism"
+                    );
+                }
+            }
+
+            // For continuation requests, inject cached KV if available.
+            // This preserves KV cache across decode steps in pipeline parallelism.
+            // Presence in pipeline_kv_cache indicates this is a continuation request.
+            {
+                let op_id = request.id;
+                if let Ok(cache_map) = self.pipeline_kv_cache.lock() {
+                    if let Some(cached_kv) = cache_map.get(&op_id) {
+                        tracing::debug!(
+                            %op_id,
+                            "Checking for cached KV to inject"
+                        );
+                        // Calculate cached length first
+                        let cached_len = cached_kv.get(0)
+                            .and_then(|kv| kv.as_ref())
+                            .and_then(|kv| kv.k().ok().flatten())
+                            .map(|k| k.dims()[2])
+                            .unwrap_or(0);
+
+                        // Inject cached KV into new sequence before adding to scheduler
+                        let injected_cache_len = {
+                            let new_kv = seq.normal_cache();
+                            for (i, kv) in cached_kv.iter().enumerate() {
+                                if i < new_kv.len() {
+                                    new_kv[i] = kv.clone();
+                                }
+                            }
+
+                            new_kv.get(0)
+                                .and_then(|kv| kv.as_ref())
+                                .and_then(|kv| kv.k().ok().flatten())
+                                .map(|k| k.dims()[2])
+                                .unwrap_or(0)
+                        };
+
+                        tracing::debug!(
+                            %op_id,
+                            cache_layers = cached_kv.iter().filter(|kv| kv.is_some()).count(),
+                            seq_tokens = seq.get_toks().len(),
+                            cached_len,
+                            injected_cache_len,
+                            "Cache injected for continuation"
+                        );
+                    }
+                }
+            }
+
             *get_mut_arcmutex!(self.id) += 1;
             get_mut_arcmutex!(self.scheduler).add_seq(seq);
             added_seq = true;
@@ -677,18 +881,26 @@ impl Engine {
         }
     }
 
-    async fn tokenize_text(&self, request: TokenizationRequest) {
-        match request.text {
+    async fn tokenize_text(&self, request: TokenizeRequest) {
+        match request.input.text {
             Either::Left(messages) => {
                 let pipeline = &*get_mut_arcmutex!(self.pipeline);
-                let tools = request.tools.unwrap_or_default();
+                let tools = request.input.tools.unwrap_or_default();
                 let template = pipeline.get_processor().process(
                     pipeline,
                     messages,
-                    request.add_generation_prompt,
-                    request.add_special_tokens,
-                    request.enable_thinking,
-                    request.reasoning_effort,
+                    request.input.add_generation_prompt,
+                    request.input.add_special_tokens,
+                    match (request.input.enable_thinking, request.input.reasoning_effort) {
+                        (Some(b), None) => Some(crate::request::ThinkingMode::Bool(b)),
+                        (None, Some(effort)) => {
+                            Some(crate::request::ThinkingMode::Effort(effort))
+                        }
+                        (Some(_b), Some(effort)) => {
+                            Some(crate::request::ThinkingMode::Effort(effort))
+                        }
+                        (None, None) => None,
+                    },
                     tools,
                 );
                 let toks = match template {
@@ -696,7 +908,7 @@ impl Engine {
                     Err(e) => {
                         request
                             .response
-                            .send(Err(e))
+                            .send(Err::<Vec<u32>, _>(e))
                             .await
                             .unwrap_or_else(|_| warn!("Receiver disconnected"));
                         return;
@@ -724,7 +936,7 @@ impl Engine {
                         return;
                     }
                 };
-                let toks = tokenizer.encode_fast(text, request.add_special_tokens);
+                let toks = tokenizer.encode_fast(text, request.input.add_special_tokens);
                 let toks = match toks {
                     Ok(tokenizer) => tokenizer,
                     Err(e) => {
@@ -745,7 +957,7 @@ impl Engine {
         };
     }
 
-    async fn detokenize_text(&self, request: DetokenizationRequest) {
+    async fn detokenize_text(&self, request: DetokenizeRequest) {
         let pipeline = &*get_mut_arcmutex!(self.pipeline);
         let tokenizer = pipeline.tokenizer();
         let tokenizer = match tokenizer {
@@ -754,14 +966,14 @@ impl Engine {
                 request
                     .response
                     .send(Err(anyhow::Error::msg(
-                        "Pipeline does not include a toksnizer.",
+                        "Pipeline does not include a tokenizer.",
                     )))
                     .await
                     .unwrap_or_else(|_| warn!("Receiver disconnected"));
                 return;
             }
         };
-        let txt = tokenizer.decode(&request.tokens, request.skip_special_tokens);
+        let txt = tokenizer.decode(&request.input.tokens, request.input.skip_special_tokens);
         let txt = match txt {
             Ok(tokenizer) => tokenizer,
             Err(e) => {
@@ -787,8 +999,8 @@ impl Engine {
     /// 2. Input is (query, document) pairs, not single prompts
     /// 3. Output is relevance scores, not generated tokens
     async fn handle_rerank_request(&self, request: NormalRequest) {
-        let (query, documents, truncate) = match &request.messages {
-            RequestMessage::Rerank {
+        let (query, documents, truncate) = match &request.input.op {
+            InferenceOperation::Rerank {
                 query,
                 documents,
                 truncate,
@@ -880,44 +1092,311 @@ impl Engine {
 
     /// Handle pipeline continuation request for non-first pipeline stages.
     ///
-    /// When a non-first stage receives activations from the previous stage,
-    /// this triggers a minimal forward pass. The distributed hook intercepts
-    /// at layer 0 and injects the received activations.
+    /// This method directly manages persistent sequences for pipeline parallelism,
+    /// bypassing the scheduler. Sequences are stored in `pipeline_sequences` and
+    /// reused across multiple forward passes (one per activation).
     ///
-    /// For KV cache preservation: The first forward pass for an op_id resets the cache
-    /// (prompt processing). Subsequent forward passes reuse the cache (decode steps).
+    /// Flow:
+    /// 1. First activation: Create sequence, store in `pipeline_sequences`, run forward
+    /// 2. Subsequent activations: Reuse sequence from `pipeline_sequences`, update tokens, run forward
+    /// 3. Cleanup signal: Remove from `pipeline_sequences`
     async fn handle_pipeline_continue(&self, request: PipelineContinueRequest) {
+        let request_id = request.id;
+        let tokens = request.input.tokens.clone();
+        let sequence_position = request.input.sequence_position;
+        let initial_seq_len = request.input.initial_seq_len;
 
-        // Create a NormalRequest with the correct number of dummy tokens
-        // to ensure attention mask is created with the right dimensions.
-        // The hook will intercept at layer 0 and replace with actual activations.
-        let mut sampling_params = crate::sampler::SamplingParams::deterministic();
-        sampling_params.max_len = Some(1); // Single forward pass only
+        // Set pending tokens on hook for activation injection
+        {
+            let pipeline = get_mut_arcmutex!(self.pipeline);
+            if let Some(hook_container) = pipeline.get_hook() {
+                if let Some(hook) = hook_container.get() {
+                    hook.set_pending_tokens(tokens.clone());
+                }
+            }
+        }
 
-        // Create seq_len dummy tokens so attention mask matches activation shape
-        let dummy_tokens = vec![0u32; request.seq_len];
-
-        let minimal_request = NormalRequest {
-            messages: RequestMessage::CompletionTokens(dummy_tokens),
-            sampling_params,
-            response: request.response,
-            return_logprobs: false,
-            is_streaming: false,
-            id: request.op_id,
-            constraint: crate::Constraint::None,
-            suffix: None,
-            logits_processors: None,
-            return_raw_logits: true, // We want raw logits for the response
-            web_search_options: None,
-            model_id: request.model_id,
-            tools: None,
-            tool_choice: None,
-            truncate_sequence: false,
-            // Set op_id for KV cache preservation across decode steps
-            pipeline_continue_op_id: Some(request.op_id),
+        // Check if we have an existing sequence for this request
+        let is_first_activation = {
+            let seqs = self.pipeline_sequences.lock().unwrap();
+            !seqs.contains_key(&request_id)
         };
 
-        // Process through normal request path - hook will intercept and handle
-        self.add_request(minimal_request).await;
+        if is_first_activation {
+            // First activation: Create new sequence with full setup
+            let num_hidden_layers = get_mut_arcmutex!(self.pipeline)
+                .get_metadata()
+                .num_hidden_layers;
+
+            let eos_toks = get_mut_arcmutex!(self.pipeline)
+                .get_metadata()
+                .eos_tok
+                .clone();
+
+            let tokenizer = get_mut_arcmutex!(self.pipeline).tokenizer();
+            let sampler = Sampler::new(
+                Some(request.input.sampling_params.temperature.unwrap_or(1.0)),
+                request.input.sampling_params.top_n_logprobs,
+                tokenizer,
+                request.input.sampling_params.frequency_penalty,
+                request.input.sampling_params.presence_penalty,
+                request.input.sampling_params.repetition_penalty,
+                request.input.sampling_params.dry_params.clone(),
+                request.input.sampling_params.top_k.map(|x| x as i64).unwrap_or(-1),
+                request.input.sampling_params.top_p.unwrap_or(1.0),
+                request.input.sampling_params.min_p.unwrap_or(0.0),
+                vec![],
+            );
+
+            let sampler = match sampler {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = request.response.send(Response::InternalError(e.into())).await;
+                    return;
+                }
+            };
+
+            let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(1, false, false, None)));
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time travel has occurred!");
+
+            let mut seq = Sequence::new_waiting(
+                tokens.clone(),
+                String::new(), // No prompt text needed for pipeline continuation
+                *get_mut_arcmutex!(self.id).deref(),
+                now.as_millis(),
+                request_id,
+                num_hidden_layers,
+                request.response.clone(),
+                sampler,
+                vec![], // stop_toks
+                vec![], // stop_strings
+                None,   // max_len - unlimited for pipeline sequences
+                false,  // return_logprobs
+                false,  // is_xlora
+                group,
+                0,      // response_index
+                now.as_secs(),
+                SequenceRecognizer::None,
+                None,   // suffix
+                None,   // echo_prompt
+                None,   // images
+                None,   // audios
+                None,   // block_size
+                None,   // tool_matcher
+                None,   // image_generation_format
+                SeqStepType::PromptAndDecode,
+                None,   // diffusion_params
+                None,   // seq_preallocated_cache
+                true,   // return_raw_logits - always true for pipeline parallelism
+                eos_toks,
+            );
+
+            // Configure sequence for pipeline continuation
+            seq.set_prompt_len(initial_seq_len);
+            seq.set_token_offset(sequence_position);
+            seq.set_state(SequenceState::RunningPrompt);
+
+            *get_mut_arcmutex!(self.id) += 1;
+
+            // Store in pipeline_sequences
+            {
+                let mut seqs = self.pipeline_sequences.lock().unwrap();
+                seqs.insert(request_id, seq);
+            }
+        } else {
+            // Subsequent activation: Replace tokens with current chunk (not accumulate)
+            // KV cache grows via CacheInstruction::In, token_offset provides RoPE position
+            let mut seqs = self.pipeline_sequences.lock().unwrap();
+            if let Some(seq) = seqs.get_mut(&request_id) {
+                // Replace tokens with just this chunk - forward pass processes only new tokens
+                // while token_offset ensures correct RoPE positions
+                seq.set_tokens_for_pp(&tokens);
+                // Update token offset to match Stage 0's position
+                seq.set_token_offset(sequence_position);
+                // Update responder so response goes to THIS request's channel
+                seq.set_responder(request.response.clone());
+                // Reset state to prompt for fresh forward pass
+                seq.set_state(SequenceState::RunningPrompt);
+            }
+        }
+
+        // Run forward pass directly, bypassing scheduler
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
+
+        // Phase 1: Extract sequence from map to release lock during await
+        // This prevents deadlock when multiple pipeline requests run concurrently
+        let mut seq = {
+            let mut seqs = self.pipeline_sequences.lock().unwrap();
+            match seqs.remove(&request_id) {
+                Some(s) => s,
+                None => {
+                    tracing::error!(%request_id, "Sequence not found in pipeline_sequences");
+                    let _ = request
+                        .response
+                        .send(Response::InternalError(
+                            "Pipeline sequence not found".to_string().into(),
+                        ))
+                        .await;
+                    return;
+                }
+            }
+        };
+
+        // Phase 2: Check first forward status (brief lock)
+        let is_first_forward = {
+            let done = self.pipeline_first_forward_done.lock().unwrap();
+            !done.contains(&(request_id, 0))
+        };
+
+        // Determine prompt vs decode based on absolute sequence position.
+        // For pipeline continuation, later prompt chunks must still be treated as prompt
+        // (i.e., build KV) even though they are not the first forward.
+        let is_prompt_step = sequence_position < initial_seq_len;
+
+        let pre_op = if is_first_forward {
+            CacheInstruction::Reset {
+                load_preallocated_cache: false,
+                reset_non_granular: false,
+            }
+        } else {
+            CacheInstruction::In
+        };
+        let post_op = CacheInstruction::Out;
+        let backend_metadata = CacheBackendMetadata::DefaultInstructions { pre_op, post_op };
+
+        // Phase 3: Check stage type (brief lock)
+        let is_first_stage = {
+            let pipeline = get_mut_arcmutex!(self.pipeline);
+            pipeline
+                .get_hook()
+                .is_some_and(|h| h.needs_external_logits())
+        };
+
+        // Phase 4: Execute pipeline operation
+        // Pipeline lock is held during operation but pipeline_sequences is free
+        let mut seq_refs: Vec<&mut Sequence> = vec![&mut seq];
+
+        if is_first_stage {
+            // Stage 0: Run full step (forward + wait for logits + sample + send response)
+            let step_result = {
+                let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
+                pipeline
+                    .step(
+                        &mut seq_refs,
+                        is_prompt_step,
+                        false, // Don't return raw logits - we want sampling
+                        &mut *prefix_cacher,
+                        self.disable_eos_stop,
+                        rng,
+                        backend_metadata,
+                    )
+                    .await
+            };
+
+            // Mark first forward as done
+            {
+                let mut done = self.pipeline_first_forward_done.lock().unwrap();
+                done.insert((request_id, 0));
+            }
+
+            if let Err(e) = step_result {
+                tracing::error!(%request_id, error = %e, "Pipeline step failed");
+                let _ = request
+                    .response
+                    .send(Response::InternalError(
+                        format!("Pipeline step failed: {e}").into(),
+                    ))
+                    .await;
+                // Don't re-insert on error - cleanup will handle it
+                return;
+            }
+
+            tracing::debug!(%request_id, "Pipeline step completed");
+        } else {
+            // Intermediate/last stage: Run forward pass and send logits to worker
+            let result = {
+                let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                pipeline.forward_pass(&mut seq_refs, is_prompt_step, backend_metadata)
+            };
+
+            // Mark first forward as done
+            {
+                let mut done = self.pipeline_first_forward_done.lock().unwrap();
+                done.insert((request_id, 0));
+            }
+
+            match result {
+                Ok(logits) => {
+                    // Send logits tensor directly in Response::Raw
+                    let _ = request
+                        .response
+                        .send(Response::Raw {
+                            logits_chunks: vec![logits],
+                            tokens: vec![],
+                        })
+                        .await;
+                    tracing::debug!(
+                        %request_id,
+                        "Pipeline forward pass completed, sent logits to worker"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(%request_id, error = %e, "Pipeline forward pass failed");
+                    let _ = request
+                        .response
+                        .send(Response::InternalError(
+                            format!("Pipeline forward failed: {e}").into(),
+                        ))
+                        .await;
+                    // Don't re-insert on error - cleanup will handle it
+                    return;
+                }
+            }
+        }
+
+        // Phase 5: Re-insert sequence for future use on success
+        self.pipeline_sequences
+            .lock()
+            .unwrap()
+            .insert(request_id, seq);
     }
+
+    /// Handle cleanup signal for a pipeline request.
+    /// Called when the stream closes (request completed or aborted).
+    /// Removes all cached state associated with the request.
+    async fn handle_pipeline_cleanup(&self, request_id: uuid::Uuid) {
+        tracing::debug!(%request_id, "Pipeline cleanup requested");
+
+        // Remove from pipeline_sequences (persistent sequence storage)
+        if let Ok(mut seqs) = self.pipeline_sequences.lock() {
+            if seqs.remove(&request_id).is_some() {
+                tracing::debug!(%request_id, "Removed sequence from pipeline_sequences");
+            }
+        }
+
+        // Remove from pipeline_kv_cache (legacy KV cache storage)
+        if let Ok(mut cache) = self.pipeline_kv_cache.lock() {
+            if cache.remove(&request_id).is_some() {
+                tracing::debug!(%request_id, "Removed KV cache from pipeline_kv_cache");
+            }
+        }
+
+        // Remove from pipeline_continue_meta
+        if let Ok(mut meta) = self.pipeline_continue_meta.lock() {
+            if meta.remove(&request_id).is_some() {
+                tracing::debug!(%request_id, "Removed metadata from pipeline_continue_meta");
+            }
+        }
+
+        // Remove from pipeline_first_forward_done
+        if let Ok(mut done) = self.pipeline_first_forward_done.lock() {
+            // Remove all entries for this request_id (across all chunk_ids)
+            done.retain(|(op_id, _)| *op_id != request_id);
+        }
+    }
+
 }

@@ -8,12 +8,32 @@ use tokenizers::InputSequence;
 use crate::{
     get_mut_arcmutex,
     request::SearchContextSize,
+    request::InferenceOperation,
     search::{self, ExtractFunctionParameters, SearchFunctionParameters, SearchResult},
-    MessageContent, NormalRequest, RequestMessage, Response, ToolCallResponse, ToolChoice,
-    WebSearchOptions,
+    MessageContent, NormalRequest, Response, ToolCallResponse, ToolChoice, WebSearchOptions,
 };
 
 use super::Engine;
+
+fn chat_op_fields_mut(
+    op: &mut InferenceOperation,
+) -> (
+    &mut Vec<IndexMap<String, MessageContent>>,
+    &mut Option<Vec<crate::Tool>>,
+    &mut Option<ToolChoice>,
+    &mut Option<WebSearchOptions>,
+) {
+    match op {
+        InferenceOperation::Chat {
+            messages,
+            tools,
+            tool_choice,
+            web_search_options,
+            ..
+        } => (messages, tools, tool_choice, web_search_options),
+        _ => unreachable!("search_request only supports chat-like operations"),
+    }
+}
 
 async fn do_search(
     this: Arc<Engine>,
@@ -21,12 +41,8 @@ async fn do_search(
     tool_calls: &ToolCallResponse,
     web_search_options: &WebSearchOptions,
 ) -> NormalRequest {
-    let messages = match &mut second_request.messages {
-        RequestMessage::Chat { messages, .. } | RequestMessage::VisionChat { messages, .. } => {
-            messages
-        }
-        _ => unreachable!(),
-    };
+    let (messages, _tools, tool_choice, ws_opts) =
+        chat_op_fields_mut(&mut second_request.input.op);
 
     // Add assistant call message
     {
@@ -202,9 +218,9 @@ async fn do_search(
     }
 
     // Allow the assistant to invoke tools again on the next turn
-    second_request.tool_choice = Some(ToolChoice::Auto);
+    *tool_choice = Some(ToolChoice::Auto);
     // Recursion is enabled here!
-    second_request.web_search_options = Some(web_search_options.clone());
+    *ws_opts = Some(web_search_options.clone());
 
     second_request
 }
@@ -215,12 +231,8 @@ async fn do_extraction(
     tool_calls: &ToolCallResponse,
     web_search_options: &WebSearchOptions,
 ) -> NormalRequest {
-    let messages = match &mut second_request.messages {
-        RequestMessage::Chat { messages, .. } | RequestMessage::VisionChat { messages, .. } => {
-            messages
-        }
-        _ => unreachable!(),
-    };
+    let (messages, _tools, tool_choice, ws_opts) =
+        chat_op_fields_mut(&mut second_request.input.op);
 
     // Add assistant call message
     {
@@ -300,9 +312,13 @@ async fn do_extraction(
     }
 
     // Allow the assistant to invoke tools again on the next turn
-    second_request.tool_choice = Some(ToolChoice::Auto);
-    // Recursion is enabled here!
-    second_request.web_search_options = Some(web_search_options.clone());
+    {
+        let (_messages, _tools, tool_choice, ws_opts) =
+            chat_op_fields_mut(&mut second_request.input.op);
+        *tool_choice = Some(ToolChoice::Auto);
+        // Recursion is enabled here!
+        *ws_opts = Some(web_search_options.clone());
+    }
 
     second_request
 }
@@ -312,12 +328,8 @@ async fn do_custom_tool(
     mut second_request: NormalRequest,
     tool_calls: &ToolCallResponse,
 ) -> NormalRequest {
-    let messages = match &mut second_request.messages {
-        RequestMessage::Chat { messages, .. } | RequestMessage::VisionChat { messages, .. } => {
-            messages
-        }
-        _ => unreachable!(),
-    };
+    let (messages, _tools, tool_choice, _ws_opts) =
+        chat_op_fields_mut(&mut second_request.input.op);
 
     {
         let mut message: IndexMap<String, MessageContent> = IndexMap::new();
@@ -366,7 +378,7 @@ async fn do_custom_tool(
         messages.push(message);
     }
 
-    second_request.tool_choice = Some(ToolChoice::Auto);
+    *tool_choice = Some(ToolChoice::Auto);
     second_request
 }
 
@@ -380,26 +392,32 @@ async fn do_custom_tool(
 /// 4. Forward every user-visible reply **except** the first, which is just the
 ///    probe that discovers whether a tool call is needed.
 pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
-    let web_search_options = request.web_search_options.clone();
+    let web_search_options = match &request.input.op {
+        InferenceOperation::Chat {
+            web_search_options, ..
+        } => web_search_options.clone(),
+        _ => None,
+    };
 
     // The sender that ultimately delivers data back to the caller.
     let user_sender = request.response.clone();
-    let is_streaming = request.is_streaming;
+    let is_streaming = request.input.exec.is_streaming;
 
     // ---------------------------------------------------------------------
     // Build the *first* request (the “probe”).
     // ---------------------------------------------------------------------
     let mut probe = request.clone();
     if let Some(ref opts) = web_search_options {
-        probe
-            .tools
+        let (_messages, tools, _tool_choice, _ws_opts) = chat_op_fields_mut(&mut probe.input.op);
+        tools
             .get_or_insert_with(Vec::new)
             .extend(search::get_search_tools(opts).unwrap());
     }
 
     // Add Tool definitions from tool callbacks with tools if they're not already present
     if !this.tool_callbacks_with_tools.is_empty() {
-        let tools = probe.tools.get_or_insert_with(Vec::new);
+        let (_messages, tools, _tool_choice, _ws_opts) = chat_op_fields_mut(&mut probe.input.op);
+        let tools = tools.get_or_insert_with(Vec::new);
         let existing_tool_names: Vec<String> =
             tools.iter().map(|t| t.function.name.clone()).collect();
 
@@ -410,9 +428,15 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
         }
     }
 
-    probe.tool_choice = Some(ToolChoice::Auto);
+    {
+        let (_messages, _tools, tool_choice, _ws_opts) = chat_op_fields_mut(&mut probe.input.op);
+        *tool_choice = Some(ToolChoice::Auto);
+    }
     // Prevent accidental infinite recursion on the probe itself.
-    probe.web_search_options = None;
+    {
+        let (_messages, _tools, _tool_choice, ws_opts) = chat_op_fields_mut(&mut probe.input.op);
+        *ws_opts = None;
+    }
 
     // The conversation context that the user *will* see.
     let mut visible_req = probe.clone();

@@ -170,9 +170,34 @@ pub struct Engine {
     logger: IntervalLogger,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     pending_notify: Arc<Notify>,
-    /// Track pipeline parallelism op_ids that have completed their first forward pass.
-    /// Used to preserve KV cache for subsequent decode steps on non-first pipeline stages.
-    pipeline_first_forward_done: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// Track pipeline parallelism (op_id, chunk_id) tuples that have completed their first forward pass.
+    /// Used to preserve KV cache for subsequent decode steps and chunked prefill on non-first pipeline stages.
+    pipeline_first_forward_done: Arc<std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, usize)>>>,
+    /// Cache of KV cache state for pipeline continuation requests, keyed by op_id.
+    /// KV cache is extracted after forward pass and injected into new sequences to preserve state across decode.
+    /// Entry is created on first continuation request and cleaned up when generation is done.
+    pipeline_kv_cache: Arc<std::sync::Mutex<HashMap<uuid::Uuid, Vec<Option<crate::pipeline::KvCache>>>>>,
+
+    /// Metadata for pipeline continuation requests keyed by request_id.
+    /// Stores initial_seq_len for prefill/decode boundary detection.
+    pipeline_continue_meta: Arc<std::sync::Mutex<HashMap<uuid::Uuid, PipelineContinueMeta>>>,
+
+    /// Persistent sequences for pipeline parallelism, keyed by request_id.
+    /// Unlike normal sequences that are created per-request, pipeline sequences
+    /// persist across multiple forward passes (one per activation).
+    /// KV cache lives on the Sequence and is naturally preserved.
+    /// Entry created on first activation, removed on cleanup signal.
+    pipeline_sequences: Arc<std::sync::Mutex<HashMap<uuid::Uuid, crate::sequence::Sequence>>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PipelineContinueMeta {
+    /// Initial sequence length (total prompt tokens).
+    /// Prefill/decode boundary: kv_len >= this value.
+    pub(super) initial_seq_len: usize,
+    /// Absolute position where this chunk starts (for RoPE encoding).
+    /// Used to set token_offset on the Sequence for correct position calculation.
+    pub(super) sequence_position: usize,
 }
 
 impl Drop for Engine {
@@ -202,10 +227,18 @@ impl Engine {
     ) -> anyhow::Result<Self> {
         no_kv_cache |= get_mut_arcmutex!(pipeline).get_metadata().no_kv_cache;
 
+        // Disable prefix cache if PP hook is attached - prefix cache and PP don't compose
+        // because Stage 1 can't compute KV for positions that Stage 0 skipped via cache
+        let has_pp_hook = get_mut_arcmutex!(pipeline).get_hook().is_some();
+        if has_pp_hook {
+            tracing::info!("Pipeline parallelism enabled - disabling prefix cache");
+        }
+
         no_prefix_cache = no_prefix_cache
             || no_kv_cache
             || get_mut_arcmutex!(pipeline).get_metadata().no_prefix_cache
-            || prefix_cache_n == 0;
+            || prefix_cache_n == 0
+            || has_pp_hook;
 
         let search_pipeline = match search_embedding_model {
             Some(search_embedding_model) => Some(SearchPipeline::new(
@@ -246,6 +279,9 @@ impl Engine {
             handles: Arc::new(Mutex::new(Vec::new())),
             pending_notify: Arc::new(Notify::new()),
             pipeline_first_forward_done: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            pipeline_kv_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pipeline_continue_meta: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pipeline_sequences: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -422,6 +458,26 @@ impl Engine {
 
                         self.logger.add_tokens_processed(scheduled.completion.len());
 
+                        // For pipeline continuation decode steps, cache KV for next decode
+                        for seq in scheduled.completion.iter_mut() {
+                            if seq.prefill_chunk_size().is_some() {
+                                let op_id = seq.request_id();
+                                if let Ok(mut cache_map) = self.pipeline_kv_cache.lock() {
+                                    let kv_snapshot = seq.normal_cache().clone();
+                                    let cache_layers = kv_snapshot.iter().filter(|kv| kv.is_some()).count();
+
+                                    cache_map.insert(op_id, kv_snapshot);
+
+                                    tracing::debug!(
+                                        %op_id,
+                                        cache_layers,
+                                        seq_len = seq.len(),
+                                        "Cached KV for pipeline decode step"
+                                    );
+                                }
+                            }
+                        }
+
                         last_completion_ids = current_completion_ids;
                     }
 
@@ -451,28 +507,15 @@ impl Engine {
                             // This comes from prefix caching
                             // The invariant where all token offsets are the same is handled by the scheduler
                             //
-                            // For pipeline parallelism: if this is a continuation request (non-first
-                            // stage receiving activations), we need to preserve the KV cache for
-                            // subsequent decode steps. On the first forward for an op_id, we reset
-                            // the cache. On subsequent forwards, we use Nothing to preserve it.
-                            // Note: We use Nothing instead of In because the sequence doesn't have
-                            // cached data to clone - the cache lives in the model's NormalCache.
+                            // For chunked prefill (including pipeline parallelism): if chunk_offset > 0,
+                            // this is a continuation chunk and we need to preserve the KV cache.
                             let pre_op = if scheduled.prompt[0].token_offset() != 0 {
                                 CacheInstruction::In
-                            } else if let Some(op_id) = scheduled.prompt[0].pipeline_continue_op_id() {
-                                // Pipeline parallelism: check if this op_id has already done its first forward
-                                let mut done_set = self.pipeline_first_forward_done.lock().unwrap();
-                                if done_set.contains(&op_id) {
-                                    // Subsequent forward for this op_id - preserve cache (do nothing)
-                                    CacheInstruction::Nothing
-                                } else {
-                                    // First forward for this op_id - reset cache and mark as done
-                                    done_set.insert(op_id);
-                                    CacheInstruction::Reset {
-                                        load_preallocated_cache: false,
-                                        reset_non_granular: false,
-                                    }
-                                }
+                            } else if scheduled.prompt[0].prefill_chunk_offset() > 0 {
+                                // Chunked prefill continuation: ensure any existing KV cache is loaded.
+                                // For pipeline continuation we create a fresh Sequence per chunk/step and inject
+                                // cached KV into seq.normal_cache, so we must load it into the backend here.
+                                CacheInstruction::In
                             } else {
                                 CacheInstruction::Reset {
                                     load_preallocated_cache: true,
@@ -510,6 +553,26 @@ impl Engine {
                         self.logger.add_tokens_processed(total_processed_tokens);
 
                         for seq in scheduled.prompt.iter_mut() {
+                            // For pipeline continuation sequences (chunked prefill + decode), cache KV
+                            // Use request_id as the cache key
+                            if seq.prefill_chunk_size().is_some() {
+                                let op_id = seq.request_id();
+                                if let Ok(mut cache_map) = self.pipeline_kv_cache.lock() {
+                                    let kv_snapshot = seq.normal_cache().clone();
+                                    let cache_layers = kv_snapshot.iter().filter(|kv| kv.is_some()).count();
+
+                                    cache_map.insert(op_id, kv_snapshot);
+
+                                    tracing::debug!(
+                                        %op_id,
+                                        cache_layers,
+                                        seq_len = seq.len(),
+                                        has_remaining = seq.has_remaining_prefill(),
+                                        "Cached KV for pipeline continuation (prefill chunk or decode step)"
+                                    );
+                                }
+                            }
+
                             // Skip sequences already marked Done (e.g., by send_raw_responses
                             // when return_raw_logits is true for pipeline parallelism)
                             if seq.is_finished_paged_attn() {
