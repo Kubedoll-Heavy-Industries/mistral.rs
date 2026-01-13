@@ -4,17 +4,230 @@ use mistralrs_audio::AudioInput;
 use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokenizers::Tokenizer;
 
 use crate::{
-    response::Response, sampler::SamplingParams, tools::ToolChoice, CustomLogitsProcessor,
-    DiffusionGenerationParams, Tool,
+    pipeline::DiffusionGenerationParams, response::Response, sampler::SamplingParams,
+    tools::ToolChoice, CustomLogitsProcessor, Tool,
 };
 use std::{fmt::Debug, sync::Arc};
 use tokio::sync::mpsc::Sender;
 
-pub type LlguidanceGrammar = llguidance::api::TopLevelGrammar;
+/// Model inference request.
+///
+/// Generic over input and response types:
+/// - `I`: Input data (messages, tokens, etc.)
+/// - `R`: Response type sent through the channel
+///
+/// The response channel is `Sender<R>`. For requests that need error handling,
+/// use `R = anyhow::Result<T>`.
+#[derive(Serialize, Deserialize)]
+pub struct InferenceRequest<I, R> {
+    pub id: uuid::Uuid,
+    pub input: I,
+    #[serde(default = "default_responder")]
+    #[serde(skip)]
+    pub response: Sender<R>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+}
+
+// Manual Clone impl - Sender<T> is Clone regardless of T, so we only need I: Clone
+impl<I: Clone, R> Clone for InferenceRequest<I, R> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            input: self.input.clone(),
+            response: self.response.clone(),
+            model_id: self.model_id.clone(),
+        }
+    }
+}
+
+// =============================================================================
+// Input types for inference requests
+// =============================================================================
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct InferenceExec {
+    pub is_streaming: bool,
+    pub truncate_sequence: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct InferenceInput {
+    pub op: InferenceOperation,
+    pub exec: InferenceExec,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ThinkingMode {
+    Bool(bool),
+    Effort(ReasoningEffort),
+}
+
+impl ThinkingMode {
+    /// Construct ThinkingMode from optional enable flag and effort level.
+    ///
+    /// Priority: effort takes precedence over bool if both provided.
+    pub fn from_options(
+        enable_thinking: Option<bool>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Option<Self> {
+        match (enable_thinking, reasoning_effort) {
+            (_, Some(effort)) => Some(Self::Effort(effort)),
+            (Some(b), None) => Some(Self::Bool(b)),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ChatAttachment {
+    #[serde(skip)]
+    Image(image::DynamicImage),
+    #[serde(skip)]
+    Audio(AudioInput),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum InferenceOperation {
+    Chat {
+        messages: Vec<IndexMap<String, MessageContent>>,
+        attachments: Vec<ChatAttachment>,
+        thinking: Option<ThinkingMode>,
+        sampling_params: SamplingParams,
+        return_logprobs: bool,
+        constraint: Constraint,
+        tools: Option<Vec<Tool>>,
+        tool_choice: Option<ToolChoice>,
+        #[serde(skip)]
+        logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
+        return_raw_logits: bool,
+        web_search_options: Option<WebSearchOptions>,
+    },
+    Completion {
+        text: String,
+        echo_prompt: bool,
+        best_of: Option<usize>,
+        sampling_params: SamplingParams,
+        return_logprobs: bool,
+        constraint: Constraint,
+        suffix: Option<String>,
+        tools: Option<Vec<Tool>>,
+        tool_choice: Option<ToolChoice>,
+        #[serde(skip)]
+        logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
+        return_raw_logits: bool,
+    },
+    CompletionTokens {
+        tokens: Vec<u32>,
+        sampling_params: SamplingParams,
+        return_logprobs: bool,
+        constraint: Constraint,
+        suffix: Option<String>,
+        tools: Option<Vec<Tool>>,
+        tool_choice: Option<ToolChoice>,
+        #[serde(skip)]
+        logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
+        return_raw_logits: bool,
+    },
+    ImageGeneration {
+        prompt: String,
+        format: ImageGenerationResponseFormat,
+        generation_params: DiffusionGenerationParams,
+    },
+    SpeechGeneration {
+        prompt: String,
+    },
+    Embedding {
+        prompt: String,
+    },
+    EmbeddingTokens {
+        prompt: Vec<u32>,
+    },
+    Rerank {
+        query: String,
+        documents: Vec<String>,
+        truncate: bool,
+    },
+}
+
+impl InferenceOperation {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Chat { .. } => "chat",
+            Self::Completion { .. } => "completion",
+            Self::CompletionTokens { .. } => "completion_tokens",
+            Self::ImageGeneration { .. } => "image_generation",
+            Self::SpeechGeneration { .. } => "speech_generation",
+            Self::Embedding { .. } => "embedding",
+            Self::EmbeddingTokens { .. } => "embedding_tokens",
+            Self::Rerank { .. } => "rerank",
+        }
+    }
+}
+
+/// Input for pipeline continuation requests (already tokenized).
+///
+/// For pipeline parallelism, position tracking is critical:
+/// - `sequence_position`: Absolute position where this chunk starts (for RoPE)
+/// - `initial_seq_len`: Total prompt tokens (for prefill/decode boundary)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PipelineContinueInput {
+    pub tokens: Vec<u32>,
+    pub sampling_params: SamplingParams,
+    /// Initial sequence length (total prompt tokens).
+    /// Prefill/decode boundary: kv_len >= this value.
+    pub initial_seq_len: usize,
+    /// Absolute position where this chunk starts (for RoPE encoding).
+    /// During prefill: position of first token in this chunk.
+    /// During decode: total tokens processed so far.
+    pub sequence_position: usize,
+}
+
+/// Input for tokenization requests.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TokenizeInput {
+    pub text: Either<Vec<IndexMap<String, MessageContent>>, String>,
+    pub tools: Option<Vec<Tool>>,
+    pub add_generation_prompt: bool,
+    pub add_special_tokens: bool,
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Input for detokenization requests.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DetokenizeInput {
+    pub tokens: Vec<u32>,
+    pub skip_special_tokens: bool,
+}
+
+// =============================================================================
+// Type aliases for concrete request types
+// =============================================================================
+
+/// Normal inference request (HTTP API → model inference → Response)
+pub type NormalRequest = InferenceRequest<InferenceInput, Response>;
+
+/// Pipeline continuation request (already tokenized → model inference → Response)
+pub type PipelineRequest = InferenceRequest<PipelineContinueInput, Response>;
+
+/// Tokenization request (text/messages → token IDs)
+pub type TokenizeRequest = InferenceRequest<TokenizeInput, anyhow::Result<Vec<u32>>>;
+
+/// Detokenization request (token IDs → text)
+pub type DetokenizeRequest = InferenceRequest<DetokenizeInput, anyhow::Result<String>>;
+
+// Backwards compatibility aliases
+pub type TokenizationRequest = TokenizeRequest;
+pub type DetokenizationRequest = DetokenizeRequest;
+pub type PipelineContinueRequest = PipelineRequest;
+
+pub type LlguidanceGrammar = llguidance::api::TopLevelGrammar;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 /// Control the constraint with llguidance.
 pub enum Constraint {
     Regex(String),
@@ -60,56 +273,6 @@ impl ReasoningEffort {
             Self::High => "high",
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-/// Message or messages for a [`Request`].
-pub enum RequestMessage {
-    Chat {
-        messages: Vec<IndexMap<String, MessageContent>>,
-        enable_thinking: Option<bool>,
-        /// Reasoning effort level for Harmony-format models
-        reasoning_effort: Option<ReasoningEffort>,
-    },
-    Completion {
-        text: String,
-        echo_prompt: bool,
-        best_of: Option<usize>,
-    },
-    CompletionTokens(Vec<u32>),
-    VisionChat {
-        #[serde(skip)] // TODO
-        images: Vec<image::DynamicImage>,
-        #[serde(skip)] // TODO
-        audios: Vec<AudioInput>,
-        messages: Vec<IndexMap<String, MessageContent>>,
-        enable_thinking: Option<bool>,
-        /// Reasoning effort level for Harmony-format models
-        reasoning_effort: Option<ReasoningEffort>,
-    },
-    ImageGeneration {
-        prompt: String,
-        format: ImageGenerationResponseFormat,
-        generation_params: DiffusionGenerationParams,
-    },
-    SpeechGeneration {
-        prompt: String,
-    },
-    Embedding {
-        prompt: String,
-    },
-    EmbeddingTokens {
-        prompt: Vec<u32>,
-    },
-    /// Cross-encoder reranking request
-    Rerank {
-        /// Query to rank documents against
-        query: String,
-        /// Documents to rerank
-        documents: Vec<String>,
-        /// Whether to truncate if input exceeds max length
-        truncate: bool,
-    },
 }
 
 fn default_responder<T>() -> Sender<T> {
@@ -163,141 +326,26 @@ pub struct WebSearchOptions {
     pub extract_description: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-/// A normal request request to the `MistralRs`.
-/// - `messages`: Messages for the request
-/// - `sampling_params`: Sampling parameters for generation
-/// - `response`: Object to send the result through
-/// - `return_logprobs`: Whether to return logprobs
-/// - `is_streaming`: Control whether the request is streaming, if so chunk responses will be sent
-/// - `id`: Request ID
-/// - `constraint`: Constraint to use during generation
-/// - `suffix`: Suffix to add
-/// - `tools`: Tools available in this request
-/// - `tool_choice`: Choice of tools
-/// - `logits_processors`: Custom logits processors. Order of application:
-///     1) Apply penalties from `sampling_params`
-///     2) Apply these custom logits processors sequentially
-///     3) Apply temperature and softmax
-///     4) Sample the next token (topk, topp, minp, etc)
-/// - `return_raw_logits`: Return raw logits.
-/// - `truncate_sequence`: Whether to truncate the prompt if it exceeds the model's maximum context length.
-pub struct NormalRequest {
-    pub messages: RequestMessage,
-    pub sampling_params: SamplingParams,
-    #[serde(default = "default_responder")]
-    #[serde(skip)]
-    pub response: Sender<Response>,
-    pub return_logprobs: bool,
-    pub is_streaming: bool,
-    pub id: uuid::Uuid,
-    pub constraint: Constraint,
-    pub suffix: Option<String>,
-    pub tools: Option<Vec<Tool>>,
-    pub tool_choice: Option<ToolChoice>,
-    #[serde(skip)]
-    pub logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
-    pub return_raw_logits: bool,
-    pub web_search_options: Option<WebSearchOptions>,
-    pub model_id: Option<String>,
-    #[serde(default)]
-    pub truncate_sequence: bool,
-    /// Pipeline parallelism op_id for KV cache preservation.
-    /// If Some, this request is part of a pipeline continuation and the cache
-    /// should NOT be reset if this op_id has already done its first forward.
-    #[serde(skip)]
-    pub pipeline_continue_op_id: Option<uuid::Uuid>,
-}
-
-impl NormalRequest {
-    pub fn new_simple(
-        messages: RequestMessage,
-        sampling_params: SamplingParams,
-        response: Sender<Response>,
-        id: uuid::Uuid,
-        tools: Option<Vec<Tool>>,
-        tool_choice: Option<ToolChoice>,
-    ) -> Self {
-        Self {
-            messages,
-            sampling_params,
-            response,
-            id,
-            tools,
-            tool_choice,
-            return_logprobs: false,
-            is_streaming: false,
-            constraint: Constraint::None,
-            suffix: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: None,
-            model_id: None,
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
-        }
-    }
-}
 
 #[derive(Clone, Serialize, Deserialize)]
-/// Request to tokenize some messages or some text.
-/// - `add_generation_prompt` is only applicable if chat messages are provided and not a raw string.
-pub struct TokenizationRequest {
-    pub text: Either<Vec<IndexMap<String, MessageContent>>, String>,
-    pub tools: Option<Vec<Tool>>,
-    pub add_generation_prompt: bool,
-    pub add_special_tokens: bool,
-    pub enable_thinking: Option<bool>,
-    pub reasoning_effort: Option<ReasoningEffort>,
-    #[serde(default = "default_responder")]
-    #[serde(skip)]
-    pub response: Sender<anyhow::Result<Vec<u32>>>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-/// Request to detokenize some text.
-pub struct DetokenizationRequest {
-    pub tokens: Vec<u32>,
-    pub skip_special_tokens: bool,
-    #[serde(default = "default_responder")]
-    #[serde(skip)]
-    pub response: Sender<anyhow::Result<String>>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-/// Request for pipeline continuation on non-first stages.
-///
-/// When a non-first pipeline stage receives activations from the previous stage,
-/// it sends this request to trigger forward() on the model. The distributed hook
-/// will intercept at layer 0 and inject the received activations.
-pub struct PipelineContinueRequest {
-    /// Operation ID for correlation with the activation.
-    pub op_id: uuid::Uuid,
-    /// Channel for response (logits from this stage).
-    #[serde(default = "default_responder")]
-    #[serde(skip)]
-    pub response: Sender<Response>,
-    /// Model ID to target.
-    pub model_id: Option<String>,
-    /// Sequence length from the received activation.
-    /// Used to create the correct number of dummy tokens for attention mask.
-    pub seq_len: usize,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-/// A request to the Engine, encapsulating the various parameters as well as
-/// the `mpsc` response `Sender` used to return the [`Response`].
+/// Discriminated union of all request types to the Engine.
+/// Each variant wraps an InferenceRequest<I, R> with appropriate input/output types.
 pub enum Request {
+    /// Normal inference request (HTTP API)
     Normal(Box<NormalRequest>),
+    /// Re-quantize model
     ReIsq(IsqType),
-    Tokenize(TokenizationRequest),
-    Detokenize(DetokenizationRequest),
-    /// Pipeline continuation request for non-first stages.
-    /// Triggers forward() so the distributed hook can inject received activations.
-    PipelineContinue(PipelineContinueRequest),
-    // Sending a terminate request causes the `run` function to return to the thread created in `MistralRs::new`,
-    // and then Engine will be dropped.
+    /// Tokenization request
+    Tokenize(TokenizeRequest),
+    /// Detokenization request
+    Detokenize(DetokenizeRequest),
+    /// Pipeline continuation (distributed inference)
+    PipelineContinue(PipelineRequest),
+    /// Cleanup a pipeline request (called when stream closes)
+    PipelineCleanup { request_id: uuid::Uuid },
+    /// Terminate the engine
     Terminate,
+    /// Terminate all sequences on next step
     TerminateAllSeqsNextStep,
 }
 
@@ -305,29 +353,28 @@ impl Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Request::Normal(boxed_req) => {
-                let NormalRequest {
-                    messages,
-                    sampling_params,
-                    is_streaming,
-                    id,
-                    ..
-                } = &**boxed_req;
+                let id = &boxed_req.id;
+                let op_kind = boxed_req.input.op.kind_str();
+                let is_streaming = boxed_req.input.exec.is_streaming;
                 write!(
                     f,
-                    "Request {id} {{ messages: `{messages:?}`, sampling_params: {sampling_params:?}, is_streaming: {is_streaming}}}",
+                    "Request {id} {{ op: `{op_kind}`, is_streaming: {is_streaming}}}",
                 )
             }
             Request::ReIsq(tp) => {
                 write!(f, "Re ISQ Request {tp:?}",)
             }
             Request::Tokenize(req) => {
-                write!(f, "Tokenization Request {:?}", req.text)
+                write!(f, "Tokenization Request {:?}", req.input.text)
             }
             Request::Detokenize(req) => {
-                write!(f, "Tokenization Request {:?}", req.tokens)
+                write!(f, "Detokenization Request {:?}", req.input.tokens)
             }
             Request::PipelineContinue(req) => {
-                write!(f, "Pipeline Continue Request op_id={}", req.op_id)
+                write!(f, "Pipeline Continue Request id={}", req.id)
+            }
+            Request::PipelineCleanup { request_id } => {
+                write!(f, "Pipeline Cleanup Request id={}", request_id)
             }
             Request::Terminate => write!(f, "Termination Request"),
             Request::TerminateAllSeqsNextStep => write!(f, "Terminate All Seqs Next Step"),
