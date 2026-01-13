@@ -17,7 +17,6 @@ use crate::{
         },
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
     },
-    request::ReasoningEffort,
     sequence::Sequence,
     vision_models::ModelInputs,
     MessageContent, Pipeline, Tool,
@@ -65,16 +64,14 @@ impl Processor for Idefics2Processor {
         messages: Vec<IndexMap<String, MessageContent>>,
         add_generation_prompt: bool,
         add_special_tokens: bool,
-        enable_thinking: Option<bool>,
-        reasoning_effort: Option<ReasoningEffort>,
+        thinking: Option<crate::request::ThinkingMode>,
         tools: Vec<Tool>,
     ) -> anyhow::Result<(Vec<u32>, String)> {
         let mut prompt = apply_chat_template(
             pipeline,
             messages,
             add_generation_prompt,
-            enable_thinking,
-            reasoning_effort,
+            thinking,
             self.template_action(),
             tools,
         )?;
