@@ -37,6 +37,19 @@ pub struct LayerActivation<'a> {
     pub layer_idx: usize,
     /// Total number of layers in the model.
     pub total_layers: usize,
+    /// Token sequence for this forward pass.
+    ///
+    /// For pipeline parallelism: hooks can extract tokens and propagate them
+    /// with activations to enable sparse KV cache reconstruction on remote workers.
+    ///
+    /// During prefill: contains tokens for the current chunk being processed
+    /// During decode: contains the current token only (due to model forward() API)
+    pub tokens: &'a [u32],
+    /// Request ID (UUID7) for correlation across pipeline stages.
+    ///
+    /// Generated once per request via `MistralRs::next_request_id()`.
+    /// Enables distributed tracing and activation correlation in pipeline parallelism.
+    pub request_id: uuid::Uuid,
 }
 
 /// Hook for intercepting layer activations during forward pass.
@@ -138,18 +151,91 @@ pub trait PipelineHook: Send + Sync {
             "receive_response_logits not supported by this hook".to_string(),
         ))
     }
-}
 
-/// A no-op hook that does nothing (for when hooks are disabled).
-pub struct NoOpHook;
+    /// Set pending tokens for sparse KV cache propagation (pipeline parallelism).
+    ///
+    /// Called before the forward pass begins when this is a pipeline continuation
+    /// request. Allows hooks to store the token sequence for later extraction
+    /// and propagation with activations.
+    ///
+    /// Default implementation does nothing. Override in distributed hooks that
+    /// need to propagate tokens for sparse KV cache reconstruction.
+    fn set_pending_tokens(&self, _tokens: Vec<u32>) {
+        // Default: no-op
+    }
 
-impl PipelineHook for NoOpHook {
-    fn on_layer_output(
+    /// Set request context for the current forward pass.
+    ///
+    /// This MUST be called before forward() begins to establish the request context
+    /// for activation sending/receiving. Hooks use this stored context instead of
+    /// threading request_id through model forward signatures.
+    ///
+    /// # Parameters
+    /// * `request_id` - The request UUID (UUID7) for correlation
+    fn set_request_context(&self, _request_id: uuid::Uuid) {
+        // Default: no-op
+    }
+
+    /// Send init RPC for pipeline parallelism (called once per request).
+    ///
+    /// This method MUST be called exactly once per request BEFORE the first
+    /// `send_activation()` call. It informs all downstream pipeline stages about
+    /// the total prompt length, enabling them to correctly detect prefill vs decode
+    /// boundaries during chunked processing.
+    ///
+    /// # Separation of Concerns
+    /// - `init_pipeline_request()`: One-time metadata setup (total_prompt_tokens)
+    /// - `send_activation()`: Per-chunk/per-token data streaming
+    ///
+    /// Default implementation does nothing. Override in distributed hooks that
+    /// support pipeline parallelism.
+    ///
+    /// # Parameters
+    /// * `request_id` - The request UUID (UUID7) for correlation
+    /// * `total_prompt_tokens` - Total tokens in the complete prompt (not per-chunk)
+    fn init_pipeline_request(&self, _request_id: uuid::Uuid, _total_prompt_tokens: usize) {
+        // Default: no-op
+    }
+
+    /// Send activation to next pipeline stage (called by pipeline after forward).
+    ///
+    /// This is called by the pipeline orchestration layer after forward() completes
+    /// on stages that are not the last stage. Should be no-op on last stage.
+    ///
+    /// # Important
+    /// Before calling this for the first time, you MUST call `init_pipeline_request()`
+    /// to send initialization metadata. This method only sends per-chunk/per-token data.
+    ///
+    /// Default implementation does nothing. Override in distributed hooks that
+    /// need to send activations to the next stage.
+    ///
+    /// # Parameters
+    /// * `hidden` - The activation tensor to send
+    /// * `tokens` - Token sequence for this forward pass
+    /// * `request_id` - Request UUID for correlation
+    /// * `sequence_position` - RoPE position offset for this chunk (from seqlen_offsets)
+    fn send_activation(
         &self,
-        _layer_idx: usize,
-        _activation: &LayerActivation,
-    ) -> Result<Option<Tensor>> {
-        Ok(None)
+        _hidden: &Tensor,
+        _tokens: &[u32],
+        _request_id: uuid::Uuid,
+        _sequence_position: usize,
+    ) -> Result<()> {
+        // Default: no-op
+        Ok(())
+    }
+
+    /// Receive activation from previous pipeline stage (called by pipeline before forward).
+    ///
+    /// This is called by the pipeline orchestration layer before forward() begins
+    /// on stages that are not the first stage. Should error on first stage.
+    ///
+    /// Default implementation returns an error. Override in distributed hooks that
+    /// need to receive activations from the previous stage.
+    fn receive_activation(&self) -> Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "receive_activation not supported by this hook".to_string(),
+        ))
     }
 }
 
@@ -178,6 +264,11 @@ impl HookContainer {
         self.hook.is_some()
     }
 
+    /// Get a reference to the contained hook, if any.
+    pub fn get(&self) -> Option<&Arc<dyn PipelineHook>> {
+        self.hook.as_ref()
+    }
+
     /// Call the hook's on_layer_output if present.
     ///
     /// Returns the original activation if no hook or hook returns None.
@@ -186,6 +277,8 @@ impl HookContainer {
         layer_idx: usize,
         hidden_states: &Tensor,
         total_layers: usize,
+        tokens: &[u32],
+        request_id: uuid::Uuid,
     ) -> Result<Option<Tensor>> {
         match &self.hook {
             Some(hook) if hook.layer_range().contains(&layer_idx) => {
@@ -193,6 +286,8 @@ impl HookContainer {
                     hidden_states,
                     layer_idx,
                     total_layers,
+                    tokens,
+                    request_id,
                 };
                 hook.on_layer_output(layer_idx, &activation)
             }
@@ -206,6 +301,8 @@ impl HookContainer {
         layer_idx: usize,
         hidden_states: &Tensor,
         total_layers: usize,
+        tokens: &[u32],
+        request_id: uuid::Uuid,
     ) -> Result<Option<Tensor>> {
         match &self.hook {
             Some(hook) if hook.layer_range().contains(&layer_idx) => {
@@ -213,10 +310,22 @@ impl HookContainer {
                     hidden_states,
                     layer_idx,
                     total_layers,
+                    tokens,
+                    request_id,
                 };
                 hook.on_layer_input(layer_idx, &activation)
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Call the hook's init_pipeline_request if present.
+    ///
+    /// This should be called once per request on the first prefill chunk
+    /// to initialize pipeline parallelism metadata.
+    pub fn call_init_pipeline_request(&self, request_id: uuid::Uuid, total_prompt_tokens: usize) {
+        if let Some(hook) = &self.hook {
+            hook.init_pipeline_request(request_id, total_prompt_tokens);
         }
     }
 
@@ -238,6 +347,85 @@ impl HookContainer {
             )),
             None => Err(candle_core::Error::Msg("No hook configured".to_string())),
         }
+    }
+
+    /// Get the layer range this hook handles.
+    ///
+    /// Used by pipeline to determine which layer indices to pass to hook calls.
+    /// Returns None if no hook is configured.
+    pub fn layer_range(&self) -> Option<std::ops::Range<usize>> {
+        self.hook.as_ref().map(|h| h.layer_range())
+    }
+
+    // === Stage-level operations (preferred API for pipeline parallelism) ===
+
+    /// Set request context for the current forward pass.
+    ///
+    /// MUST be called before forward() to establish context for activation
+    /// sending/receiving. Hooks use stored context instead of threading
+    /// request_id through model forward signatures.
+    pub fn set_request_context(&self, request_id: uuid::Uuid) {
+        if let Some(hook) = &self.hook {
+            hook.set_request_context(request_id);
+        }
+    }
+
+    /// Receive activation from previous pipeline stage (STAGE-LEVEL).
+    ///
+    /// Called BEFORE forward_pass() on non-first stages.
+    /// Blocks until activation arrives from the transport layer.
+    ///
+    /// Returns None if no hook configured or this is the first stage.
+    pub fn receive_stage_input(&self) -> Result<Option<Tensor>> {
+        match &self.hook {
+            Some(hook) => {
+                // If layer_range starts at 0, this is first stage - no input to receive
+                if hook.layer_range().start == 0 {
+                    return Ok(None);
+                }
+                Ok(Some(hook.receive_activation()?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Send activation to next pipeline stage (STAGE-LEVEL).
+    ///
+    /// Called AFTER forward_pass() on non-last stages.
+    /// Does nothing if no hook configured or this is the last stage.
+    ///
+    /// # Parameters
+    /// * `hidden` - The activation tensor to send
+    /// * `tokens` - Token sequence for this forward pass
+    /// * `request_id` - Request UUID for correlation
+    /// * `sequence_position` - RoPE position offset for this chunk (from seqlen_offsets[0])
+    pub fn send_stage_output(
+        &self,
+        hidden: &Tensor,
+        tokens: &[u32],
+        request_id: uuid::Uuid,
+        sequence_position: usize,
+    ) -> Result<()> {
+        if let Some(hook) = &self.hook {
+            hook.send_activation(hidden, tokens, request_id, sequence_position)?;
+        }
+        Ok(())
+    }
+
+    /// Check if this is the first pipeline stage (layer_range starts at 0).
+    pub fn is_first_stage(&self) -> bool {
+        self.hook
+            .as_ref()
+            .map(|h| h.layer_range().start == 0)
+            .unwrap_or(true)
+    }
+
+    /// Check if this is the last pipeline stage.
+    ///
+    /// Determined by whether the hook needs external logits - first stage (but not last)
+    /// needs external logits from the last stage.
+    pub fn is_last_stage(&self) -> bool {
+        !self.needs_external_logits()
     }
 }
 
@@ -282,7 +470,9 @@ mod tests {
         assert!(!container.is_some());
 
         let tensor = Tensor::zeros((1, 4, 8), candle_core::DType::F32, &Device::Cpu).unwrap();
-        let result = container.call_layer_output(0, &tensor, 32).unwrap();
+        let tokens = vec![];
+        let request_id = uuid::Uuid::now_v7();
+        let result = container.call_layer_output(0, &tensor, 32, &tokens, request_id).unwrap();
         assert!(result.is_none());
     }
 
@@ -295,11 +485,13 @@ mod tests {
         assert!(container.is_some());
 
         let tensor = Tensor::zeros((1, 4, 8), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let tokens = vec![];
+        let request_id = uuid::Uuid::now_v7();
 
         // Call hook 3 times
-        container.call_layer_output(0, &tensor, 32).unwrap();
-        container.call_layer_output(1, &tensor, 32).unwrap();
-        container.call_layer_output(2, &tensor, 32).unwrap();
+        container.call_layer_output(0, &tensor, 32, &tokens, request_id).unwrap();
+        container.call_layer_output(1, &tensor, 32, &tokens, request_id).unwrap();
+        container.call_layer_output(2, &tensor, 32, &tokens, request_id).unwrap();
 
         assert_eq!(hook.count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
@@ -331,10 +523,12 @@ mod tests {
         let container = HookContainer::new(hook.clone());
 
         let tensor = Tensor::zeros((1, 4, 8), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let tokens = vec![];
+        let request_id = uuid::Uuid::now_v7();
 
         // Call for layers 0-14
         for i in 0..15 {
-            container.call_layer_output(i, &tensor, 32).unwrap();
+            container.call_layer_output(i, &tensor, 32, &tokens, request_id).unwrap();
         }
 
         // Only layers 5-9 should have triggered (5 calls)
