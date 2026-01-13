@@ -343,9 +343,12 @@ impl LayerWeights {
             let k = k
                 .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
                 .transpose(1, 2)?;
+            // NOTE: Metal SDPA requires contiguous tensors after transpose
+            // See candle fix: https://github.com/huggingface/candle/commit/57f41da1
             let v = v
                 .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
+                .transpose(1, 2)?
+                .contiguous()?;
             (q, k, v)
         } else {
             let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
@@ -741,6 +744,12 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
+        // Generate request ID for correlation across pipeline stages
+        let request_id = uuid::Uuid::now_v7();
+
+        // Extract tokens for pipeline parallelism hooks
+        let tokens_vec: Vec<u32> = x.flatten_all()?.to_vec1()?;
+
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;
 
@@ -770,11 +779,7 @@ impl ModelWeights {
             }
 
             // Pre-layer hook: can inject activations from previous pipeline stage
-            if let Some(ref hook) = self.hook {
-                if let Some(injected) = hook.call_layer_input(global_layer_idx, &layer_in, self.total_layers)? {
-                    layer_in = injected;
-                }
-            }
+            crate::pp_hook_layer_input!(self, layer_in, global_layer_idx, tokens_vec, request_id);
 
             let x = layer.attention_norm.forward(&layer_in)?;
             let attn = layer.forward_attn(
@@ -798,11 +803,7 @@ impl ModelWeights {
             layer_in = (x + residual)?;
 
             // Post-layer hook: can capture/replace activations for next pipeline stage
-            if let Some(ref hook) = self.hook {
-                if let Some(replacement) = hook.call_layer_output(global_layer_idx, &layer_in, self.total_layers)? {
-                    layer_in = replacement;
-                }
-            }
+            crate::pp_hook_layer_output!(self, layer_in, global_layer_idx, tokens_vec, request_id);
         }
 
         let layer_in = layer_in.to_device(&self.device)?;

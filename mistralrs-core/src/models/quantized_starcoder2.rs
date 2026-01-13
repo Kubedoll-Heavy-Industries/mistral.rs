@@ -405,6 +405,12 @@ impl ModelWeights {
         seqlen_offsets: &[usize],
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
+        // Generate request ID for correlation across pipeline stages
+        let request_id = uuid::Uuid::now_v7();
+
+        // Extract tokens for pipeline parallelism hooks
+        let tokens_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+
         let (_b_sz, seq_len) = input_ids.dims2()?;
         let mut xs = self.tok_embeddings.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;
@@ -433,13 +439,7 @@ impl ModelWeights {
             }
 
             // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(injected) =
-                    hook.call_layer_input(global_layer_idx, &xs, self.total_layers)?
-                {
-                    xs = injected;
-                }
-            }
+            crate::pp_hook_layer_input!(self, xs, global_layer_idx, tokens_vec, request_id);
 
             let residual = &xs;
             let ys = xs.apply(&layer.attn_norm)?;
@@ -461,13 +461,7 @@ impl ModelWeights {
             xs = (ys + residual)?;
 
             // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(replacement) =
-                    hook.call_layer_output(global_layer_idx, &xs, self.total_layers)?
-                {
-                    xs = replacement;
-                }
-            }
+            crate::pp_hook_layer_output!(self, xs, global_layer_idx, tokens_vec, request_id);
         }
         let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;
         MatMul.qmatmul(&xs, &self.output)

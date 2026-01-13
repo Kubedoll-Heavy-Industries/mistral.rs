@@ -484,6 +484,12 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
+        // Generate request ID for correlation across pipeline stages
+        let request_id = uuid::Uuid::now_v7();
+
+        // Extract tokens for pipeline parallelism hooks
+        let tokens_vec: Vec<u32> = x.flatten_all()?.to_vec1()?;
+
         // For pipeline parallelism: non-first stages don't use tok_embeddings.
         // Instead, the hook will inject the activation at the first local layer.
         // Create a placeholder that will be replaced by the hook.
@@ -522,13 +528,7 @@ impl ModelWeights {
             }
 
             // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(injected) =
-                    hook.call_layer_input(global_layer_idx, &layer_in, self.total_layers)?
-                {
-                    layer_in = injected;
-                }
-            }
+            crate::pp_hook_layer_input!(self, layer_in, global_layer_idx, tokens_vec, request_id);
 
             let x = layer_in;
             let residual = &x;
@@ -553,13 +553,7 @@ impl ModelWeights {
             layer_in = (x + residual)?;
 
             // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(replacement) =
-                    hook.call_layer_output(global_layer_idx, &layer_in, self.total_layers)?
-                {
-                    layer_in = replacement;
-                }
-            }
+            crate::pp_hook_layer_output!(self, layer_in, global_layer_idx, tokens_vec, request_id);
         }
 
         // Last stage (or no PP): run final norm and lm_head

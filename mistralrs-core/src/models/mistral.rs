@@ -601,6 +601,12 @@ impl Model {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
+        // Generate request ID for correlation across pipeline stages
+        let request_id = uuid::Uuid::now_v7();
+
+        // Extract tokens for pipeline parallelism hooks
+        let tokens_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+
         let mut xs = input_embeds;
         let cache = &mut self.cache.normal().0;
         let attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
@@ -626,11 +632,7 @@ impl Model {
             xs = self.mapper.map(xs, global_layer_idx)?;
 
             // Pre-layer hook: can inject activations from previous pipeline stage
-            if let Some(ref hook) = self.hook {
-                if let Some(injected) = hook.call_layer_input(global_layer_idx, &xs, self.total_layers)? {
-                    xs = injected;
-                }
-            }
+            crate::pp_hook_layer_input!(self, xs, global_layer_idx, tokens_vec, request_id);
 
             xs = layer.forward(
                 &xs,
@@ -647,11 +649,7 @@ impl Model {
             )?;
 
             // Post-layer hook: can capture/replace activations for next pipeline stage
-            if let Some(ref hook) = self.hook {
-                if let Some(replacement) = hook.call_layer_output(global_layer_idx, &xs, self.total_layers)? {
-                    xs = replacement;
-                }
-            }
+            crate::pp_hook_layer_output!(self, xs, global_layer_idx, tokens_vec, request_id);
         }
 
         let xs = xs.to_device(&self.device)?;

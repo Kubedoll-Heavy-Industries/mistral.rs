@@ -491,17 +491,16 @@ impl Llama {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_embeds(
+    /// Run transformer layers on input activations (embeddings or received from previous stage).
+    /// Returns hidden states WITHOUT applying lm_head (for pipeline parallelism).
+    pub fn forward_layers(
         &self,
         input_ids: &Tensor,
-        input_embeds: Tensor,
+        mut x: Tensor,
         seqlen_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        let mut x = input_embeds;
         let cache = &mut self.kv_cache.normal().0;
         let mask = CausalMasker.make_causal_mask_matrix(
             input_ids,
@@ -532,6 +531,16 @@ impl Llama {
                 flash_params,
             )?;
         }
+        Ok(x)
+    }
+
+    /// Apply final layer norm and lm_head projection.
+    /// Used by last pipeline stage to convert hidden states to logits.
+    pub fn apply_lm_head(
+        &self,
+        x: Tensor,
+        context_lens: Vec<(usize, usize)>,
+    ) -> Result<Tensor> {
         let x = x.to_device(&self.device)?;
         let mut x = self.ln_f.forward(&x)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
@@ -539,6 +548,21 @@ impl Llama {
         }
         let xs = MatMul.qmethod_matmul(&x, &*self.lm_head)?;
         extract_logits(&xs, context_lens)
+    }
+
+    /// Full forward pass: embeddings → layers → lm_head.
+    /// For single-stage (non-distributed) inference.
+    pub fn forward_embeds(
+        &self,
+        input_ids: &Tensor,
+        input_embeds: Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> Result<Tensor> {
+        let x = self.forward_layers(input_ids, input_embeds, seqlen_offsets, metadata, flash_params)?;
+        self.apply_lm_head(x, context_lens)
     }
 
     pub fn residual_tensors_m(&self, uvb_m: UnVarBuilder) -> Vec<(String, Tensor)> {
@@ -654,6 +678,27 @@ impl NormalModel for Llama {
     }
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
+    }
+
+    // === Building blocks for pipeline parallelism ===
+
+    fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.get_input_embeddings(input_ids)
+    }
+
+    fn forward_layers(
+        &self,
+        input_ids: &Tensor,
+        x: Tensor,
+        seqlen_offsets: &[usize],
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> Result<Tensor> {
+        self.forward_layers(input_ids, x, seqlen_offsets, metadata, flash_params)
+    }
+
+    fn apply_lm_head(&self, x: Tensor, context_lens: Vec<(usize, usize)>) -> Result<Tensor> {
+        self.apply_lm_head(x, context_lens)
     }
 }
 

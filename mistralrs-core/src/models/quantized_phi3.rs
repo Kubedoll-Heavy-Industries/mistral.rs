@@ -149,7 +149,7 @@ impl LayerWeights {
 }
 
 pub struct ModelWeights {
-    tok_embeddings: Embedding,
+    pub tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
     output_norm: RmsNorm,
     output: QMatMul,
@@ -408,15 +408,25 @@ impl ModelWeights {
         self.hook.as_ref()
     }
 
-    pub fn forward(
+    /// Get input embeddings from token IDs (first stage only).
+    /// Consumes: token IDs [batch, seq_len]
+    /// Produces: embeddings [batch, seq_len, hidden_dim]
+    pub fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(input_ids)
+    }
+
+    /// Run transformer layers on activations.
+    /// Consumes: activations [batch, seq_len, hidden_dim], tokens
+    /// Produces: activations [batch, seq_len, hidden_dim]
+    pub fn forward_layers(
         &self,
         input_ids: &Tensor,
+        mut xs: Tensor,
+        _input_ids_full: Option<&Tensor>,
         seqlen_offsets: &[usize],
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        _request_id: uuid::Uuid,
     ) -> Result<Tensor> {
-        let (_b_sz, seq_len) = input_ids.dims2()?;
-        // PP: Get embedding for first stage, or placeholder for non-first stages
-        let mut xs = crate::pp_get_layer_input!(self, input_ids, DType::F32);
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
             input_ids,
@@ -435,21 +445,9 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use global layer index for hooks
-            let global_layer_idx = self.layer_start + i;
-
             // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
                 xs = mapper.map(xs, i)?;
-            }
-
-            // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(injected) =
-                    hook.call_layer_input(global_layer_idx, &xs, self.total_layers)?
-                {
-                    xs = injected;
-                }
             }
 
             let residual = &xs;
@@ -470,19 +468,147 @@ impl ModelWeights {
             let ys = ys.apply(&layer.ffn_norm)?;
             let ys = layer.mlp.forward(&ys)?;
             xs = (ys + residual)?;
-
-            // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(replacement) =
-                    hook.call_layer_output(global_layer_idx, &xs, self.total_layers)?
-                {
-                    xs = replacement;
-                }
-            }
         }
 
-        // Last stage (or no PP): run final norm and lm_head
+        Ok(xs)
+    }
+
+    /// Apply lm_head to convert hidden states to logits (last stage only).
+    /// Consumes: activations [batch, seq_len, hidden_dim]
+    /// Produces: logits [batch, vocab_size]
+    pub fn apply_lm_head(&self, xs: Tensor) -> Result<Tensor> {
+        let (_b_sz, seq_len, _) = xs.dims3()?;
         let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;
         MatMul.qmatmul(&xs, &self.output)
+    }
+
+    /// Monolithic forward pass (consumes tokens, produces logits).
+    ///
+    /// # Parameters
+    /// * `input_ids` - Token IDs tensor
+    /// * `input_activation` - Activation from previous pipeline stage (None for first stage)
+    /// * `input_ids_full` - Full input IDs for context
+    /// * `seqlen_offsets` - Sequence position offsets for RoPE
+    /// * `metadata` - PagedAttention metadata if enabled
+    /// * `request_id` - UUID for distributed tracing
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        input_activation: Option<&Tensor>,
+        input_ids_full: Option<&Tensor>,
+        seqlen_offsets: &[usize],
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        request_id: uuid::Uuid,
+    ) -> Result<Tensor> {
+        // Use provided activation or compute embeddings
+        let xs = match input_activation {
+            Some(act) => act.clone(),
+            None => self.tok_embeddings.forward(input_ids)?,
+        };
+
+        // Run layers
+        let xs = self.forward_layers(
+            input_ids,
+            xs,
+            input_ids_full,
+            seqlen_offsets,
+            metadata,
+            request_id,
+        )?;
+
+        // Only apply lm_head on last stage (has output layer)
+        // Non-last stages return hidden states for pipeline parallelism
+        if self.is_last_stage() {
+            self.apply_lm_head(xs)
+        } else {
+            Ok(xs)
+        }
+    }
+}
+
+/// State needed for Phi3 forward passes.
+/// Contains position information and optional paged attention metadata.
+pub struct Phi3State {
+    /// Position offsets for RoPE (one per batch element)
+    pub seqlen_offsets: Vec<usize>,
+    /// Optional paged attention metadata (owned for simplicity)
+    pub paged_attn_meta: Option<(Vec<(Tensor, Tensor)>, PagedAttentionInputMetadata)>,
+}
+
+// Implement LanguageModel trait (Phase 2 of pipeline refactoring)
+impl crate::models::LanguageModel for ModelWeights {
+    type State = Phi3State;
+
+    fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(input_ids)
+    }
+
+    fn forward(&self, hidden: Tensor, input_ids: &Tensor, state: &Self::State) -> Result<Tensor> {
+        // Use the provided input_ids tensor (already has correct shape and metadata)
+        let mut xs = hidden;
+
+        // Convert owned paged_attn_meta to borrowed form
+        let metadata = state.paged_attn_meta.as_ref().map(|(kv, meta)| (kv.clone(), meta as &PagedAttentionInputMetadata));
+
+        let cache = &mut self.cache.normal().0;
+        let seqlen_offsets_slice = state.seqlen_offsets.as_slice();
+        let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
+            &input_ids,
+            metadata
+                .as_ref()
+                .map(|(_, _)| &seqlen_offsets_slice as &dyn PastKvLenCache)
+                .unwrap_or(cache as &dyn PastKvLenCache),
+            Some(self.max_seq_len),
+            self.dtype,
+            self.layers[0].n_head,
+        )?;
+        let mask = mask.filter(|_| {
+            metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Forward through transformer layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Device mapping for multi-device setups
+            if let Some(ref mapper) = self.mapper {
+                xs = mapper.map(xs, i)?;
+            }
+
+            // Transformer layer: attention + MLP with residual connections
+            let residual = &xs;
+            let ys = xs.apply(&layer.attn_norm)?;
+            let ys = layer.forward_attn(
+                &ys,
+                mask.as_ref()
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
+                &state.seqlen_offsets,
+                &mut cache[i],
+                metadata
+                    .as_ref()
+                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+            )?;
+            let ys = (ys + residual)?;
+            let residual = &ys;
+            let ys = ys.apply(&layer.ffn_norm)?;
+            let ys = layer.mlp.forward(&ys)?;
+            xs = (ys + residual)?;
+        }
+
+        Ok(xs)
+    }
+
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        self.apply_lm_head(hidden)
+    }
+
+    fn has_layer_0(&self) -> bool {
+        self.is_first_stage()
+    }
+
+    fn has_final_layer(&self) -> bool {
+        self.is_last_stage()
     }
 }
