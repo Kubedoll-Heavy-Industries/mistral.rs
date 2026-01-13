@@ -445,24 +445,30 @@ impl ModelWeights {
         self.hook.as_ref()
     }
 
+    /// Forward pass for pipeline parallelism.
+    ///
+    /// # Arguments
+    /// * `x` - Token IDs tensor
+    /// * `input_activation` - Activation from previous pipeline stage (None for first stage)
+    /// * `start_offsets` - Sequence position offsets for RoPE
+    /// * `context_lens` - Context lengths for logit extraction
+    /// * `metadata` - PagedAttention metadata if enabled
+    ///
+    /// # Returns
+    /// * For last stage: logits tensor after lm_head
+    /// * For non-last stages: hidden states tensor after transformer layers
     pub fn forward(
         &self,
         x: &Tensor,
+        input_activation: Option<&Tensor>,
         start_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        // For pipeline parallelism: non-first stages don't use tok_embeddings.
-        // Instead, the hook will inject the activation at the first local layer.
-        // Create a placeholder that will be replaced by the hook.
-        let mut layer_in = if self.is_first_stage() {
-            self.tok_embeddings.forward(x)?
-        } else {
-            // Placeholder tensor - will be replaced by hook at first local layer.
-            // Use F32 to match dequantized embedding output dtype (dequantize returns F32).
-            let (batch, seq_len) = x.dims2()?;
-            let embed_dim = self.tok_embeddings.embeddings().dim(1)?;
-            Tensor::zeros((batch, seq_len, embed_dim), DType::F32, &self.device)?
+        // Use provided activation or compute embeddings
+        let mut layer_in = match input_activation {
+            Some(act) => act.clone(),
+            None => self.tok_embeddings.forward(x)?,
         };
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_causal_mask_matrix(
@@ -481,20 +487,8 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use global layer index for hooks
-            let global_layer_idx = self.layer_start + i;
-
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
-            }
-
-            // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(injected) =
-                    hook.call_layer_input(global_layer_idx, &layer_in, self.total_layers)?
-                {
-                    layer_in = injected;
-                }
             }
 
             let x = layer_in;
@@ -518,23 +512,19 @@ impl ModelWeights {
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
             layer_in = (x + residual)?;
-
-            // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
-            if let Some(ref hook) = self.hook {
-                if let Some(replacement) =
-                    hook.call_layer_output(global_layer_idx, &layer_in, self.total_layers)?
-                {
-                    layer_in = replacement;
-                }
-            }
         }
 
-        // Last stage (or no PP): run final norm and lm_head
-        let x = self.norm.forward(&layer_in)?;
-        extract_logits(
-            &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,
-            context_lens,
-        )
+        // Only apply final norm + lm_head on last stage
+        if self.is_last_stage() {
+            let x = self.norm.forward(&layer_in)?;
+            extract_logits(
+                &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,
+                context_lens,
+            )
+        } else {
+            // Non-last stage: return hidden states for next stage
+            Ok(layer_in)
+        }
     }
 
     /// Forward pass for embeddings - returns hidden states before LM head.

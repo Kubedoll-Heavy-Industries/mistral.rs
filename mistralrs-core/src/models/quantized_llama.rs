@@ -215,8 +215,10 @@ impl LayerWeights {
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
-    norm: QRmsNorm,
-    output: Arc<dyn QuantMethod>,
+    /// Final norm layer (None for non-last pipeline stages)
+    norm: Option<QRmsNorm>,
+    /// Output/LM head layer (None for non-last pipeline stages)
+    output: Option<Arc<dyn QuantMethod>>,
     pub device: Device,
     pub cache: EitherCache,
     pub max_seq_len: usize,
@@ -316,11 +318,11 @@ impl ModelConfig::FromGGML for ModelWeights {
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, ct.hparams.n_embd as usize),
             layers,
-            norm,
-            output: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+            norm: Some(norm), // GGML doesn't support PP, always has norm
+            output: Some(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                 q_weight: Arc::new(output),
                 b: None,
-            })?),
+            })?)),
             device: ct.device.clone(),
             cache: EitherCache::Normal(NormalCache::new(
                 total_layers,
@@ -453,12 +455,24 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
-        let output = if !ct.has_tensor("output.weight") {
-            ct.tensor("token_embd.weight", device)?
+
+        // PP: Only load norm and output (LM head) for last stage
+        let is_last_stage = layer_end >= total_layers;
+        let norm = if is_last_stage {
+            Some(QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
         } else {
-            ct.tensor("output.weight", device)?
+            None
         };
+        let output = if is_last_stage {
+            Some(if !ct.has_tensor("output.weight") {
+                ct.tensor("token_embd.weight", device)?
+            } else {
+                ct.tensor("output.weight", device)?
+            })
+        } else {
+            None
+        };
+
         let mut layers = Vec::with_capacity(num_loaded_layers);
 
         let head_dim = key_length;
@@ -661,10 +675,12 @@ impl ModelConfig::FromGGUF for ModelWeights {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
             norm,
-            output: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                q_weight: Arc::new(output),
-                b: None,
-            })?),
+            output: output.map(|q_tensor| {
+                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                    q_weight: Arc::new(q_tensor),
+                    b: None,
+                }).unwrap()) as Arc<dyn QuantMethod>
+            }),
             device: device.clone(),
             cache: EitherCache::Normal(NormalCache::new(num_loaded_layers, max_seq_len)),
             max_seq_len,
@@ -706,7 +722,9 @@ impl ModelWeights {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         // PP: Get embedding for first stage, or placeholder for non-first stages
-        let mut layer_in = crate::pp_get_layer_input!(self, x, DType::F32);
+        let activation = crate::pp_get_layer_input!(self, x, DType::F32);
+
+        // Prepare context for layer execution
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_causal_mask_matrix(
             x,
@@ -717,66 +735,125 @@ impl ModelWeights {
             self.dtype,
             self.layers[0].n_head,
         )?;
-        // PagedAttention prompt chunking
         let mask = mask.filter(|_| {
             metadata
                 .as_ref()
                 .map(|(_, meta)| meta.is_first_prompt_chunk)
                 .unwrap_or(true)
         });
+
+        // Build layer context
+        let context = LlamaLayerContext {
+            mask: &mask,
+            start_offsets,
+            cache,
+            metadata,
+        };
+
+        // TODO: Migrate to new pipeline-level hook pattern
+        // Execute layers (simple loop - hooks at pipeline level now)
+        let mut layer_out = activation;
         for (i, layer) in self.layers.iter().enumerate() {
-            // Global layer index for hooks (accounts for partial layer loading)
-            let global_layer_idx = self.layer_start + i;
-
-            // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
-                layer_in = mapper.map(layer_in, i)?;
+                layer_out = mapper.map(layer_out, i)?;
             }
-
-            // Pre-layer hook: can inject activations from previous pipeline stage
-            if let Some(ref hook) = self.hook {
-                if let Some(injected) = hook.call_layer_input(global_layer_idx, &layer_in, self.total_layers)? {
-                    layer_in = injected;
-                }
-            }
-
-            let x = layer_in;
-            let residual = &x;
-            let x = layer.attention_norm.forward(&x)?;
+            let residual = &layer_out;
+            let x = layer.attention_norm.forward(&layer_out)?;
             let attn = layer.forward_attn(
                 &x,
-                mask.as_ref()
+                context
+                    .mask
+                    .as_ref()
                     .map(|m| m.to_device(x.device()).unwrap())
                     .as_ref(),
-                start_offsets,
-                &mut cache[i],
-                metadata
+                context.start_offsets,
+                &mut context.cache[i],
+                context
+                    .metadata
                     .as_ref()
                     .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
             )?;
             let x = (attn + residual)?;
-
-            // MLP
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp_or_moe.forward(&x)?;
-            let x = (x + residual)?;
-            layer_in = x;
-
-            // Post-layer hook: can capture/replace activations for next pipeline stage
-            if let Some(ref hook) = self.hook {
-                if let Some(replacement) = hook.call_layer_output(global_layer_idx, &layer_in, self.total_layers)? {
-                    layer_in = replacement;
-                }
-            }
+            layer_out = (x + residual)?;
         }
 
-        // Last stage (or no PP): run final norm and lm_head
-        let layer_in = layer_in.to_device(&self.device)?;
-        let x = self.norm.forward(&layer_in)?;
-        extract_logits(
-            &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,
-            context_lens,
-        )
+        // PP: Return activations for non-last stages, logits for last stage
+        if self.is_last_stage() {
+            let layer_out = layer_out.to_device(&self.device)?;
+            let x = self.norm.as_ref().unwrap().forward(&layer_out)?;
+            extract_logits(
+                &MatMul.qmethod_matmul(&x.contiguous()?, &**self.output.as_ref().unwrap())?,
+                context_lens,
+            )
+        } else {
+            Ok(layer_out)
+        }
     }
 }
+
+/// Context required for LLaMA layer execution.
+///
+/// This struct contains all model-specific state needed to execute
+/// a single transformer layer.
+pub struct LlamaLayerContext<'a> {
+    pub mask: &'a Option<Tensor>,
+    pub start_offsets: &'a [usize],
+    pub cache: &'a mut Vec<KvCache>,  // Fixed: use correct KvCache type
+    pub metadata: Option<(Vec<(Tensor, Tensor)>, &'a PagedAttentionInputMetadata)>,
+}
+
+// TODO: Migrate to new Layered trait pattern (see models/llama.rs for reference)
+// use crate::pipeline::LayerExecutor;
+//
+// impl LayerExecutor for ModelLlama {
+//     type Context = LlamaLayerContext<'_>;
+//
+//     fn forward_layer(
+//         &self,
+//         layer_idx: usize,
+//         mut activation: Tensor,
+//         context: &mut Self::Context,
+//     ) -> Result<Tensor> {
+//         // Device mapping (use local index for loaded layers only)
+//         if let Some(ref mapper) = self.mapper {
+//             activation = mapper.map(activation, layer_idx)?;
+//         }
+//
+//         // Transformer layer computation
+//         let layer = &self.layers[layer_idx];
+//         let residual = &activation;
+//         let x = layer.attention_norm.forward(&activation)?;
+//         let attn = layer.forward_attn(
+//             &x,
+//             context
+//                 .mask
+//                 .as_ref()
+//                 .map(|m| m.to_device(x.device()).unwrap())
+//                 .as_ref(),
+//             context.start_offsets,
+//             &mut context.cache[layer_idx],
+//             context
+//                 .metadata
+//                 .as_ref()
+//                 .map(|(kv_cache, metadata)| (kv_cache[layer_idx].clone(), *metadata)),
+//         )?;
+//         let x = (attn + residual)?;
+//
+//         // MLP
+//         let residual = &x;
+//         let x = layer.ffn_norm.forward(&x)?;
+//         let x = layer.mlp_or_moe.forward(&x)?;
+//         Ok((x + residual)?)
+//     }
+//
+//     fn num_layers(&self) -> usize {
+//         self.layers.len()
+//     }
+//
+//     fn layer_start(&self) -> usize {
+//         self.layer_start
+//     }
+// }
