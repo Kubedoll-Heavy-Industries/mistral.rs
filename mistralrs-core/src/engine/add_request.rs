@@ -2,8 +2,7 @@ use crate::{
     pipeline::{CacheBackendMetadata, CacheInstruction, ForwardInputsResult, NormalCache, RerankInputs},
     prefix_cacher::MatchingCache,
     request::{
-        DetokenizationRequest, DetokenizeRequest, InferenceExec, InferenceInput, InferenceOperation,
-        NormalRequest, PipelineContinueRequest, TokenizationRequest, TokenizeRequest,
+        DetokenizeRequest, InferenceOperation, NormalRequest, PipelineContinueRequest, TokenizeRequest,
     },
     sequence::{SeqStepType, SequenceRecognizer, SequenceState},
     tools::{ToolCallingMatcher, ToolChoice},
@@ -29,6 +28,30 @@ use crate::{
 };
 
 use super::{search_request, Engine, TERMINATE_ALL_NEXT_STEP};
+
+/// Send an error response and return from the current function.
+/// Usage: `send_error!(response, Response::ValidationError("msg".into()))`
+macro_rules! send_error {
+    ($response:expr, $err:expr) => {{
+        $response
+            .send($err)
+            .await
+            .unwrap_or_else(|_| warn!("Receiver disconnected"));
+        return;
+    }};
+}
+
+/// Send an error response and return None from the current function.
+/// Usage: `send_error_none!(response, Response::ValidationError("msg".into()))`
+macro_rules! send_error_none {
+    ($response:expr, $err:expr) => {{
+        $response
+            .send($err)
+            .await
+            .unwrap_or_else(|_| warn!("Receiver disconnected"));
+        return None;
+    }};
+}
 
 impl Engine {
     pub async fn handle_request(self: Arc<Self>, request: Request) {
@@ -109,13 +132,9 @@ impl Engine {
         response: &tokio::sync::mpsc::Sender<Response>,
     ) -> Option<(Vec<u32>, String)> {
         let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
-            response
-                .send(Response::ValidationError(
-                    "Completion requests require the pipeline to have a tokenizer".into(),
-                ))
-                .await
-                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-            return None;
+            send_error_none!(response, Response::ValidationError(
+                "Completion requests require the pipeline to have a tokenizer".into()
+            ));
         };
 
         let prompt = tokenizer
@@ -124,11 +143,7 @@ impl Engine {
         let tokenized = match prompt {
             Ok(enc) => enc.get_ids().to_vec(),
             Err(e) => {
-                response
-                    .send(Response::InternalError(e.into()))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                return None;
+                send_error_none!(response, Response::InternalError(e.into()));
             }
         };
         Some((tokenized, text))
@@ -152,14 +167,9 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|ch_t| ch_t.has_chat_template())
         {
-            request
-                .response
-                .send(Response::ValidationError(
-                    "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into(),
-                ))
-                .await
-                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-            return;
+            send_error!(request.response, Response::ValidationError(
+                "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into()
+            ));
         }
 
         // Verify the model's category matches the messages received.
@@ -181,14 +191,9 @@ impl Engine {
             ) => (),
             (ModelCategory::Rerank, InferenceOperation::Rerank { .. }) => (),
             _ => {
-                request
-                    .response
-                    .send(Response::ValidationError(
-                        "Received a request incompatible for this model's category.".into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                return;
+                send_error!(request.response, Response::ValidationError(
+                    "Received a request incompatible for this model's category.".into()
+                ));
             }
         }
 
@@ -273,34 +278,13 @@ impl Engine {
             }
             InferenceOperation::ImageGeneration { prompt, .. }
             | InferenceOperation::SpeechGeneration { prompt } => (vec![u32::MAX], prompt.clone()),
-            InferenceOperation::CompletionTokens { tokens: it, .. } => {
+            InferenceOperation::CompletionTokens { tokens: it, .. }
+            | InferenceOperation::EmbeddingTokens { prompt: it } => {
                 let it = it.clone();
                 let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
-                    request
-                        .response
-                        .send(Response::ValidationError(
-                            "Completion requests w/ raw tokens require the pipeline to have a tokenizer".into(),
-                        ))
-                        .await
-                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                    return;
-                };
-                let prompt = tokenizer
-                    .decode(&it, false)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()));
-                (it, handle_seq_error!(prompt, request.response))
-            }
-            InferenceOperation::EmbeddingTokens { prompt: it } => {
-                let it = it.clone();
-                let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
-                    request
-                        .response
-                        .send(Response::ValidationError(
-                            "Completion requests w/ raw tokens require the pipeline to have a tokenizer".into(),
-                        ))
-                        .await
-                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                    return;
+                    send_error!(request.response, Response::ValidationError(
+                        "Completion requests w/ raw tokens require the pipeline to have a tokenizer".into()
+                    ));
                 };
                 let prompt = tokenizer
                     .decode(&it, false)
@@ -313,14 +297,9 @@ impl Engine {
             }
         };
         if prompt_tokens.is_empty() {
-            request
-                .response
-                .send(Response::ValidationError(
-                    "Received an empty prompt.".into(),
-                ))
-                .await
-                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-            return;
+            send_error!(request.response, Response::ValidationError(
+                "Received an empty prompt.".into()
+            ));
         }
 
         if matches!(
@@ -332,14 +311,9 @@ impl Engine {
             // embedding => truncate from end
             let category = get_mut_arcmutex!(self.pipeline).category();
             if !truncate_sequence {
-                request
-                    .response
-                    .send(Response::ValidationError(
-                        format!("Prompt sequence length is greater than {}, perhaps consider using `truncate_sequence`?", get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len).into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                return;
+                send_error!(request.response, Response::ValidationError(
+                    format!("Prompt sequence length is greater than {}, perhaps consider using `truncate_sequence`?", get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len).into()
+                ));
             } else if matches!(category, ModelCategory::Text | ModelCategory::Vision { .. }) {
                 let prompt_len = prompt_tokens.len();
                 let max_len = get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len;
@@ -429,14 +403,9 @@ impl Engine {
                     if let Some(tok_env) = tok_env.as_ref() {
                         let tok_trie = tok_env.tok_trie();
                         if tok_trie.has_extensions(tok_trie.token(*id)) {
-                            request
-                                .response
-                                .send(Response::ValidationError(
-                                    format!("Stop token {:?} is also a prefix of other tokens and cannot be used as a stop token.", tok_trie.token_str(*id)).into(),
-                                ))
-                                .await
-                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                            return;
+                            send_error!(request.response, Response::ValidationError(
+                                format!("Stop token {:?} is also a prefix of other tokens and cannot be used as a stop token.", tok_trie.token_str(*id)).into()
+                            ));
                         }
                     }
                 }
@@ -456,15 +425,9 @@ impl Engine {
 
                 for stop_txt in s {
                     let Some(tokenizer) = &tokenizer else {
-                        request
-                            .response
-                            .send(Response::ValidationError(
-                                "Completion requests require the pipeline to have a tokenizer"
-                                    .into(),
-                            ))
-                            .await
-                            .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                        return;
+                        send_error!(request.response, Response::ValidationError(
+                            "Completion requests require the pipeline to have a tokenizer".into()
+                        ));
                     };
                     let encoded = tokenizer.encode_fast(stop_txt.to_string(), true);
                     let toks = handle_seq_error!(encoded, request.response)
@@ -525,14 +488,9 @@ impl Engine {
         let sampler = handle_seq_error!(sampler, request.response);
 
         if sampling_params.n_choices == 0 {
-            request
-                .response
-                .send(Response::ValidationError(
-                    "n_choices must be greater than 0".into(),
-                ))
-                .await
-                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-            return;
+            send_error!(request.response, Response::ValidationError(
+                "n_choices must be greater than 0".into()
+            ));
         }
 
         // Add sequences
@@ -544,14 +502,9 @@ impl Engine {
             let recognizer = match Self::build_sequence_recognizer(&factory, constraint) {
                 Ok(recognizer) => recognizer,
                 Err(err) => {
-                    request
-                        .response
-                        .send(Response::ValidationError(
-                            format!("Invalid grammar. {err}").into(),
-                        ))
-                        .await
-                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                    return;
+                    send_error!(request.response, Response::ValidationError(
+                        format!("Invalid grammar. {err}").into()
+                    ));
                 }
             };
 
@@ -602,16 +555,9 @@ impl Engine {
                     match k_seq_cache {
                         Ok(x) => x,
                         Err(_) => {
-                            request
-                                .response
-                                .send(Response::InternalError(
-                                    "Failed to allocate preallocated KV cache."
-                                        .to_string()
-                                        .into(),
-                                ))
-                                .await
-                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                            return;
+                            send_error!(request.response, Response::InternalError(
+                                "Failed to allocate preallocated KV cache.".to_string().into()
+                            ));
                         }
                     }
                 };
@@ -623,16 +569,9 @@ impl Engine {
                     match v_seq_cache {
                         Ok(x) => x,
                         Err(_) => {
-                            request
-                                .response
-                                .send(Response::InternalError(
-                                    "Failed to allocate preallocated KV cache."
-                                        .to_string()
-                                        .into(),
-                                ))
-                                .await
-                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                            return;
+                            send_error!(request.response, Response::InternalError(
+                                "Failed to allocate preallocated KV cache.".to_string().into()
+                            ));
                         }
                     }
                 };
@@ -1006,29 +945,18 @@ impl Engine {
                 truncate,
             } => (query.clone(), documents.clone(), *truncate),
             _ => {
-                request
-                    .response
-                    .send(Response::InternalError(
-                        "handle_rerank_request called with non-Rerank message".into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                return;
+                send_error!(request.response, Response::InternalError(
+                    "handle_rerank_request called with non-Rerank message".into()
+                ));
             }
         };
 
         // Validate model category
         let mut pipeline = get_mut_arcmutex!(self.pipeline);
         if !matches!(pipeline.category(), ModelCategory::Rerank) {
-            request
-                .response
-                .send(Response::ValidationError(
-                    "Loaded model is not a reranker. Use ModelSelected::Rerank to load a cross-encoder model."
-                        .into(),
-                ))
-                .await
-                .unwrap_or_else(|_| warn!("Receiver disconnected"));
-            return;
+            send_error!(request.response, Response::ValidationError(
+                "Loaded model is not a reranker. Use ModelSelected::Rerank to load a cross-encoder model.".into()
+            ));
         }
 
         // Perform reranking using Pipeline::forward_inputs()
@@ -1048,14 +976,9 @@ impl Engine {
                 let scores_vec = match scores.to_vec1::<f32>() {
                     Ok(v) => v,
                     Err(e) => {
-                        request
-                            .response
-                            .send(Response::InternalError(
-                                format!("Failed to convert scores: {e}").into(),
-                            ))
-                            .await
-                            .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                        return;
+                        send_error!(request.response, Response::InternalError(
+                            format!("Failed to convert scores: {e}").into()
+                        ));
                     }
                 };
 
@@ -1070,22 +993,14 @@ impl Engine {
                     .unwrap_or_else(|_| warn!("Receiver disconnected"));
             }
             Ok(_) => {
-                request
-                    .response
-                    .send(Response::InternalError(
-                        "RerankPipeline returned unexpected result type".into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                send_error!(request.response, Response::InternalError(
+                    "RerankPipeline returned unexpected result type".into()
+                ));
             }
             Err(e) => {
-                request
-                    .response
-                    .send(Response::InternalError(
-                        format!("Reranking failed: {e}").into(),
-                    ))
-                    .await
-                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                send_error!(request.response, Response::InternalError(
+                    format!("Reranking failed: {e}").into()
+                ));
             }
         }
     }
