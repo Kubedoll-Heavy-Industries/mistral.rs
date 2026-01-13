@@ -5,8 +5,9 @@ use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, initialize_logging, paged_attn_supported,
     parse_isq_value, Constraint, DefaultSchedulerMethod, DeviceLayerMapMetadata, DeviceMapMetadata,
     DeviceMapSetting, DrySamplingParams, Loader, LoaderBuilder, MemoryGpuConfig, MistralRs,
-    MistralRsBuilder, ModelSelected, NormalRequest, PagedAttentionConfig, PagedCacheType, Request,
-    RequestMessage, Response, SamplingParams, SchedulerConfig, TokenSource, Usage,
+    InferenceExec, InferenceInput, InferenceOperation, ModelSelected, MistralRsBuilder,
+    MistralRsConfig, MistralRsError, NormalRequest, PagedAttentionConfig, PagedCacheType, Pipeline,
+    Request, Response, SamplingParams, SchedulerConfig, TokenSource, Usage,
 };
 use std::fmt::Display;
 use std::sync::Arc;
@@ -47,7 +48,7 @@ impl Display for UncertainTokSec {
 
 async fn run_bench(
     mistralrs: Arc<MistralRs>,
-    prompt: RequestMessage,
+    prompt: InferenceOperation,
     n_gen: usize,
     concurrency: usize,
     repetitions: usize,
@@ -73,21 +74,15 @@ async fn run_bench(
 
     let req = Request::Normal(Box::new(NormalRequest {
         id: mistralrs.next_request_id(),
-        messages: prompt,
-        sampling_params: sampling_params.clone(),
+        input: InferenceInput {
+            op: prompt,
+            exec: InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
+        },
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        constraint: Constraint::None,
-        suffix: None,
-        tools: None,
-        tool_choice: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
         model_id: None,
-        truncate_sequence: false,
-        pipeline_continue_op_id: None,
     }));
 
     let mut usages = Vec::new();
@@ -236,25 +231,27 @@ async fn warmup_run(mistralrs: Arc<MistralRs>) {
 
     let req = Request::Normal(Box::new(NormalRequest {
         id: mistralrs.next_request_id(),
-        messages: RequestMessage::Completion {
-            text: "Hello!".to_string(),
-            echo_prompt: false,
-            best_of: None,
+        input: InferenceInput {
+            op: InferenceOperation::Completion {
+                text: "Hello!".to_string(),
+                echo_prompt: false,
+                best_of: None,
+                sampling_params: sampling_params.clone(),
+                return_logprobs: false,
+                constraint: Constraint::None,
+                tools: None,
+                tool_choice: None,
+                suffix: None,
+                logits_processors: None,
+                return_raw_logits: false,
+            },
+            exec: InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
         },
-        sampling_params: sampling_params.clone(),
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        constraint: Constraint::None,
-        suffix: None,
-        tools: None,
-        tool_choice: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
         model_id: None,
-        truncate_sequence: false,
-        pipeline_continue_op_id: None,
     }));
 
     if sender.send(req.clone()).await.is_err() {
@@ -542,10 +539,21 @@ async fn main() -> anyhow::Result<()> {
         if args.n_gen > 0 {
             let r = run_bench(
                 mistralrs.clone(),
-                RequestMessage::Completion {
+                InferenceOperation::Completion {
                     text: "Rust".to_string(),
                     echo_prompt: false,
                     best_of: None,
+                    sampling_params: SamplingParams {
+                        max_len: Some(args.n_gen - 1),
+                        ..SamplingParams::deterministic()
+                    },
+                    return_logprobs: false,
+                    constraint: Constraint::None,
+                    tools: None,
+                    tool_choice: None,
+                    suffix: None,
+                    logits_processors: None,
+                    return_raw_logits: false,
                 },
                 args.n_gen - 1,
                 *concurrency,
@@ -560,7 +568,20 @@ async fn main() -> anyhow::Result<()> {
             let tks = (1000..1000 + args.n_prompt as u32).collect();
             let r = run_bench(
                 mistralrs.clone(),
-                RequestMessage::CompletionTokens(tks),
+                InferenceOperation::CompletionTokens {
+                    tokens: tks,
+                    sampling_params: SamplingParams {
+                        max_len: Some(1),
+                        ..SamplingParams::deterministic()
+                    },
+                    return_logprobs: false,
+                    constraint: Constraint::None,
+                    tools: None,
+                    tool_choice: None,
+                    suffix: None,
+                    logits_processors: None,
+                    return_raw_logits: false,
+                },
                 1,
                 *concurrency,
                 args.repetitions,
