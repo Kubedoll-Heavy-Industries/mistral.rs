@@ -181,6 +181,8 @@ impl InputsProcessor for Phi3InputsProcessor {
                         paged_attn_meta,
                         flash_meta,
                         flash_meta_full: _,
+                        request_id: _,
+                        ..
                     } = *inputs
                         .downcast::<text_models_inputs_processor::ModelInputs>()
                         .expect("Downcast failed.");
