@@ -5,8 +5,8 @@ use either::Either;
 use indexmap::IndexMap;
 
 use crate::{
-    request::ReasoningEffort,
     vision_models::{preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig},
+    request::ThinkingMode,
     MessageContent, Pipeline, Tool,
 };
 
@@ -32,15 +32,13 @@ pub enum MessagesAction {
 /// model.
 pub trait Processor {
     /// Get the tokens and the untokenized prompt. `add_special_tokens` should usually be true.
-    #[allow(clippy::too_many_arguments)]
     fn process(
         &self,
         pipeline: &dyn Pipeline,
         messages: Vec<IndexMap<String, MessageContent>>,
         add_generation_prompt: bool,
         add_special_tokens: bool,
-        enable_thinking: Option<bool>,
-        reasoning_effort: Option<ReasoningEffort>,
+        thinking: Option<ThinkingMode>,
         tools: Vec<Tool>,
     ) -> Result<(Vec<u32>, String)> {
         // for message in messages.iter_mut() {
@@ -57,8 +55,7 @@ pub trait Processor {
             pipeline,
             messages,
             add_generation_prompt,
-            enable_thinking,
-            reasoning_effort,
+            thinking,
             self.template_action(),
             tools,
         )?;
@@ -107,11 +104,16 @@ pub(crate) fn apply_chat_template(
     pipeline: &dyn Pipeline,
     messages: Vec<IndexMap<String, MessageContent>>,
     add_generation_prompt: bool,
-    enable_thinking: Option<bool>,
-    reasoning_effort: Option<ReasoningEffort>,
+    thinking: Option<ThinkingMode>,
     action: MessagesAction,
     tools: Vec<Tool>,
 ) -> Result<String> {
+    let (enable_thinking, reasoning_effort) = match thinking {
+        None => (None, None),
+        Some(ThinkingMode::Bool(b)) => (Some(b), None),
+        Some(ThinkingMode::Effort(e)) => (Some(true), Some(e)),
+    };
+
     let messages = match action {
         MessagesAction::Keep => messages,
         MessagesAction::FlattenOnlyText => {

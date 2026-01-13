@@ -80,8 +80,7 @@ impl Processor for SpeechProcessor {
         _messages: Vec<IndexMap<String, MessageContent>>,
         _add_generation_prompt: bool,
         _add_special_tokens: bool,
-        _enable_thinking: Option<bool>,
-        _reasoning_effort: Option<crate::request::ReasoningEffort>,
+        _thinking: Option<crate::request::ThinkingMode>,
         _tools: Vec<crate::Tool>,
     ) -> Result<(Vec<u32>, String)> {
         anyhow::bail!(

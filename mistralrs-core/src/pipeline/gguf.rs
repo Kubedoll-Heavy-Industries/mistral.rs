@@ -49,7 +49,7 @@ use crate::{
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
 use anyhow::{bail, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{Device, Module, Tensor};
 use either::Either;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
@@ -844,7 +844,33 @@ impl Pipeline for GGUFPipeline {
             paged_attn_meta,
             flash_meta,
             flash_meta_full,
+            request_id,
+            inference_step,
         } = *inputs.downcast().expect("Downcast failed.");
+
+        // Set request context on hook BEFORE forward (proper design: context on hook, not threaded through model)
+        if let Some(hook) = self.model.get_hook() {
+            hook.set_request_context(request_id);
+
+            use crate::pipeline::text_models_inputs_processor::InferenceStep;
+            if let InferenceStep::Prefill { total_prompt_tokens, .. } = inference_step {
+                tracing::info!(
+                    %request_id,
+                    total_prompt_tokens,
+                    "GGUF forward_inputs: Calling init_pipeline_request on hook (Prefill)"
+                );
+                hook.call_init_pipeline_request(request_id, total_prompt_tokens);
+            } else {
+                tracing::debug!(
+                    %request_id,
+                    ?inference_step,
+                    "GGUF forward_inputs: Skipping init (not Prefill)"
+                );
+            }
+        } else {
+            tracing::debug!(%request_id, "GGUF forward_inputs: No hook attached");
+        }
+
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
             (Some(engine), Some(meta)) => Some((engine.get_kv_cache().clone(), meta)),
@@ -880,7 +906,46 @@ impl Pipeline for GGUFPipeline {
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
             Model::Phi3(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
+                // Pipeline parallelism: receive activation from previous stage if not first stage
+                let input_activation = if let Some(hook) = model.get_hook() {
+                    hook.receive_stage_input()?
+                } else {
+                    None
+                };
+
+                let output = model.forward(
+                    &input_ids,
+                    input_activation.as_ref(),
+                    input_ids_full.as_ref(),
+                    &seqlen_offsets,
+                    paged_attn_meta,
+                    request_id,
+                )?;
+
+                // Pipeline parallelism flow (same as Qwen3)
+                if let Some(hook) = model.get_hook() {
+                    if !hook.is_last_stage() {
+                        let tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+                        let sequence_position = seqlen_offsets.first().copied().unwrap_or(0);
+                        hook.send_stage_output(&output, &tokens, request_id, sequence_position)?;
+
+                        if hook.needs_external_logits() {
+                            let logits = hook.receive_response_logits()?;
+                            let logits_3d = logits.unsqueeze(1)?;
+                            if return_raw_logits {
+                                return Ok(ForwardInputsResult::RawLogits { logits: logits_3d });
+                            } else {
+                                return Ok(ForwardInputsResult::CausalGeneration { logits: logits_3d });
+                            }
+                        }
+
+                        return Err(candle_core::Error::Msg(
+                            "Middle stage in PP should not reach here".to_string()
+                        ));
+                    }
+                }
+
+                output
             }
             Model::XLoraPhi3(ref model) => model.forward(
                 &input_ids,
@@ -900,10 +965,61 @@ impl Pipeline for GGUFPipeline {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen3(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                // Pipeline parallelism: receive activation from previous stage if not first stage
+                let input_activation = if let Some(hook) = model.get_hook() {
+                    hook.receive_stage_input()?
+                } else {
+                    None
+                };
+
+                let output = model.forward(
+                    &input_ids,
+                    input_activation.as_ref(),
+                    &seqlen_offsets,
+                    context_lens.clone(),
+                    paged_attn_meta,
+                )?;
+
+                // Pipeline parallelism flow:
+                // - First stage (non-last): send hidden states → wait for logits → return
+                // - Middle stage: send hidden states → done (shouldn't happen in 2-stage PP)
+                // - Last stage: return logits (worker sends them back to first stage)
+                // - Single stage: no hook, just return logits
+                if let Some(hook) = model.get_hook() {
+                    if !hook.is_last_stage() {
+                        // Non-last stage: send hidden states to next stage
+                        let tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+                        let sequence_position = seqlen_offsets.first().copied().unwrap_or(0);
+                        hook.send_stage_output(&output, &tokens, request_id, sequence_position)?;
+
+                        // First stage needs to wait for logits from last stage
+                        if hook.needs_external_logits() {
+                            let logits = hook.receive_response_logits()?;
+                            // receive_response_logits returns [batch, vocab_size] (already extracted last position)
+                            // Sampling expects [batch, seq_len, vocab_size], so unsqueeze to [batch, 1, vocab]
+                            let logits_3d = logits.unsqueeze(1)?;
+                            if return_raw_logits {
+                                return Ok(ForwardInputsResult::RawLogits { logits: logits_3d });
+                            } else {
+                                return Ok(ForwardInputsResult::CausalGeneration { logits: logits_3d });
+                            }
+                        }
+
+                        // Middle stages (if any) just return - they don't produce logits
+                        // This shouldn't happen in 2-stage PP
+                        return Err(candle_core::Error::Msg(
+                            "Middle stage in PP should not reach here".to_string()
+                        ));
+                    }
+                    // Last stage: fall through and return logits normally
+                    // Worker will extract from Response::Raw and send to first stage
+                }
+
+                // Last stage or no PP: output is logits
+                output
             }
             Model::Qwen3MoE(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta, request_id)?
             }
         };
         if return_raw_logits {

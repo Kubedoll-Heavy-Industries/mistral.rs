@@ -86,6 +86,7 @@ pub struct NormalPipeline {
     config: String,
     imatrix: Option<PathBuf>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
+    hook: Option<HookContainer>,
 }
 
 /// A loader for a "normal" (non-quantized) model.
@@ -1032,6 +1033,7 @@ impl Loader for NormalLoader {
             config,
             imatrix: self.config.imatrix.clone(),
             mapper: pipeline_mapper,
+            hook: None,
         })))
     }
 
@@ -1157,7 +1159,7 @@ impl MetadataMixin for NormalPipeline {
 #[async_trait::async_trait]
 impl Pipeline for NormalPipeline {
     fn get_hook(&self) -> Option<&crate::pipeline::HookContainer> {
-        self.model.get_hook()
+        self.hook.as_ref()
     }
 
     fn forward_inputs(
@@ -1175,6 +1177,8 @@ impl Pipeline for NormalPipeline {
             paged_attn_meta,
             flash_meta,
             flash_meta_full,
+            request_id,  // Capture request_id for hook orchestration
+            ..  // Ignore inference_step for now (not used in normal pipeline yet)
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
@@ -1189,20 +1193,99 @@ impl Pipeline for NormalPipeline {
             }
             (None, None) => None,
         };
-        let logits = match self.model.is_xlora() {
+
+        // Prepare hook parameters (if hooks are enabled)
+        //
+        // IMPORTANT: during decode, `input_ids` is typically only the current token (seq_len=1),
+        // while pipeline-parallel workers need the full token history to correctly reconstruct
+        // sparse KV cache. When available, `input_ids_full` carries the full token sequence.
+        let (tokens, total_layers) = if self.hook.is_some() {
+            let tokens_tensor = input_ids_full.as_ref().unwrap_or(&input_ids);
+            let tokens = tokens_tensor.flatten_all()?.to_vec1::<u32>()?;
+            let total_layers = self.model.config().num_layers;
+            (tokens, total_layers)
+        } else {
+            (vec![], 0) // Dummy values when no hook
+        };
+
+        let mut logits = match self.model.is_xlora() {
             false => {
                 let paged_attn_meta = paged_attn_meta
                     .as_ref()
                     .map(|meta| (meta.0.get_kv_cache().clone(), meta.1.clone()));
 
-                self.model.forward(
-                    &input_ids,
-                    &seqlen_offsets,
-                    context_lens,
-                    position_ids,
-                    paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
-                    &flash_meta,
-                )?
+                // Use building blocks when hooks are present for pipeline orchestration
+                if let Some(ref hook) = self.hook {
+                    // === PIPELINE PARALLELISM: Stage-level orchestration ===
+
+                    // 1. Get initial activation (embeddings OR received from previous stage)
+                    let activation = if hook.is_first_stage() {
+                        // First stage: compute embeddings from tokens
+                        self.model.get_input_embeddings(&input_ids)?
+                    } else {
+                        // Middle/last stage: receive activation from previous stage (BLOCKING)
+                        match hook.receive_stage_input()? {
+                            Some(received) => {
+                                tracing::info!("Received activation from previous pipeline stage");
+                                received
+                            }
+                            None => {
+                                // Middle/last stage MUST receive activation from previous stage
+                                candle_core::bail!(
+                                    "Pipeline parallelism error: middle/last stage did not receive activation from previous stage"
+                                );
+                            }
+                        }
+                    };
+
+                    // 2. Run transformer layers (all stages)
+                    let activation = self.model.forward_layers(
+                        &input_ids,
+                        activation,
+                        &seqlen_offsets,
+                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                        &flash_meta,
+                    )?;
+
+                    // 3. Send activation to next stage (if not last stage)
+                    if !hook.is_last_stage() {
+                        let sequence_position = seqlen_offsets.first().copied().unwrap_or(0);
+                        hook.send_stage_output(&activation, &tokens, request_id, sequence_position)?;
+                        tracing::info!("Sent activation to next pipeline stage");
+                    }
+
+                    // 4. Get final logits (local lm_head OR external from last stage)
+                    if hook.needs_external_logits() {
+                        // First stage (but not last): receive logits from last stage
+                        tracing::info!("Waiting for logits from last pipeline stage");
+                        hook.receive_response_logits()?
+                    } else {
+                        // Last stage: check if this is decode (single token) or prefill (multiple tokens)
+                        // Decode (seq_len == 1): produce logits for sampling
+                        // Prefill (seq_len > 1): just building KV cache, no logits needed
+                        let is_decode = tokens.len() == 1;
+
+                        if is_decode {
+                            // Decode step: apply lm_head to get logits for next token
+                            tracing::info!(%request_id, "Decode step: applying lm_head");
+                            self.model.apply_lm_head(activation, context_lens.clone())?
+                        } else {
+                            // Prefill step: building KV cache, return dummy logits
+                            tracing::info!(%request_id, seq_len = tokens.len(), "Prefill step: skipping lm_head");
+                            Tensor::zeros((1, 1, 1), candle_core::DType::F32, activation.device())?
+                        }
+                    }
+                } else {
+                    // No hooks: use traditional single-stage forward pass
+                    self.model.forward(
+                        &input_ids,
+                        &seqlen_offsets,
+                        context_lens.clone(),
+                        position_ids,
+                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
+                        &flash_meta,
+                    )?
+                }
             }
             true => self.model.xlora_forward(
                 &input_ids,
@@ -1211,12 +1294,13 @@ impl Pipeline for NormalPipeline {
                 seqlen_offsets_full.as_ref().unwrap_or(&seqlen_offsets),
                 self.no_kv_cache,
                 &self.non_granular_state,
-                context_lens,
+                context_lens.clone(),
                 position_ids,
                 &flash_meta,
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
         };
+
         if return_raw_logits {
             Ok(ForwardInputsResult::RawLogits { logits })
         } else {
@@ -1237,10 +1321,10 @@ impl Pipeline for NormalPipeline {
         ModelCategory::Text
     }
     fn set_hook(&mut self, hook: HookContainer) {
-        self.model.set_hook(hook);
+        self.hook = Some(hook);
     }
     fn supports_hooks(&self) -> bool {
-        self.model.supports_hooks()
+        true
     }
 }
 

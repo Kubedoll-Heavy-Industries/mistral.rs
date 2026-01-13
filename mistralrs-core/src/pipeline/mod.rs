@@ -76,7 +76,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 pub use vision::{VisionLoader, VisionLoaderBuilder, VisionSpecificConfig};
-pub use hooks::{HookContainer, LayerActivation, NoOpHook, PipelineHook};
+pub use hooks::{HookContainer, LayerActivation, PipelineHook};
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, Var};
@@ -507,22 +507,18 @@ pub trait Pipeline:
         None
     }
 
-    /// Returns the total of model execution time.
-    #[allow(clippy::too_many_arguments)]
-    async fn step(
+    /// Forward pass - runs model forward, returns output tensor.
+    /// For PP, hooks intercept the tensor.
+    fn forward_pass(
         &mut self,
         input_seqs: &mut [&mut Sequence],
         is_prompt: bool,
-        return_raw_logits: bool,
-        prefix_cacher: &mut PrefixCacheManagerV2,
-        disable_eos_stop: bool,
-        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
         backend_metadata: CacheBackendMetadata,
-    ) -> Result<Duration, candle_core::Error> {
+    ) -> Result<Tensor, candle_core::Error> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
-                let inputs_iter =
-                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                let InputProcessorOutput { inputs, .. } =
+                    self.get_processor().inputs_processor().process_inputs(
                         self.tokenizer(),
                         input_seqs,
                         is_prompt,
@@ -530,68 +526,28 @@ pub trait Pipeline:
                         &self.device(),
                         self.get_metadata().no_kv_cache,
                         None,
-                        return_raw_logits,
+                        false, // return_raw_logits
                         self.get_input_processor_config(),
                         None,
                         self.device_mapper(),
-                    ));
+                    ).map_err(candle_core::Error::msg)?;
 
-                let mut logits = vec![None; input_seqs.len()];
-                let len_inputs = 1;
-                let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
-                let mut embedding_logits = vec![None; input_seqs.len()];
-
-                let mut exec_duration = Duration::ZERO;
-                for (i, inputs) in inputs_iter.into_iter().enumerate() {
-                    let InputProcessorOutput {
-                        inputs,
-                        seq_indices,
-                    } = inputs.map_err(candle_core::Error::msg)?;
-                    if i == 0 {
-                        match pre_op {
-                            CacheInstruction::In => self.clone_in_cache(input_seqs),
-                            CacheInstruction::Nothing => (),
-                            CacheInstruction::Reset {
-                                load_preallocated_cache,
-                                reset_non_granular,
-                            } => self.set_none_cache(
-                                input_seqs,
-                                reset_non_granular,
-                                false,
-                                load_preallocated_cache,
-                            ),
-                            _ => unreachable!("Unreachable PRE cache op."),
-                        }
-                    }
-
-                    let start = Instant::now();
-                    let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
-
-                    // For PP first stage: replace forward result with external logits from last stage
-                    // The forward pass ran our layers and sent activations via hook; now we await
-                    // the response logits from the last stage which did lm_head + final layers.
-                    let raw_logits = if self.get_hook().is_some_and(|h| h.needs_external_logits()) {
-                        let external_logits = self.get_hook().unwrap().receive_response_logits()?;
-                        ForwardInputsResult::CausalGeneration { logits: external_logits }
-                    } else {
-                        raw_logits
-                    };
-
-                    let end = Instant::now();
-                    exec_duration += end.duration_since(start);
-
-                    for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
-                        if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
-                            raw_out_logits[seq_idx][i] =
-                                Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
-                        } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
-                            embedding_logits[seq_idx] =
-                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
-                        } else {
-                            logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
-                        }
-                    }
+                match pre_op {
+                    CacheInstruction::In => self.clone_in_cache(input_seqs),
+                    CacheInstruction::Nothing => (),
+                    CacheInstruction::Reset {
+                        load_preallocated_cache,
+                        reset_non_granular,
+                    } => self.set_none_cache(
+                        input_seqs,
+                        reset_non_granular,
+                        false,
+                        load_preallocated_cache,
+                    ),
+                    _ => unreachable!("Unreachable PRE cache op."),
                 }
+
+                let result = self.forward_inputs(inputs, false)?;
 
                 match post_op {
                     CacheInstruction::Out => self.clone_out_cache(input_seqs),
@@ -608,166 +564,132 @@ pub trait Pipeline:
                     _ => unreachable!("Unreachable POST cache op."),
                 }
 
-                if raw_out_logits[0][0].is_some() {
-                    let start = Instant::now();
-                    response::send_raw_responses(
-                        input_seqs,
-                        raw_out_logits
-                            .into_iter()
-                            .map(|raw| raw.into_iter().flatten().collect::<Vec<_>>())
-                            .collect(),
-                    )
-                    .await?;
-                    let end = Instant::now();
-                    exec_duration += end.duration_since(start);
-
-                    return Ok(exec_duration);
+                // Extract logits tensor from result
+                match result {
+                    ForwardInputsResult::CausalGeneration { logits } => Ok(logits),
+                    _ => candle_core::bail!("forward_pass expects CausalGeneration result"),
                 }
-                if embedding_logits[0].is_some() {
-                    let start = Instant::now();
-                    response::send_embedding_responses(
-                        input_seqs,
-                        embedding_logits
-                            .into_iter()
-                            .map(|raw| {
-                                raw.unwrap()
-                                    .to_dtype(DType::F32)
-                                    .unwrap()
-                                    .to_vec1::<f32>()
-                                    .unwrap()
-                            })
-                            .collect(),
-                    )
-                    .await?;
-                    let end = Instant::now();
-                    exec_duration += end.duration_since(start);
-
-                    return Ok(exec_duration);
-                }
-
-                let start = Instant::now();
-                let logits_on_cpu = logits.len() > 1;
-                let logits = logits
-                    .into_iter()
-                    .map(|l| {
-                        let l = l.expect("Did not get any inputs. This is shocking.");
-                        if logits_on_cpu {
-                            l.to_device(&Device::Cpu)
-                        } else {
-                            Ok(l)
-                        }
-                    })
-                    .collect::<candle_core::Result<Vec<_>>>()?;
-
-                match &logits[0] {
-                    ForwardInputsResult::RawLogits { .. }
-                    | ForwardInputsResult::Embeddings { .. }
-                    | ForwardInputsResult::Rerank { .. } => unreachable!(),
-                    ForwardInputsResult::CausalGeneration { .. } => {
-                        self.sample_causal_gen(
-                            input_seqs,
-                            logits
-                                .into_iter()
-                                .map(|r| {
-                                    #[allow(irrefutable_let_patterns)]
-                                    let ForwardInputsResult::CausalGeneration { logits } = r
-                                    else {
-                                        unreachable!(
-                                            "All results must have same type, `CausalGeneration`"
-                                        )
-                                    };
-                                    logits
-                                })
-                                .collect::<Vec<_>>(),
-                            prefix_cacher,
-                            disable_eos_stop,
-                            rng,
-                        )
-                        .await?;
-                    }
-                    ForwardInputsResult::Image { .. } => {
-                        response::send_image_responses(
-                            input_seqs,
-                            logits
-                                .into_iter()
-                                .map(|r| {
-                                    #[allow(irrefutable_let_patterns)]
-                                    let ForwardInputsResult::Image { images } = r
-                                    else {
-                                        unreachable!("All results must have same type, `Image`")
-                                    };
-                                    images
-                                        .into_iter()
-                                        .next()
-                                        .expect("Must have at least 1 element.")
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                        .await?;
-                    }
-                    ForwardInputsResult::Speech { .. } => {
-                        let rates = logits
-                            .iter()
-                            .map(|r| {
-                                #[allow(irrefutable_let_patterns)]
-                                let ForwardInputsResult::Speech { rates, .. } = r
-                                else {
-                                    unreachable!("All results must have same type, `Speech`")
-                                };
-                                assert_eq!(rates.len(), 1, "Each sequence must have 1 PCM output.");
-                                *rates.first().unwrap()
-                            })
-                            .collect::<Vec<_>>();
-                        let channels = logits
-                            .iter()
-                            .map(|r| {
-                                #[allow(irrefutable_let_patterns)]
-                                let ForwardInputsResult::Speech { channels, .. } = r
-                                else {
-                                    unreachable!("All results must have same type, `Speech`")
-                                };
-                                assert_eq!(
-                                    channels.len(),
-                                    1,
-                                    "Each sequence must have 1 PCM output."
-                                );
-                                *channels.first().unwrap()
-                            })
-                            .collect::<Vec<_>>();
-                        let pcms = logits
-                            .into_iter()
-                            .map(|r| {
-                                #[allow(irrefutable_let_patterns)]
-                                let ForwardInputsResult::Speech { pcms, .. } = r
-                                else {
-                                    unreachable!("All results must have same type, `Speech`")
-                                };
-                                assert_eq!(pcms.len(), 1, "Each sequence must have 1 PCM output.");
-                                pcms.into_iter().nth(0).unwrap()
-                            })
-                            .collect::<Vec<_>>();
-                        response::send_speech_responses(input_seqs, &pcms, &rates, &channels)
-                            .await?;
-                    }
-                }
-                let end = Instant::now();
-                exec_duration += end.duration_since(start);
-
-                Ok(exec_duration)
             }
             CacheBackendMetadata::PagedAttention {
                 metadata,
                 blocks_to_copy,
             } => {
-                // Cloning might be bad?
                 self.get_metadata()
                     .cache_engine
                     .as_ref()
                     .expect("PagedAttention must have cache engines.")
                     .execute_scheduler_ops(&blocks_to_copy)?;
 
-                let inputs_iter =
-                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                let InputProcessorOutput { inputs, .. } =
+                    self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        false, // return_raw_logits
+                        self.get_input_processor_config(),
+                        Some(metadata),
+                        self.device_mapper(),
+                    ).map_err(candle_core::Error::msg)?;
+
+                let result = self.forward_inputs(inputs, false)?;
+
+                // For PP first stage: get logits from hook
+                let logits = if self.get_hook().is_some_and(|h| h.needs_external_logits()) {
+                    self.get_hook().unwrap().receive_response_logits()?
+                } else {
+                    match result {
+                        ForwardInputsResult::CausalGeneration { logits } => logits,
+                        _ => candle_core::bail!("forward_pass expects CausalGeneration result"),
+                    }
+                };
+
+                Ok(logits)
+            }
+        }
+    }
+
+    /// Run forward pass and send responses. For normal inference (non-PP).
+    #[allow(clippy::too_many_arguments)]
+    async fn step(
+        &mut self,
+        input_seqs: &mut [&mut Sequence],
+        is_prompt: bool,
+        return_raw_logits: bool,
+        prefix_cacher: &mut PrefixCacheManagerV2,
+        disable_eos_stop: bool,
+        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+        backend_metadata: CacheBackendMetadata,
+    ) -> Result<Duration, candle_core::Error> {
+        match backend_metadata {
+            CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
+                let InputProcessorOutput { inputs, seq_indices } =
+                    self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        return_raw_logits,
+                        self.get_input_processor_config(),
+                        None,
+                        self.device_mapper(),
+                    ).map_err(candle_core::Error::msg)?;
+
+                match pre_op {
+                    CacheInstruction::In => self.clone_in_cache(input_seqs),
+                    CacheInstruction::Nothing => (),
+                    CacheInstruction::Reset {
+                        load_preallocated_cache,
+                        reset_non_granular,
+                    } => self.set_none_cache(
+                        input_seqs,
+                        reset_non_granular,
+                        false,
+                        load_preallocated_cache,
+                    ),
+                    _ => unreachable!("Unreachable PRE cache op."),
+                }
+
+                let start = Instant::now();
+                let result = self.forward_inputs(inputs, return_raw_logits)?;
+                let exec_duration = start.elapsed();
+
+                match post_op {
+                    CacheInstruction::Out => self.clone_out_cache(input_seqs),
+                    CacheInstruction::Nothing => (),
+                    CacheInstruction::Reset {
+                        load_preallocated_cache,
+                        reset_non_granular,
+                    } => self.set_none_cache(
+                        input_seqs,
+                        reset_non_granular,
+                        false,
+                        load_preallocated_cache,
+                    ),
+                    _ => unreachable!("Unreachable POST cache op."),
+                }
+
+                self.handle_result(input_seqs, result, seq_indices, prefix_cacher, disable_eos_stop, rng).await?;
+                Ok(exec_duration)
+            }
+            CacheBackendMetadata::PagedAttention {
+                metadata,
+                blocks_to_copy,
+            } => {
+                self.get_metadata()
+                    .cache_engine
+                    .as_ref()
+                    .expect("PagedAttention must have cache engines.")
+                    .execute_scheduler_ops(&blocks_to_copy)?;
+
+                let InputProcessorOutput { inputs, seq_indices } =
+                    self.get_processor().inputs_processor().process_inputs(
                         self.tokenizer(),
                         input_seqs,
                         is_prompt,
@@ -779,193 +701,77 @@ pub trait Pipeline:
                         self.get_input_processor_config(),
                         Some(metadata),
                         self.device_mapper(),
-                    ));
-
-                let mut logits = vec![None; input_seqs.len()];
-                let len_inputs = 1;
-                let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
-                let mut embedding_logits = vec![None; input_seqs.len()];
-
-                let mut exec_duration = Duration::ZERO;
-                for (i, inputs) in inputs_iter.into_iter().enumerate() {
-                    let InputProcessorOutput {
-                        inputs,
-                        seq_indices,
-                    } = inputs.map_err(candle_core::Error::msg)?;
-
-                    let start = Instant::now();
-                    let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
-
-                    // For PP first stage: replace forward result with external logits from last stage
-                    let raw_logits = if self.get_hook().is_some_and(|h| h.needs_external_logits()) {
-                        let external_logits = self.get_hook().unwrap().receive_response_logits()?;
-                        ForwardInputsResult::CausalGeneration { logits: external_logits }
-                    } else {
-                        raw_logits
-                    };
-
-                    let end = Instant::now();
-                    exec_duration += end.duration_since(start);
-
-                    for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
-                        if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
-                            raw_out_logits[seq_idx][i] =
-                                Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
-                        } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
-                            embedding_logits[seq_idx] =
-                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
-                        } else {
-                            logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
-                        }
-                    }
-                }
-
-                if raw_out_logits[0][0].is_some() {
-                    let start = Instant::now();
-                    response::send_raw_responses(
-                        input_seqs,
-                        raw_out_logits
-                            .into_iter()
-                            .map(|raw| raw.into_iter().flatten().collect::<Vec<_>>())
-                            .collect(),
-                    )
-                    .await?;
-                    let end = Instant::now();
-                    exec_duration += end.duration_since(start);
-
-                    return Ok(exec_duration);
-                }
-                if embedding_logits[0].is_some() {
-                    let start = Instant::now();
-                    response::send_embedding_responses(
-                        input_seqs,
-                        embedding_logits
-                            .into_iter()
-                            .map(|raw| {
-                                raw.unwrap()
-                                    .to_dtype(DType::F32)
-                                    .unwrap()
-                                    .to_vec1::<f32>()
-                                    .unwrap()
-                            })
-                            .collect(),
-                    )
-                    .await?;
-                    let end = Instant::now();
-                    exec_duration += end.duration_since(start);
-
-                    return Ok(exec_duration);
-                }
+                    ).map_err(candle_core::Error::msg)?;
 
                 let start = Instant::now();
-                let logits_on_cpu = logits.len() > 1;
-                let logits = logits
-                    .into_iter()
-                    .map(|l| {
-                        let l = l.expect("Did not get any inputs. This is shocking.");
-                        if logits_on_cpu {
-                            l.to_device(&Device::Cpu)
-                        } else {
-                            Ok(l)
-                        }
-                    })
-                    .collect::<candle_core::Result<Vec<_>>>()?;
+                let result = self.forward_inputs(inputs, return_raw_logits)?;
+                let exec_duration = start.elapsed();
 
-                match &logits[0] {
-                    ForwardInputsResult::RawLogits { .. }
-                    | ForwardInputsResult::Embeddings { .. }
-                    | ForwardInputsResult::Rerank { .. } => unreachable!(),
-                    ForwardInputsResult::CausalGeneration { .. } => {
-                        self.sample_causal_gen(
-                            input_seqs,
-                            logits
-                                .into_iter()
-                                .map(|r| {
-                                    #[allow(irrefutable_let_patterns)]
-                                    let ForwardInputsResult::CausalGeneration { logits } = r
-                                    else {
-                                        unreachable!("All results must have same type")
-                                    };
-                                    logits
-                                })
-                                .collect::<Vec<_>>(),
-                            prefix_cacher,
-                            disable_eos_stop,
-                            rng,
-                        )
-                        .await?;
-                    }
-                    ForwardInputsResult::Image { .. } => {
-                        response::send_image_responses(
-                            input_seqs,
-                            logits
-                                .into_iter()
-                                .map(|r| {
-                                    #[allow(irrefutable_let_patterns)]
-                                    let ForwardInputsResult::Image { images } = r
-                                    else {
-                                        unreachable!("All results must have same type, `Image`")
-                                    };
-                                    images
-                                        .into_iter()
-                                        .next()
-                                        .expect("Must have at least 1 element.")
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                        .await?;
-                    }
-                    ForwardInputsResult::Speech { .. } => {
-                        let rates = logits
-                            .iter()
-                            .map(|r| {
-                                #[allow(irrefutable_let_patterns)]
-                                let ForwardInputsResult::Speech { rates, .. } = r
-                                else {
-                                    unreachable!("All results must have same type, `Speech`")
-                                };
-                                assert_eq!(rates.len(), 1, "Each sequence must have 1 PCM output.");
-                                *rates.first().unwrap()
-                            })
-                            .collect::<Vec<_>>();
-                        let channels = logits
-                            .iter()
-                            .map(|r| {
-                                #[allow(irrefutable_let_patterns)]
-                                let ForwardInputsResult::Speech { channels, .. } = r
-                                else {
-                                    unreachable!("All results must have same type, `Speech`")
-                                };
-                                assert_eq!(
-                                    channels.len(),
-                                    1,
-                                    "Each sequence must have 1 PCM output."
-                                );
-                                *channels.first().unwrap()
-                            })
-                            .collect::<Vec<_>>();
-                        let pcms = logits
-                            .into_iter()
-                            .map(|r| {
-                                #[allow(irrefutable_let_patterns)]
-                                let ForwardInputsResult::Speech { pcms, .. } = r
-                                else {
-                                    unreachable!("All results must have same type, `Speech`")
-                                };
-                                assert_eq!(pcms.len(), 1, "Each sequence must have 1 PCM output.");
-                                pcms.into_iter().nth(0).unwrap()
-                            })
-                            .collect::<Vec<_>>();
-                        response::send_speech_responses(input_seqs, &pcms, &rates, &channels)
-                            .await?;
-                    }
-                }
-                let end = Instant::now();
-                exec_duration += end.duration_since(start);
-
+                self.handle_result(input_seqs, result, seq_indices, prefix_cacher, disable_eos_stop, rng).await?;
                 Ok(exec_duration)
             }
         }
+    }
+
+    /// Handle forward result - index per sequence and dispatch to response handlers.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_result(
+        &self,
+        input_seqs: &mut [&mut Sequence],
+        result: ForwardInputsResult,
+        seq_indices: Vec<usize>,
+        prefix_cacher: &mut PrefixCacheManagerV2,
+        disable_eos_stop: bool,
+        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+    ) -> Result<(), candle_core::Error> {
+        match result {
+            ForwardInputsResult::RawLogits { logits } => {
+                let raw_logits: Vec<Vec<Tensor>> = seq_indices
+                    .into_iter()
+                    .map(|idx| vec![logits.i(idx).unwrap().to_device(&Device::Cpu).unwrap()])
+                    .collect();
+                response::send_raw_responses(input_seqs, raw_logits).await?;
+            }
+            ForwardInputsResult::Embeddings { embeddings } => {
+                let emb_list: Vec<Vec<f32>> = seq_indices
+                    .into_iter()
+                    .map(|idx| {
+                        embeddings.i(idx).unwrap()
+                            .to_dtype(DType::F32).unwrap()
+                            .to_vec1().unwrap()
+                    })
+                    .collect();
+                response::send_embedding_responses(input_seqs, emb_list).await?;
+            }
+            ForwardInputsResult::CausalGeneration { logits } => {
+                let logits_list: Vec<Tensor> = seq_indices
+                    .into_iter()
+                    .map(|idx| logits.i(idx).unwrap())
+                    .collect();
+                self.sample_causal_gen(input_seqs, logits_list, prefix_cacher, disable_eos_stop, rng).await?;
+            }
+            ForwardInputsResult::Image { images } => {
+                let img_list: Vec<DynamicImage> = seq_indices
+                    .into_iter()
+                    .map(|idx| images[idx].clone())
+                    .collect();
+                response::send_image_responses(input_seqs, img_list).await?;
+            }
+            ForwardInputsResult::Speech { pcms, rates, channels } => {
+                let (p, r, c): (Vec<_>, Vec<_>, Vec<_>) = seq_indices
+                    .into_iter()
+                    .map(|idx| (pcms[idx].clone(), rates[idx], channels[idx]))
+                    .fold((vec![], vec![], vec![]), |(mut p, mut r, mut c), (pcm, rate, ch)| {
+                        p.push(pcm); r.push(rate); c.push(ch);
+                        (p, r, c)
+                    });
+                response::send_speech_responses(input_seqs, &p, &r, &c).await?;
+            }
+            ForwardInputsResult::Rerank { .. } => {
+                candle_core::bail!("Rerank not supported in step()")
+            }
+        }
+        Ok(())
     }
 
     async fn sample_causal_gen(

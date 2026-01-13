@@ -568,6 +568,7 @@ fn new_dummy_seq(
         prompt,
         0,
         0,
+        uuid::Uuid::now_v7(), // Dummy request_id for testing
         1,
         dummy_sender,
         dummy_sampler,
@@ -592,6 +593,5 @@ fn new_dummy_seq(
         None,
         false,
         eos_toks,
-        None, // pipeline_continue_op_id
     )
 }
