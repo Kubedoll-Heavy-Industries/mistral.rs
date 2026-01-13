@@ -61,35 +61,16 @@ impl MultiModel {
     /// Send a chat request to a specific model.
     pub async fn send_chat_request_to_model(
         &self,
-        mut request: impl crate::RequestLike,
+        request: crate::Chat,
         model_id: Option<&str>,
     ) -> anyhow::Result<ChatCompletionResponse> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-        let (tools, tool_choice) = if let Some((a, b)) = request.take_tools() {
-            (Some(a), Some(b))
-        } else {
-            (None, None)
-        };
-        let truncate_sequence = request.truncate_sequence();
-
         let request = Request::Normal(Box::new(NormalRequest {
-            messages: request.take_messages(),
-            sampling_params: request.take_sampling_params(),
-            response: tx,
-            return_logprobs: request.return_logprobs(),
-            is_streaming: false,
             id: uuid::Uuid::nil(),
-            constraint: request.take_constraint(),
-            suffix: None,
-            tools,
-            tool_choice,
-            logits_processors: request.take_logits_processors(),
-            return_raw_logits: false,
-            web_search_options: request.take_web_search_options(),
+            input: request.into_inference_input(false),
+            response: tx,
             model_id: model_id.map(|s| s.to_string()),
-            truncate_sequence,
-            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(model_id)?.send(request).await?;

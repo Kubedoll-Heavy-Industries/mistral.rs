@@ -7,21 +7,111 @@ use indexmap::IndexMap;
 use serde_json::{json, Value};
 
 /// A type which can be used as a chat request.
-pub trait RequestLike {
-    fn messages_ref(&self) -> &[IndexMap<String, MessageContent>];
-    fn images_ref(&self) -> &[DynamicImage];
-    fn take_messages(&mut self) -> RequestMessage;
-    fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>>;
-    fn take_adapters(&mut self) -> Option<Vec<String>>;
-    fn return_logprobs(&self) -> bool;
-    fn enable_search(&self) -> Option<bool>;
-    fn take_constraint(&mut self) -> Constraint;
-    fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)>;
-    fn take_sampling_params(&mut self) -> SamplingParams;
-    fn take_web_search_options(&mut self) -> Option<WebSearchOptions>;
-    fn truncate_sequence(&self) -> bool {
-        false
+pub struct Chat {
+    pub messages: Vec<IndexMap<String, MessageContent>>,
+    pub attachments: ChatAttachments,
+    pub controls: ChatControls,
+    pub sampling_params: SamplingParams,
+    pub constraint: Constraint,
+    pub logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
+    pub return_logprobs: bool,
+    pub return_raw_logits: bool,
+    pub truncate_sequence: bool,
+}
+
+impl Chat {
+    pub fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            attachments: ChatAttachments::default(),
+            controls: ChatControls::default(),
+            sampling_params: SamplingParams::deterministic(),
+            constraint: Constraint::None,
+            logits_processors: None,
+            return_logprobs: false,
+            return_raw_logits: false,
+            truncate_sequence: false,
+        }
     }
+
+    pub fn with_truncate_sequence(mut self, truncate_sequence: bool) -> Self {
+        self.truncate_sequence = truncate_sequence;
+        self
+    }
+
+    pub fn into_inference_input(self, is_streaming: bool) -> InferenceInput {
+        let Chat {
+            messages,
+            attachments,
+            controls,
+            sampling_params,
+            constraint,
+            logits_processors,
+            return_logprobs,
+            return_raw_logits,
+            truncate_sequence,
+        } = self;
+
+        let thinking =
+            ThinkingMode::from_options(controls.enable_thinking, controls.reasoning_effort);
+
+        let mut op_attachments = Vec::new();
+        for image in attachments.images {
+            op_attachments.push(ChatAttachment::Image(image));
+        }
+        for audio in attachments.audios {
+            op_attachments.push(ChatAttachment::Audio(audio));
+        }
+
+        let op = InferenceOperation::Chat {
+            messages,
+            attachments: op_attachments,
+            thinking,
+            sampling_params,
+            return_logprobs,
+            constraint,
+            tools: controls.tools,
+            tool_choice: controls.tool_choice,
+            logits_processors,
+            return_raw_logits,
+            web_search_options: controls.web_search_options,
+        };
+
+        InferenceInput {
+            op,
+            exec: InferenceExec {
+                is_streaming,
+                truncate_sequence,
+            },
+        }
+    }
+}
+
+impl Default for Chat {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatAttachments {
+    pub images: Vec<DynamicImage>,
+    pub audios: Vec<AudioInput>,
+}
+
+impl ChatAttachments {
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.audios.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChatControls {
+    pub tools: Option<Vec<Tool>>,
+    pub tool_choice: Option<ToolChoice>,
+    pub web_search_options: Option<WebSearchOptions>,
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,45 +186,22 @@ impl TextMessages {
     }
 }
 
-impl RequestLike for TextMessages {
-    fn messages_ref(&self) -> &[IndexMap<String, MessageContent>] {
-        &self.messages
-    }
-    fn images_ref(&self) -> &[DynamicImage] {
-        &[]
-    }
-    fn take_messages(&mut self) -> RequestMessage {
-        let mut other = Vec::new();
-        std::mem::swap(&mut other, &mut self.messages);
-        RequestMessage::Chat {
-            messages: other,
-            enable_thinking: self.enable_thinking,
-            reasoning_effort: None,
+impl From<TextMessages> for Chat {
+    fn from(value: TextMessages) -> Self {
+        Chat {
+            messages: value.messages,
+            attachments: ChatAttachments::default(),
+            controls: ChatControls {
+                enable_thinking: value.enable_thinking,
+                ..ChatControls::default()
+            },
+            sampling_params: SamplingParams::deterministic(),
+            constraint: Constraint::None,
+            logits_processors: None,
+            return_logprobs: false,
+            return_raw_logits: false,
+            truncate_sequence: false,
         }
-    }
-    fn enable_search(&self) -> Option<bool> {
-        None
-    }
-    fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {
-        None
-    }
-    fn take_adapters(&mut self) -> Option<Vec<String>> {
-        None
-    }
-    fn return_logprobs(&self) -> bool {
-        false
-    }
-    fn take_constraint(&mut self) -> Constraint {
-        Constraint::None
-    }
-    fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)> {
-        None
-    }
-    fn take_sampling_params(&mut self) -> SamplingParams {
-        SamplingParams::deterministic()
-    }
-    fn take_web_search_options(&mut self) -> Option<WebSearchOptions> {
-        None
     }
 }
 
@@ -279,51 +346,25 @@ impl VisionMessages {
     }
 }
 
-impl RequestLike for VisionMessages {
-    fn messages_ref(&self) -> &[IndexMap<String, MessageContent>] {
-        &self.messages
-    }
-    fn images_ref(&self) -> &[DynamicImage] {
-        &self.images
-    }
-    fn take_messages(&mut self) -> RequestMessage {
-        let mut other_messages = Vec::new();
-        std::mem::swap(&mut other_messages, &mut self.messages);
-        let mut other_images = Vec::new();
-        std::mem::swap(&mut other_images, &mut self.images);
-        let mut other_audios = Vec::new();
-        std::mem::swap(&mut other_audios, &mut self.audios);
-        RequestMessage::VisionChat {
-            images: other_images,
-            messages: other_messages,
-            audios: other_audios,
-            enable_thinking: self.enable_thinking,
-            reasoning_effort: None,
+impl From<VisionMessages> for Chat {
+    fn from(value: VisionMessages) -> Self {
+        Chat {
+            messages: value.messages,
+            attachments: ChatAttachments {
+                images: value.images,
+                audios: value.audios,
+            },
+            controls: ChatControls {
+                enable_thinking: value.enable_thinking,
+                ..ChatControls::default()
+            },
+            sampling_params: SamplingParams::deterministic(),
+            constraint: Constraint::None,
+            logits_processors: None,
+            return_logprobs: false,
+            return_raw_logits: false,
+            truncate_sequence: false,
         }
-    }
-    fn enable_search(&self) -> Option<bool> {
-        None
-    }
-    fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {
-        None
-    }
-    fn take_adapters(&mut self) -> Option<Vec<String>> {
-        None
-    }
-    fn return_logprobs(&self) -> bool {
-        false
-    }
-    fn take_constraint(&mut self) -> Constraint {
-        Constraint::None
-    }
-    fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)> {
-        None
-    }
-    fn take_sampling_params(&mut self) -> SamplingParams {
-        SamplingParams::deterministic()
-    }
-    fn take_web_search_options(&mut self) -> Option<WebSearchOptions> {
-        None
     }
 }
 
@@ -694,101 +735,44 @@ impl RequestBuilder {
     }
 }
 
-impl RequestLike for RequestBuilder {
-    fn messages_ref(&self) -> &[IndexMap<String, MessageContent>] {
-        &self.messages
-    }
+impl From<RequestBuilder> for Chat {
+    fn from(value: RequestBuilder) -> Self {
+        let tools = if value.tools.is_empty() {
+            None
+        } else {
+            Some(value.tools)
+        };
 
-    fn images_ref(&self) -> &[DynamicImage] {
-        &self.images
-    }
+        let tool_choice = if tools.is_some() {
+            Some(value.tool_choice)
+        } else {
+            None
+        };
 
-    fn take_messages(&mut self) -> RequestMessage {
-        if self.images.is_empty() && self.audios.is_empty() {
-            let mut other = Vec::new();
-            std::mem::swap(&mut other, &mut self.messages);
-            RequestMessage::Chat {
-                messages: other,
-                enable_thinking: self.enable_thinking,
+        Chat {
+            messages: value.messages,
+            attachments: ChatAttachments {
+                images: value.images,
+                audios: value.audios,
+            },
+            controls: ChatControls {
+                tools,
+                tool_choice,
+                web_search_options: value.web_search_options,
+                enable_thinking: value.enable_thinking,
                 reasoning_effort: None,
-            }
-        } else {
-            let mut other_messages = Vec::new();
-            std::mem::swap(&mut other_messages, &mut self.messages);
-            let mut other_images = Vec::new();
-            std::mem::swap(&mut other_images, &mut self.images);
-            let mut other_audios = Vec::new();
-            std::mem::swap(&mut other_audios, &mut self.audios);
-            RequestMessage::VisionChat {
-                images: other_images,
-                messages: other_messages,
-                audios: other_audios,
-                enable_thinking: self.enable_thinking,
-                reasoning_effort: None,
-            }
+            },
+            sampling_params: value.sampling_params,
+            constraint: value.constraint,
+            logits_processors: if value.logits_processors.is_empty() {
+                None
+            } else {
+                Some(value.logits_processors)
+            },
+            return_logprobs: value.return_logprobs,
+            return_raw_logits: false,
+            truncate_sequence: value.truncate_sequence,
         }
-    }
-
-    fn enable_search(&self) -> Option<bool> {
-        self.web_search_options.as_ref().map(|_| true)
-    }
-
-    fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {
-        if self.logits_processors.is_empty() {
-            None
-        } else {
-            let mut other = Vec::new();
-            std::mem::swap(&mut other, &mut self.logits_processors);
-            Some(other)
-        }
-    }
-
-    fn take_adapters(&mut self) -> Option<Vec<String>> {
-        if self.adapters.is_empty() {
-            None
-        } else {
-            let mut other = Vec::new();
-            std::mem::swap(&mut other, &mut self.adapters);
-            Some(other)
-        }
-    }
-
-    fn return_logprobs(&self) -> bool {
-        self.return_logprobs
-    }
-
-    fn take_constraint(&mut self) -> Constraint {
-        let mut other = Constraint::None;
-        std::mem::swap(&mut other, &mut self.constraint);
-        other
-    }
-
-    fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)> {
-        if self.tools.is_empty() {
-            None
-        } else {
-            let mut other_ts = Vec::new();
-            std::mem::swap(&mut other_ts, &mut self.tools);
-            let mut other_tc = ToolChoice::Auto;
-            std::mem::swap(&mut other_tc, &mut self.tool_choice);
-            Some((other_ts, other_tc))
-        }
-    }
-
-    fn take_sampling_params(&mut self) -> SamplingParams {
-        let mut other = SamplingParams::deterministic();
-        std::mem::swap(&mut other, &mut self.sampling_params);
-        other
-    }
-
-    fn take_web_search_options(&mut self) -> Option<WebSearchOptions> {
-        let mut other = None;
-        std::mem::swap(&mut other, &mut self.web_search_options);
-        other
-    }
-
-    fn truncate_sequence(&self) -> bool {
-        self.truncate_sequence
     }
 }
 
@@ -802,10 +786,10 @@ pub enum EmbeddingRequestInput {
 }
 
 impl EmbeddingRequestInput {
-    pub fn into_request_message(self) -> RequestMessage {
+    pub fn into_operation(self) -> mistralrs_core::InferenceOperation {
         match self {
-            Self::Prompt(prompt) => RequestMessage::Embedding { prompt },
-            Self::Tokens(prompt) => RequestMessage::EmbeddingTokens { prompt },
+            Self::Prompt(prompt) => mistralrs_core::InferenceOperation::Embedding { prompt },
+            Self::Tokens(prompt) => mistralrs_core::InferenceOperation::EmbeddingTokens { prompt },
         }
     }
 }

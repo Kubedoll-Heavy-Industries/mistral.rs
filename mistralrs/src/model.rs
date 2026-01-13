@@ -6,7 +6,7 @@ use mistralrs_core::*;
 use std::sync::Arc;
 use tokio::sync::mpsc::{channel, Receiver};
 
-use crate::{EmbeddingRequest, EmbeddingRequestBuilder, RequestLike, TextMessages};
+use crate::{Chat, EmbeddingRequest, EmbeddingRequestBuilder, TextMessages};
 
 /// Gets the best device, cpu, cuda if compiled with CUDA, or Metal
 pub fn best_device(force_cpu: bool) -> Result<Device> {
@@ -64,75 +64,31 @@ impl Model {
         Self { runner }
     }
 
-    /// Generate with the model.
-    pub async fn stream_chat_request<R: RequestLike>(
-        &self,
-        mut request: R,
-    ) -> anyhow::Result<Stream<'_>> {
+    /// Stream a chat request.
+    pub async fn stream_chat_request(&self, request: Chat) -> anyhow::Result<Stream<'_>> {
         let (tx, rx) = channel(1);
 
-        let truncate_sequence = request.truncate_sequence();
-        let (tools, tool_choice) = if let Some((a, b)) = request.take_tools() {
-            (Some(a), Some(b))
-        } else {
-            (None, None)
-        };
         let request = Request::Normal(Box::new(NormalRequest {
-            messages: request.take_messages(),
-            sampling_params: request.take_sampling_params(),
-            response: tx,
-            return_logprobs: request.return_logprobs(),
-            is_streaming: true,
             id: uuid::Uuid::nil(),
-            constraint: request.take_constraint(),
-            suffix: None,
-            tools,
-            tool_choice,
-            logits_processors: request.take_logits_processors(),
-            return_raw_logits: false,
-            web_search_options: request.take_web_search_options(),
+            input: request.into_inference_input(true),
+            response: tx,
             model_id: None,
-            truncate_sequence,
-            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
 
-        let stream = Stream { _server: self, rx };
-
-        Ok(stream)
+        Ok(Stream { _server: self, rx })
     }
 
-    /// Generate with the model.
-    pub async fn send_chat_request<R: RequestLike>(
-        &self,
-        mut request: R,
-    ) -> anyhow::Result<ChatCompletionResponse> {
+    /// Send a chat request (non-streaming).
+    pub async fn send_chat_request(&self, request: Chat) -> anyhow::Result<ChatCompletionResponse> {
         let (tx, mut rx) = channel(1);
 
-        let truncate_sequence = request.truncate_sequence();
-        let (tools, tool_choice) = if let Some((a, b)) = request.take_tools() {
-            (Some(a), Some(b))
-        } else {
-            (None, None)
-        };
         let request = Request::Normal(Box::new(NormalRequest {
-            messages: request.take_messages(),
-            sampling_params: request.take_sampling_params(),
-            response: tx,
-            return_logprobs: request.return_logprobs(),
-            is_streaming: false,
             id: uuid::Uuid::nil(),
-            constraint: request.take_constraint(),
-            suffix: None,
-            tools,
-            tool_choice,
-            logits_processors: request.take_logits_processors(),
-            return_raw_logits: false,
-            web_search_options: request.take_web_search_options(),
+            input: request.into_inference_input(false),
+            response: tx,
             model_id: None,
-            truncate_sequence,
-            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -152,35 +108,19 @@ impl Model {
     /// Generate with the model, returning raw logits of the first token generated.
     ///
     /// Returns the chunks of the logits (1 or more, determined by prompt batchsize) and the tokens.
-    pub async fn send_raw_chat_request<R: RequestLike>(
+    pub async fn send_raw_chat_request(
         &self,
-        mut request: R,
+        mut request: Chat,
     ) -> anyhow::Result<(Vec<Tensor>, Vec<u32>)> {
         let (tx, mut rx) = channel(1);
 
-        let truncate_sequence = request.truncate_sequence();
-        let (tools, tool_choice) = if let Some((a, b)) = request.take_tools() {
-            (Some(a), Some(b))
-        } else {
-            (None, None)
-        };
+        request.return_raw_logits = true;
+
         let request = Request::Normal(Box::new(NormalRequest {
-            messages: request.take_messages(),
-            sampling_params: request.take_sampling_params(),
-            response: tx,
-            return_logprobs: request.return_logprobs(),
-            is_streaming: false,
             id: uuid::Uuid::nil(),
-            constraint: request.take_constraint(),
-            suffix: None,
-            tools,
-            tool_choice,
-            logits_processors: request.take_logits_processors(),
-            return_raw_logits: true,
-            web_search_options: request.take_web_search_options(),
+            input: request.into_inference_input(false),
+            response: tx,
             model_id: None,
-            truncate_sequence,
-            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -210,25 +150,19 @@ impl Model {
 
         let request = Request::Normal(Box::new(NormalRequest {
             id: uuid::Uuid::nil(),
-            messages: RequestMessage::ImageGeneration {
-                prompt: prompt.to_string(),
-                format: response_format,
-                generation_params,
+            input: mistralrs_core::InferenceInput {
+                op: mistralrs_core::InferenceOperation::ImageGeneration {
+                    prompt: prompt.to_string(),
+                    format: response_format,
+                    generation_params,
+                },
+                exec: mistralrs_core::InferenceExec {
+                    is_streaming: false,
+                    truncate_sequence: false,
+                },
             },
-            sampling_params: SamplingParams::deterministic(),
             response: tx,
-            return_logprobs: false,
-            is_streaming: false,
-            suffix: None,
-            constraint: Constraint::None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: None,
             model_id: None,
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -256,23 +190,17 @@ impl Model {
 
         let request = Request::Normal(Box::new(NormalRequest {
             id: uuid::Uuid::nil(),
-            messages: RequestMessage::SpeechGeneration {
-                prompt: prompt.to_string(),
+            input: mistralrs_core::InferenceInput {
+                op: mistralrs_core::InferenceOperation::SpeechGeneration {
+                    prompt: prompt.to_string(),
+                },
+                exec: mistralrs_core::InferenceExec {
+                    is_streaming: false,
+                    truncate_sequence: false,
+                },
             },
-            sampling_params: SamplingParams::deterministic(),
             response: tx,
-            return_logprobs: false,
-            is_streaming: false,
-            suffix: None,
-            constraint: Constraint::None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: None,
             model_id: None,
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
 
         self.runner.get_sender(None)?.send(request).await?;
@@ -310,26 +238,20 @@ impl Model {
         let futures = inputs.into_iter().map(|input| {
             let runner = runner.clone();
             async move {
-                let message = input.into_request_message();
+                let op = input.into_operation();
                 let (tx, mut rx) = channel(1);
 
                 let request = Request::Normal(Box::new(NormalRequest {
                     id: uuid::Uuid::nil(),
-                    messages: message,
-                    sampling_params: SamplingParams::deterministic(),
+                    input: mistralrs_core::InferenceInput {
+                        op,
+                        exec: mistralrs_core::InferenceExec {
+                            is_streaming: false,
+                            truncate_sequence,
+                        },
+                    },
                     response: tx,
-                    return_logprobs: false,
-                    is_streaming: false,
-                    suffix: None,
-                    constraint: Constraint::None,
-                    tool_choice: None,
-                    tools: None,
-                    logits_processors: None,
-                    return_raw_logits: false,
-                    web_search_options: None,
                     model_id: None,
-                    truncate_sequence,
-                    pipeline_continue_op_id: None,
                 }));
 
                 runner
@@ -389,13 +311,17 @@ impl Model {
     ) -> anyhow::Result<Vec<u32>> {
         let (tx, mut rx) = channel(1);
         let request = Request::Tokenize(TokenizationRequest {
-            text: text.map_left(Into::into),
-            tools,
-            add_special_tokens,
-            add_generation_prompt,
+            id: uuid::Uuid::nil(),
+            input: TokenizeInput {
+                text: text.map_left(Into::into),
+                tools,
+                add_generation_prompt,
+                add_special_tokens,
+                enable_thinking,
+                reasoning_effort: None,
+            },
             response: tx,
-            enable_thinking,
-            reasoning_effort: None,
+            model_id: None,
         });
         self.runner.get_sender(None)?.send(request).await?;
 
@@ -410,9 +336,13 @@ impl Model {
     ) -> anyhow::Result<String> {
         let (tx, mut rx) = channel(1);
         let request = Request::Detokenize(DetokenizationRequest {
-            tokens,
-            skip_special_tokens,
+            id: uuid::Uuid::nil(),
+            input: DetokenizeInput {
+                tokens,
+                skip_special_tokens,
+            },
             response: tx,
+            model_id: None,
         });
         self.runner.get_sender(None)?.send(request).await?;
 

@@ -9,7 +9,7 @@ use axum::{
 use base64::{prelude::BASE64_STANDARD, Engine};
 use futures::future::join_all;
 use mistralrs_core::{
-    Constraint, MistralRs, NormalRequest, Request, RequestMessage, Response, SamplingParams,
+    Constraint, MistralRs, NormalRequest, Request, Response, SamplingParams,
 };
 use tokio::sync::mpsc::Receiver;
 
@@ -257,21 +257,15 @@ async fn fetch_embedding(
 
     let request = Request::Normal(Box::new(NormalRequest {
         id: state.next_request_id(),
-        messages: RequestMessage::Embedding { prompt },
-        sampling_params: SamplingParams::deterministic(),
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        suffix: None,
-        constraint: Constraint::None,
-        tool_choice: None,
-        tools: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
         model_id: model_id.map(|m| m.to_string()),
-        truncate_sequence,
-        pipeline_continue_op_id: None,
+        input: mistralrs_core::InferenceInput {
+            op: mistralrs_core::InferenceOperation::Embedding { prompt },
+            exec: mistralrs_core::InferenceExec {
+                is_streaming: false,
+                truncate_sequence,
+            },
+        },
     }));
 
     send_request_with_model(&state, request, model_id)
@@ -291,21 +285,15 @@ async fn fetch_embedding_tokens(
 
     let request = Request::Normal(Box::new(NormalRequest {
         id: state.next_request_id(),
-        messages: RequestMessage::EmbeddingTokens { prompt: tokens },
-        sampling_params: SamplingParams::deterministic(),
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        suffix: None,
-        constraint: Constraint::None,
-        tool_choice: None,
-        tools: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
         model_id: model_id.map(|m| m.to_string()),
-        truncate_sequence,
-        pipeline_continue_op_id: None,
+        input: mistralrs_core::InferenceInput {
+            op: mistralrs_core::InferenceOperation::EmbeddingTokens { prompt: tokens },
+            exec: mistralrs_core::InferenceExec {
+                is_streaming: false,
+                truncate_sequence,
+            },
+        },
     }));
 
     send_request_with_model(&state, request, model_id)

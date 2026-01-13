@@ -9,8 +9,8 @@ use axum::{
     response::IntoResponse,
 };
 use mistralrs_core::{
-    Constraint, DiffusionGenerationParams, ImageGenerationResponse, MistralRs, NormalRequest,
-    Request, RequestMessage, Response, SamplingParams,
+    DiffusionGenerationParams, ImageGenerationResponse, InferenceExec, InferenceInput,
+    InferenceOperation, MistralRs, NormalRequest, Request, Response,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -63,34 +63,28 @@ pub fn parse_request(
     // Validate that the requested model matches the loaded model
     validate_model_name(&oairequest.model, state.clone())?;
 
-    Ok(Request::Normal(Box::new(NormalRequest {
+    Ok(Request::Normal(Box::new(mistralrs_core::NormalRequest {
         id: state.next_request_id(),
-        messages: RequestMessage::ImageGeneration {
-            prompt: oairequest.prompt,
-            format: oairequest.response_format,
-            generation_params: DiffusionGenerationParams {
-                height: oairequest.height,
-                width: oairequest.width,
-            },
-        },
-        sampling_params: SamplingParams::deterministic(),
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        suffix: None,
-        constraint: Constraint::None,
-        tool_choice: None,
-        tools: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
         model_id: if oairequest.model == "default" {
             None
         } else {
-            Some(oairequest.model.clone())
+            Some(oairequest.model)
         },
-        truncate_sequence: false,
-        pipeline_continue_op_id: None,
+        input: InferenceInput {
+            op: InferenceOperation::ImageGeneration {
+                prompt: oairequest.prompt,
+                format: oairequest.response_format,
+                generation_params: DiffusionGenerationParams {
+                    height: oairequest.height,
+                    width: oairequest.width,
+                },
+            },
+            exec: InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
+        },
     })))
 }
 

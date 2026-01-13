@@ -2,10 +2,10 @@ use directories::ProjectDirs;
 use either::Either;
 use indexmap::IndexMap;
 use mistralrs_core::{
-    speech_utils, Constraint, DiffusionGenerationParams, DrySamplingParams,
-    ImageGenerationResponseFormat, MessageContent, MistralRs, ModelCategory, NormalRequest,
-    Request, RequestMessage, Response, ResponseOk, SamplingParams, WebSearchOptions,
-    TERMINATE_ALL_NEXT_STEP,
+    speech_utils, ChatAttachment, Constraint, DiffusionGenerationParams, DrySamplingParams,
+    ImageGenerationResponseFormat, InferenceExec, InferenceInput, InferenceOperation,
+    MessageContent, MistralRs, ModelCategory, NormalRequest, Request, Response, ResponseOk,
+    SamplingParams, ThinkingMode, WebSearchOptions, TERMINATE_ALL_NEXT_STEP,
 };
 use regex::Regex;
 use rustyline::{error::ReadlineError, history::History, DefaultEditor, Editor, Helper};
@@ -314,30 +314,30 @@ async fn text_interactive_mode(
         // Set the handler to terminate all seqs, so allowing cancelling running
         *CTRLC_HANDLER.lock().unwrap() = &terminate_handler;
 
-        let request_messages = RequestMessage::Chat {
-            messages: messages.clone(),
-            enable_thinking,
-            reasoning_effort: None,
-        };
-
         let (tx, mut rx) = channel(10_000);
         let req = Request::Normal(Box::new(NormalRequest {
             id: mistralrs.next_request_id(),
-            messages: request_messages,
-            sampling_params: sampling_params.clone(),
+            input: InferenceInput {
+                op: InferenceOperation::Chat {
+                    messages: messages.clone(),
+                    attachments: Vec::new(),
+                    thinking: enable_thinking.map(ThinkingMode::Bool),
+                    sampling_params: sampling_params.clone(),
+                    return_logprobs: false,
+                    constraint: Constraint::None,
+                    tools: None,
+                    tool_choice: None,
+                    logits_processors: None,
+                    return_raw_logits: false,
+                    web_search_options: do_search.then(WebSearchOptions::default),
+                },
+                exec: InferenceExec {
+                    is_streaming: true,
+                    truncate_sequence: false,
+                },
+            },
             response: tx,
-            return_logprobs: false,
-            is_streaming: true,
-            constraint: Constraint::None,
-            suffix: None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
         sender.send(req).await.unwrap();
         let start_ttft = Instant::now();
@@ -628,32 +628,39 @@ async fn vision_interactive_mode(
         // Set the handler to terminate all seqs, so allowing cancelling running
         *CTRLC_HANDLER.lock().unwrap() = &terminate_handler;
 
-        let request_messages = RequestMessage::VisionChat {
-            images: images.clone(),
-            audios: audios.clone(),
-            messages: messages.clone(),
-            enable_thinking,
-            reasoning_effort: None,
-        };
-
         let (tx, mut rx) = channel(10_000);
         let req = Request::Normal(Box::new(NormalRequest {
             id: mistralrs.next_request_id(),
-            messages: request_messages,
-            sampling_params: sampling_params.clone(),
+            input: InferenceInput {
+                op: {
+                    let mut attachments = Vec::new();
+                    for image in images.clone() {
+                        attachments.push(ChatAttachment::Image(image));
+                    }
+                    for audio in audios.clone() {
+                        attachments.push(ChatAttachment::Audio(audio));
+                    }
+                    InferenceOperation::Chat {
+                        messages: messages.clone(),
+                        attachments,
+                        thinking: enable_thinking.map(ThinkingMode::Bool),
+                        sampling_params: sampling_params.clone(),
+                        return_logprobs: false,
+                        constraint: Constraint::None,
+                        tools: None,
+                        tool_choice: None,
+                        logits_processors: None,
+                        return_raw_logits: false,
+                        web_search_options: do_search.then(WebSearchOptions::default),
+                    }
+                },
+                exec: InferenceExec {
+                    is_streaming: true,
+                    truncate_sequence: false,
+                },
+            },
             response: tx,
-            return_logprobs: false,
-            is_streaming: true,
-            constraint: Constraint::None,
-            suffix: None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
         sender.send(req).await.unwrap();
         let start_ttft = Instant::now();
@@ -807,25 +814,22 @@ async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) 
         let (tx, mut rx) = channel(10_000);
         let req = Request::Normal(Box::new(NormalRequest {
             id: uuid::Uuid::nil(),
-            messages: RequestMessage::ImageGeneration {
-                prompt: prompt.to_string(),
-                format: ImageGenerationResponseFormat::Url,
-                generation_params: diffusion_params.clone(),
+            input: InferenceInput {
+                op: InferenceOperation::ImageGeneration {
+                    prompt: prompt.to_string(),
+                    format: ImageGenerationResponseFormat::Url,
+                    generation_params: DiffusionGenerationParams {
+                        width: 1024,
+                        height: 1024,
+                    },
+                },
+                exec: InferenceExec {
+                    is_streaming: false,
+                    truncate_sequence: false,
+                },
             },
-            sampling_params: SamplingParams::deterministic(),
             response: tx,
-            return_logprobs: false,
-            is_streaming: false,
-            suffix: None,
-            constraint: Constraint::None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
 
         let start = Instant::now();
@@ -899,23 +903,17 @@ async fn speech_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) {
         let (tx, mut rx) = channel(10_000);
         let req = Request::Normal(Box::new(NormalRequest {
             id: uuid::Uuid::nil(),
-            messages: RequestMessage::SpeechGeneration {
-                prompt: prompt.to_string(),
+            input: InferenceInput {
+                op: InferenceOperation::SpeechGeneration {
+                    prompt: prompt.to_string(),
+                },
+                exec: InferenceExec {
+                    is_streaming: false,
+                    truncate_sequence: false,
+                },
             },
-            sampling_params: SamplingParams::deterministic(),
             response: tx,
-            return_logprobs: false,
-            is_streaming: false,
-            suffix: None,
-            constraint: Constraint::None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
 
         let start = Instant::now();

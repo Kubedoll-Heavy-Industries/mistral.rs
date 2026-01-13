@@ -16,7 +16,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use mistralrs_core::{
     ChatCompletionChunkResponse, ChatCompletionResponse, Constraint, MistralRs, NormalRequest,
-    ReasoningEffort, Request, RequestMessage, Response, SamplingParams,
+    ReasoningEffort, Request, Response, SamplingParams,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -39,6 +39,14 @@ use crate::{
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
 };
+
+enum RequestMessage {
+    Chat {
+        messages: Vec<IndexMap<String, mistralrs_core::MessageContent>>,
+        attachments: Vec<mistralrs_core::ChatAttachment>,
+        thinking: Option<mistralrs_core::ThinkingMode>,
+    },
+}
 
 /// A callback function that processes streaming response chunks before they are sent to the client.
 ///
@@ -226,14 +234,24 @@ pub async fn parse_request(
 
     // Parse reasoning effort for Harmony-format models
     let reasoning_effort = parse_reasoning_effort(&oairequest.reasoning_effort);
+    let thinking: Option<mistralrs_core::ThinkingMode> = match (oairequest.enable_thinking, reasoning_effort) {
+        // Prefer the more specific knob at boundary inputs.
+        (_, Some(effort)) => Some(mistralrs_core::ThinkingMode::Effort(effort)),
+        (Some(b), None) => Some(mistralrs_core::ThinkingMode::Bool(b)),
+        (None, None) => None,
+    };
 
     let stop_toks = convert_stop_tokens(oairequest.stop_seqs);
 
     let messages = match oairequest.messages {
         Either::Left(req_messages) => {
             let mut messages = Vec::new();
-            let mut image_urls = Vec::new();
-            let mut audio_urls = Vec::new();
+            enum AttachmentUrl {
+                Image(String),
+                Audio(String),
+            }
+
+            let mut attachment_urls = Vec::new();
             for message in req_messages {
                 let content = match message.content.as_deref() {
                     Some(content) => content.clone(),
@@ -396,21 +414,17 @@ pub async fn parse_request(
                                 _ => None,
                             })
                             .join(" ");
-                        let image_urls_iter = items
-                            .iter()
-                            .filter_map(|item| match item {
-                                ContentPart::Image { image_url } => Some(image_url.clone()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>();
-
-                        let audio_urls_iter = items
-                            .iter()
-                            .filter_map(|item| match item {
-                                ContentPart::Audio { audio_url } => Some(audio_url.clone()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>();
+                        for item in &items {
+                            match item {
+                                ContentPart::Image { image_url } => {
+                                    attachment_urls.push(AttachmentUrl::Image(image_url.clone()))
+                                }
+                                ContentPart::Audio { audio_url } => {
+                                    attachment_urls.push(AttachmentUrl::Audio(audio_url.clone()))
+                                }
+                                ContentPart::Text { .. } => (),
+                            }
+                        }
 
                         let mut message_map: IndexMap<
                             String,
@@ -419,17 +433,21 @@ pub async fn parse_request(
                         message_map.insert("role".to_string(), Either::Left(message.role));
 
                         let mut content_map: Vec<IndexMap<String, Value>> = Vec::new();
-                        for _ in &image_urls_iter {
+                        for item in &items {
+                            if matches!(item, ContentPart::Image { .. }) {
                             let mut content_image_map = IndexMap::new();
                             content_image_map
                                 .insert("type".to_string(), Value::String("image".to_string()));
                             content_map.push(content_image_map);
                         }
-                        for _ in &audio_urls_iter {
+                        }
+                        for item in &items {
+                            if matches!(item, ContentPart::Audio { .. }) {
                             let mut content_audio_map = IndexMap::new();
                             content_audio_map
                                 .insert("type".to_string(), Value::String("audio".to_string()));
                             content_map.push(content_audio_map);
+                        }
                         }
                         {
                             let mut content_text_map = IndexMap::new();
@@ -442,43 +460,31 @@ pub async fn parse_request(
 
                         message_map.insert("content".to_string(), Either::Right(content_map));
                         messages.push(message_map);
-                        image_urls.extend(image_urls_iter);
-                        audio_urls.extend(audio_urls_iter);
                     }
                 }
             }
-            if !image_urls.is_empty() || !audio_urls.is_empty() {
-                // Parse images
-                let mut images = Vec::new();
-                for url_unparsed in image_urls {
-                    let image = parse_image_url(&url_unparsed)
-                        .await
-                        .context(format!("Failed to parse image resource: {url_unparsed}"))?;
-                    images.push(image);
+            let mut attachments = Vec::new();
+            for attachment_url in attachment_urls {
+                match attachment_url {
+                    AttachmentUrl::Image(url_unparsed) => {
+                        let image = parse_image_url(&url_unparsed)
+                            .await
+                            .context(format!("Failed to parse image resource: {url_unparsed}"))?;
+                        attachments.push(mistralrs_core::ChatAttachment::Image(image));
+                    }
+                    AttachmentUrl::Audio(url_unparsed) => {
+                        let audio = parse_audio_url(&url_unparsed)
+                            .await
+                            .context(format!("Failed to parse audio resource: {url_unparsed}"))?;
+                        attachments.push(mistralrs_core::ChatAttachment::Audio(audio));
+                    }
                 }
+            }
 
-                // Parse audios
-                let mut audios = Vec::new();
-                for url_unparsed in audio_urls {
-                    let audio = parse_audio_url(&url_unparsed)
-                        .await
-                        .context(format!("Failed to parse audio resource: {url_unparsed}"))?;
-                    audios.push(audio);
-                }
-
-                RequestMessage::VisionChat {
-                    messages,
-                    images,
-                    audios,
-                    enable_thinking: oairequest.enable_thinking,
-                    reasoning_effort,
-                }
-            } else {
-                RequestMessage::Chat {
-                    messages,
-                    enable_thinking: oairequest.enable_thinking,
-                    reasoning_effort,
-                }
+            RequestMessage::Chat {
+                messages,
+                attachments,
+                thinking,
             }
         }
         Either::Right(prompt) => {
@@ -490,8 +496,8 @@ pub async fn parse_request(
             messages.push(message_map);
             RequestMessage::Chat {
                 messages,
-                enable_thinking: oairequest.enable_thinking,
-                reasoning_effort,
+                attachments: Vec::new(),
+                thinking,
             }
         }
     };
@@ -526,39 +532,51 @@ pub async fn parse_request(
     Ok((
         Request::Normal(Box::new(NormalRequest {
             id: state.next_request_id(),
-            messages,
-            sampling_params: SamplingParams {
-                temperature: oairequest.temperature,
-                top_k: oairequest.top_k,
-                top_p: oairequest.top_p,
-                min_p: oairequest.min_p,
-                top_n_logprobs: oairequest.top_logprobs.unwrap_or(1),
-                frequency_penalty: oairequest.frequency_penalty,
-                presence_penalty: oairequest.presence_penalty,
-                repetition_penalty: oairequest.repetition_penalty,
-                max_len: oairequest.max_tokens,
-                stop_toks,
-                logits_bias: oairequest.logit_bias,
-                n_choices: oairequest.n_choices,
-                dry_params,
-            },
             response: tx,
-            return_logprobs: oairequest.logprobs,
-            is_streaming,
-            suffix: None,
-            constraint,
-            tool_choice: oairequest.tool_choice,
-            tools: oairequest.tools,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: oairequest.web_search_options,
             model_id: if oairequest.model == "default" {
                 None
             } else {
                 Some(oairequest.model.clone())
             },
-            truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
-            pipeline_continue_op_id: None,
+            input: mistralrs_core::InferenceInput {
+                op: match messages {
+                    RequestMessage::Chat {
+                        messages,
+                        attachments,
+                        thinking,
+                    } => mistralrs_core::InferenceOperation::Chat {
+                        messages,
+                        attachments,
+                        thinking,
+                        sampling_params: SamplingParams {
+                            temperature: oairequest.temperature,
+                            top_k: oairequest.top_k,
+                            top_p: oairequest.top_p,
+                            min_p: oairequest.min_p,
+                            top_n_logprobs: oairequest.top_logprobs.unwrap_or(1),
+                            frequency_penalty: oairequest.frequency_penalty,
+                            presence_penalty: oairequest.presence_penalty,
+                            repetition_penalty: oairequest.repetition_penalty,
+                            max_len: oairequest.max_tokens,
+                            stop_toks,
+                            logits_bias: oairequest.logit_bias,
+                            n_choices: oairequest.n_choices,
+                            dry_params,
+                        },
+                        return_logprobs: oairequest.logprobs,
+                        constraint,
+                        tools: oairequest.tools,
+                        tool_choice: oairequest.tool_choice,
+                        logits_processors: None,
+                        return_raw_logits: false,
+                        web_search_options: oairequest.web_search_options,
+                    },
+                },
+                exec: mistralrs_core::InferenceExec {
+                    is_streaming,
+                    truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
+                },
+            },
         })),
         is_streaming,
     ))

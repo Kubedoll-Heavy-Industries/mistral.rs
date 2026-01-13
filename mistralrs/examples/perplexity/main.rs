@@ -5,7 +5,8 @@ use clap::Parser;
 use either::Either;
 use mistralrs::{
     cross_entropy_loss, parse_isq_value, Constraint, DType, Device, MistralRs, NormalRequest,
-    Request, ResponseOk, SamplingParams, Tensor, TextModelBuilder,
+    InferenceExec, InferenceInput, InferenceOperation, Request, ResponseOk, SamplingParams, Tensor,
+    TextModelBuilder,
 };
 use tokio::sync::mpsc::channel;
 
@@ -34,24 +35,29 @@ async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(T
     let (tx, mut rx) = channel(1);
 
     let request = Request::Normal(Box::new(NormalRequest {
-        messages: mistralrs::RequestMessage::CompletionTokens(chunk),
-        sampling_params: SamplingParams {
-            max_len: Some(0),
-            ..SamplingParams::deterministic()
-        },
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
         id: uuid::Uuid::nil(),
-        constraint: Constraint::None,
-        suffix: None,
-        tools: None,
-        tool_choice: None,
-        logits_processors: None,
-        return_raw_logits: true,
-        web_search_options: None,
         model_id: None,
-        truncate_sequence: false,
+        input: InferenceInput {
+            op: InferenceOperation::CompletionTokens {
+                tokens: chunk,
+                sampling_params: SamplingParams {
+                    max_len: Some(0),
+                    ..SamplingParams::deterministic()
+                },
+                return_logprobs: false,
+                constraint: Constraint::None,
+                suffix: None,
+                tools: None,
+                tool_choice: None,
+                logits_processors: None,
+                return_raw_logits: true,
+            },
+            exec: InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
+        },
     }));
 
     runner.get_sender(None)?.send(request).await?;

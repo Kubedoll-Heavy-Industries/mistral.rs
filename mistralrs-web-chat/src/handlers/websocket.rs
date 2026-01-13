@@ -6,7 +6,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use futures_util::stream::StreamExt;
 use mistralrs::{
-    Model, RequestBuilder, TextMessageRole, TextMessages, VisionMessages, WebSearchOptions,
+    Chat, Model, RequestBuilder, TextMessageRole, TextMessages, VisionMessages, WebSearchOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,19 +103,18 @@ pub async fn ws_handler(
 }
 
 /// Generic helper to stream tokens and forward them to the websocket.
-async fn stream_and_forward<Msgs, F, E>(
+async fn stream_and_forward<F, E>(
     model: &Arc<Model>,
-    msgs: Msgs,
+    chat: Chat,
     socket: &mut WebSocket,
     mut on_token: F,
     mut on_end: E,
 ) -> Result<(), anyhow::Error>
 where
-    Msgs: mistralrs::RequestLike + Send + 'static,
     F: FnMut(&str),
     E: FnMut(),
 {
-    match model.stream_chat_request(msgs).await {
+    match model.stream_chat_request(chat).await {
         Ok(mut stream) => {
             let mut assistant_reply = String::new();
             while let Some(chunk) = stream.next().await {
@@ -566,7 +565,7 @@ async fn handle_text_model(
     *streaming = true;
     let stream_res = stream_and_forward(
         model,
-        request_builder,
+        Chat::from(request_builder),
         socket,
         |tok| {
             assistant_content = tok.to_string();
@@ -768,7 +767,7 @@ async fn handle_vision_model(
     let mut assistant_content = String::new();
     let stream_res = stream_and_forward(
         model,
-        request_builder,
+        Chat::from(request_builder),
         socket,
         |tok| {
             assistant_content = tok.to_string();

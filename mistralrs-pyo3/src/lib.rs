@@ -28,9 +28,11 @@ use mistralrs_core::{
     GGUFSpecificConfig, ImageGenerationResponse, ImageGenerationResponseFormat, LlguidanceGrammar,
     Loader, MemoryGpuConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest,
     NormalSpecificConfig, PagedAttentionConfig, PagedCacheType, ReasoningEffort,
-    Request as _Request, RequestMessage, Response, ResponseOk, SamplingParams, SchedulerConfig,
+    InferenceExec, InferenceInput, InferenceOperation, Request as _Request, Response, ResponseOk,
+    SamplingParams, SchedulerConfig,
     SearchEmbeddingModel, SpeculativeConfig, SpeculativeLoader, SpeechLoader, StopTokens,
-    TokenSource, TokenizationRequest, Tool, Topology, VisionLoaderBuilder, VisionSpecificConfig,
+    DetokenizeInput, TokenSource, TokenizationRequest, TokenizeInput, Tool, Topology,
+    VisionLoaderBuilder, VisionSpecificConfig,
 };
 use mistralrs_core::{
     CalledFunction, SearchCallback, SearchFunctionParameters, SearchResult, ToolCallback,
@@ -59,6 +61,29 @@ fn parse_reasoning_effort(effort: &Option<String>) -> Option<ReasoningEffort> {
             "high" => Some(ReasoningEffort::High),
             _ => None,
         })
+}
+
+/// Build SamplingParams from a ChatCompletionRequest.
+fn build_sampling_params(
+    request: &ChatCompletionRequest,
+    stop_toks: Option<StopTokens>,
+    dry_params: Option<DrySamplingParams>,
+) -> SamplingParams {
+    SamplingParams {
+        temperature: request.temperature,
+        top_k: request.top_k,
+        top_p: request.top_p,
+        top_n_logprobs: request.top_logprobs.unwrap_or(1),
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
+        repetition_penalty: request.repetition_penalty,
+        max_len: request.max_tokens,
+        stop_toks,
+        logits_bias: request.logit_bias.clone(),
+        n_choices: request.n_choices,
+        min_p: request.min_p,
+        dry_params,
+    }
 }
 
 static DEVICE: OnceLock<Result<Device>> = OnceLock::new();
@@ -970,9 +995,6 @@ impl Runner {
                 .stop_seqs
                 .as_ref()
                 .map(|x| StopTokens::Seqs(x.to_vec()));
-            let constraint =
-                build_constraint(request.grammar.as_deref(), request.grammar_type.as_deref())?;
-
             let dry_params = if let Some(dry_multiplier) = request.dry_multiplier {
                 Some(DrySamplingParams::new_with_defaults(
                     dry_multiplier,
@@ -983,12 +1005,29 @@ impl Runner {
             } else {
                 None
             };
+            let constraint =
+                build_constraint(request.grammar.as_deref(), request.grammar_type.as_deref())?;
+
+            let tool_choice = request.tool_choice.as_ref().map(|x| match x {
+                ToolChoice::Auto => mistralrs_core::ToolChoice::Auto,
+                ToolChoice::NoTools => mistralrs_core::ToolChoice::None,
+            });
+
+            let tools = if let Some(tools) = &request.tool_schemas {
+                let mut new_tools = Vec::new();
+                for schema in tools {
+                    new_tools.push(serde_json::from_str::<Tool>(schema)?);
+                }
+                Some(new_tools)
+            } else {
+                None
+            };
 
             let messages = match request.messages {
                 Either::Left(ref messages) => {
                     let mut messages_vec = Vec::new();
-                    let mut image_urls = Vec::new();
-                    let mut audio_urls = Vec::new();
+                    let mut image_urls: Vec<String> = Vec::new();
+                    let mut audio_urls: Vec<String> = Vec::new();
                     for message in messages {
                         let role = message["role"].as_ref().left().unwrap().clone();
                         match &message["content"] {
@@ -1113,7 +1152,8 @@ impl Runner {
                                 message_map.insert("role".to_string(), Either::Left(role));
 
                                 let mut content_map: Vec<IndexMap<String, Value>> = Vec::new();
-                                for _ in &image_urls_iter {
+                                for item in &items {
+                                    if matches!(item, ContentPart::Image { .. }) {
                                     let mut content_image_map = IndexMap::new();
                                     content_image_map.insert(
                                         "type".to_string(),
@@ -1121,13 +1161,16 @@ impl Runner {
                                     );
                                     content_map.push(content_image_map);
                                 }
-                                for _ in &audio_urls_iter {
+                                }
+                                for item in &items {
+                                    if matches!(item, ContentPart::Audio { .. }) {
                                     let mut content_audio_map = IndexMap::new();
                                     content_audio_map.insert(
                                         "type".to_string(),
                                         Value::String("audio".to_string()),
                                     );
                                     content_map.push(content_audio_map);
+                                }
                                 }
                                 {
                                     let mut content_text_map = IndexMap::new();
@@ -1149,31 +1192,57 @@ impl Runner {
                         }
                     }
                     if !image_urls.is_empty() || !audio_urls.is_empty() {
-                        let mut images = Vec::new();
+                        // Build ordered heterogeneous attachments.
+                        let mut attachments = Vec::new();
                         for url in image_urls {
                             let url_unparsed = url.trim();
-
                             let image = util::parse_image_url(url_unparsed)?;
-                            images.push(image);
+                            attachments.push(mistralrs_core::ChatAttachment::Image(image));
                         }
-                        let mut audios = Vec::new();
                         for url in audio_urls {
                             let url_unparsed = url.trim();
                             let audio = util::parse_audio_url(url_unparsed)?;
-                            audios.push(audio);
+                            attachments.push(mistralrs_core::ChatAttachment::Audio(audio));
                         }
-                        RequestMessage::VisionChat {
+
+                        let reasoning_effort = parse_reasoning_effort(&request.reasoning_effort);
+                        let thinking = mistralrs_core::ThinkingMode::from_options(
+                            request.enable_thinking,
+                            reasoning_effort,
+                        );
+
+                        InferenceOperation::Chat {
                             messages: messages_vec,
-                            images,
-                            audios,
-                            enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                            attachments,
+                            thinking,
+                            sampling_params: build_sampling_params(&request, stop_toks, dry_params),
+                            return_logprobs: request.logprobs,
+                            constraint: constraint.clone(),
+                            tools: tools.clone(),
+                            tool_choice: tool_choice.clone(),
+                            logits_processors: None,
+                            return_raw_logits: false,
+                            web_search_options: request.web_search_options.clone(),
                         }
                     } else {
-                        RequestMessage::Chat {
+                        let reasoning_effort = parse_reasoning_effort(&request.reasoning_effort);
+                        let thinking = mistralrs_core::ThinkingMode::from_options(
+                            request.enable_thinking,
+                            reasoning_effort,
+                        );
+
+                        InferenceOperation::Chat {
                             messages: messages_vec,
-                            enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                            attachments: Vec::new(),
+                            thinking,
+                            sampling_params: build_sampling_params(&request, stop_toks, dry_params),
+                            return_logprobs: request.logprobs,
+                            constraint: constraint.clone(),
+                            tools: tools.clone(),
+                            tool_choice: tool_choice.clone(),
+                            logits_processors: None,
+                            return_raw_logits: false,
+                            web_search_options: request.web_search_options.clone(),
                         }
                     }
                 }
@@ -1186,60 +1255,38 @@ impl Runner {
                     message_map.insert("role".to_string(), Either::Left("user".to_string()));
                     message_map.insert("content".to_string(), Either::Left(prompt.to_string()));
                     messages.push(message_map);
-                    RequestMessage::Chat {
+                    let reasoning_effort = parse_reasoning_effort(&request.reasoning_effort);
+                    let thinking = mistralrs_core::ThinkingMode::from_options(
+                        request.enable_thinking,
+                        reasoning_effort,
+                    );
+                    InferenceOperation::Chat {
                         messages,
-                        enable_thinking: request.enable_thinking,
-                        reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                        attachments: Vec::new(),
+                        thinking,
+                        sampling_params: build_sampling_params(&request, stop_toks, dry_params),
+                        return_logprobs: request.logprobs,
+                        constraint: constraint.clone(),
+                        tools: tools.clone(),
+                        tool_choice: tool_choice.clone(),
+                        logits_processors: None,
+                        return_raw_logits: false,
+                        web_search_options: request.web_search_options.clone(),
                     }
                 }
             };
 
-            let tool_choice = request.tool_choice.as_ref().map(|x| match x {
-                ToolChoice::Auto => mistralrs_core::ToolChoice::Auto,
-                ToolChoice::NoTools => mistralrs_core::ToolChoice::None,
-            });
-
-            let tools = if let Some(tools) = &request.tool_schemas {
-                let mut new_tools = Vec::new();
-                for schema in tools {
-                    new_tools.push(serde_json::from_str::<Tool>(schema)?);
-                }
-                Some(new_tools)
-            } else {
-                None
-            };
-
             let model_request = _Request::Normal(Box::new(NormalRequest {
                 id: uuid::Uuid::now_v7(),
-                messages,
-                sampling_params: SamplingParams {
-                    temperature: request.temperature,
-                    top_k: request.top_k,
-                    top_p: request.top_p,
-                    top_n_logprobs: request.top_logprobs.unwrap_or(1),
-                    frequency_penalty: request.frequency_penalty,
-                    presence_penalty: request.presence_penalty,
-                    repetition_penalty: request.repetition_penalty,
-                    max_len: request.max_tokens,
-                    stop_toks,
-                    logits_bias: request.logit_bias.clone(),
-                    n_choices: request.n_choices,
-                    min_p: request.min_p,
-                    dry_params,
+                input: InferenceInput {
+                    op: messages,
+                    exec: InferenceExec {
+                        is_streaming: request.stream,
+                        truncate_sequence: request.truncate_sequence,
+                    },
                 },
                 response: tx,
-                return_logprobs: request.logprobs,
-                is_streaming: request.stream,
-                constraint,
-                suffix: None,
-                tool_choice,
-                tools,
-                logits_processors: None,
-                return_raw_logits: false,
-                web_search_options: request.web_search_options.clone(),
                 model_id: model_id.clone(),
-                truncate_sequence: request.truncate_sequence,
-                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
@@ -1299,26 +1346,20 @@ impl Runner {
 
             let mut receivers = Vec::with_capacity(expected);
 
-            let mut enqueue = |message: RequestMessage| -> PyApiResult<()> {
+            let mut enqueue = |op: InferenceOperation| -> PyApiResult<()> {
                 let (tx, rx) = channel(1);
 
                 let model_request = _Request::Normal(Box::new(NormalRequest {
                     id: uuid::Uuid::now_v7(),
-                    messages: message,
-                    sampling_params: SamplingParams::deterministic(),
+                    input: InferenceInput {
+                        op,
+                        exec: InferenceExec {
+                            is_streaming: false,
+                            truncate_sequence,
+                        },
+                    },
                     response: tx,
-                    return_logprobs: false,
-                    is_streaming: false,
-                    constraint: Constraint::None,
-                    suffix: None,
-                    tool_choice: None,
-                    tools: None,
-                    logits_processors: None,
-                    return_raw_logits: false,
-                    web_search_options: None,
                     model_id: model_id.clone(),
-                    truncate_sequence,
-                    pipeline_continue_op_id: None,
                 }));
 
                 sender
@@ -1331,12 +1372,12 @@ impl Runner {
             match inputs {
                 PythonEmbeddingInputs::Prompts(prompts) => {
                     for prompt in prompts {
-                        enqueue(RequestMessage::Embedding { prompt })?;
+                        enqueue(InferenceOperation::Embedding { prompt })?;
                     }
                 }
                 PythonEmbeddingInputs::Tokens(batches) => {
                     for tokens in batches {
-                        enqueue(RequestMessage::EmbeddingTokens { prompt: tokens })?;
+                        enqueue(InferenceOperation::EmbeddingTokens { prompt: tokens })?;
                     }
                 }
             }
@@ -1451,39 +1492,41 @@ impl Runner {
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
                 id: uuid::Uuid::now_v7(),
-                messages: RequestMessage::Completion {
-                    text: request.prompt.clone(),
-                    echo_prompt: request.echo_prompt,
-                    best_of: request.best_of,
-                },
-                sampling_params: SamplingParams {
-                    temperature: request.temperature,
-                    top_k: request.top_k,
-                    top_p: request.top_p,
-                    top_n_logprobs: 1,
-                    frequency_penalty: request.frequency_penalty,
-                    presence_penalty: request.presence_penalty,
-                    repetition_penalty: request.repetition_penalty,
-                    max_len: request.max_tokens,
-                    stop_toks,
-                    logits_bias: request.logit_bias.clone(),
-                    n_choices: request.n_choices,
-                    min_p: request.min_p,
-                    dry_params,
+                input: InferenceInput {
+                    op: InferenceOperation::Completion {
+                        text: request.prompt.clone(),
+                        echo_prompt: request.echo_prompt,
+                        best_of: request.best_of,
+                        sampling_params: SamplingParams {
+                            temperature: request.temperature,
+                            top_k: request.top_k,
+                            top_p: request.top_p,
+                            top_n_logprobs: 1,
+                            frequency_penalty: request.frequency_penalty,
+                            presence_penalty: request.presence_penalty,
+                            repetition_penalty: request.repetition_penalty,
+                            max_len: request.max_tokens,
+                            stop_toks,
+                            logits_bias: request.logit_bias.clone(),
+                            n_choices: request.n_choices,
+                            min_p: request.min_p,
+                            dry_params,
+                        },
+                        return_logprobs: false,
+                        constraint,
+                        suffix: request.suffix.clone(),
+                        tools,
+                        tool_choice,
+                        logits_processors: None,
+                        return_raw_logits: false,
+                    },
+                    exec: InferenceExec {
+                        is_streaming: false,
+                        truncate_sequence: request.truncate_sequence,
+                    },
                 },
                 response: tx,
-                return_logprobs: false,
-                is_streaming: false,
-                constraint,
-                suffix: request.suffix.clone(),
-                tool_choice,
-                tools,
-                logits_processors: None,
-                return_raw_logits: false,
-                web_search_options: None,
                 model_id: model_id.clone(),
-                truncate_sequence: request.truncate_sequence,
-                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
@@ -1530,25 +1573,19 @@ impl Runner {
 
         let request = _Request::Normal(Box::new(NormalRequest {
             id: uuid::Uuid::nil(),
-            messages: RequestMessage::ImageGeneration {
-                prompt: prompt.to_string(),
-                format: response_format,
-                generation_params: DiffusionGenerationParams { height, width },
+            input: InferenceInput {
+                op: InferenceOperation::ImageGeneration {
+                    prompt: prompt.to_string(),
+                    format: response_format,
+                    generation_params: DiffusionGenerationParams { height, width },
+                },
+                exec: InferenceExec {
+                    is_streaming: false,
+                    truncate_sequence: false,
+                },
             },
-            sampling_params: SamplingParams::deterministic(),
             response: tx,
-            return_logprobs: false,
-            is_streaming: false,
-            suffix: None,
-            constraint: Constraint::None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: None,
             model_id: model_id.clone(),
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
 
         let sender = self.runner.get_sender(model_id.as_deref())?;
@@ -1579,21 +1616,15 @@ impl Runner {
 
         let request = _Request::Normal(Box::new(NormalRequest {
             id: uuid::Uuid::nil(),
-            messages: RequestMessage::SpeechGeneration { prompt },
-            sampling_params: SamplingParams::deterministic(),
+            input: InferenceInput {
+                op: InferenceOperation::SpeechGeneration { prompt },
+                exec: InferenceExec {
+                    is_streaming: false,
+                    truncate_sequence: false,
+                },
+            },
             response: tx,
-            return_logprobs: false,
-            is_streaming: false,
-            suffix: None,
-            constraint: Constraint::None,
-            tool_choice: None,
-            tools: None,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: None,
             model_id: model_id.clone(),
-            truncate_sequence: false,
-            pipeline_continue_op_id: None,
         }));
 
         let sender = self.runner.get_sender(model_id.as_deref())?;
@@ -1641,13 +1672,17 @@ impl Runner {
     ) -> PyApiResult<Vec<u32>> {
         let (tx, mut rx) = channel(1);
         let request = _Request::Tokenize(TokenizationRequest {
-            text: Either::Right(text),
-            tools: None,
-            add_generation_prompt: true,
-            add_special_tokens,
+            id: uuid::Uuid::now_v7(),
+            input: TokenizeInput {
+                text: Either::Right(text),
+                tools: None,
+                add_generation_prompt: true,
+                add_special_tokens,
+                enable_thinking,
+                reasoning_effort: None,
+            },
             response: tx,
-            enable_thinking,
-            reasoning_effort: None,
+            model_id: model_id.clone(),
         });
 
         self.runner
@@ -1670,9 +1705,13 @@ impl Runner {
     ) -> PyApiResult<String> {
         let (tx, mut rx) = channel(1);
         let request = _Request::Detokenize(DetokenizationRequest {
-            tokens,
-            skip_special_tokens,
+            id: uuid::Uuid::now_v7(),
+            input: DetokenizeInput {
+                tokens,
+                skip_special_tokens,
+            },
             response: tx,
+            model_id: model_id.clone(),
         });
 
         self.runner
@@ -1724,12 +1763,11 @@ impl Runner {
         let (tx, mut rx) = channel(10_000);
         Python::with_gil(|py| {
             let request = request.bind(py).borrow();
+
             let stop_toks = request
                 .stop_seqs
                 .as_ref()
                 .map(|x| StopTokens::Seqs(x.to_vec()));
-            let constraint =
-                build_constraint(request.grammar.as_deref(), request.grammar_type.as_deref())?;
 
             let dry_params = if let Some(dry_multiplier) = request.dry_multiplier {
                 Some(DrySamplingParams::new_with_defaults(
@@ -1742,11 +1780,30 @@ impl Runner {
                 None
             };
 
-            let messages = match request.messages {
+            let constraint =
+                build_constraint(request.grammar.as_deref(), request.grammar_type.as_deref())?;
+
+            let tool_choice = request.tool_choice.as_ref().map(|x| match x {
+                ToolChoice::Auto => mistralrs_core::ToolChoice::Auto,
+                ToolChoice::NoTools => mistralrs_core::ToolChoice::None,
+            });
+
+            let tools = if let Some(tools) = &request.tool_schemas {
+                let mut new_tools = Vec::new();
+                for schema in tools {
+                    new_tools.push(serde_json::from_str::<Tool>(schema)?);
+                }
+                Some(new_tools)
+            } else {
+                None
+            };
+
+            let op = match request.messages {
                 Either::Left(ref messages) => {
                     let mut messages_vec = Vec::new();
-                    let mut image_urls = Vec::new();
-                    let mut audio_urls = Vec::new();
+                    let mut image_urls: Vec<String> = Vec::new();
+                    let mut audio_urls: Vec<String> = Vec::new();
+
                     for message in messages {
                         let role = message["role"].as_ref().left().unwrap().clone();
                         match &message["content"] {
@@ -1763,9 +1820,6 @@ impl Runner {
                                 messages_vec.push(message_map);
                             }
                             Either::Right(image_messages) => {
-                                // If there is only one message, it is possible a text message
-                                // found when rig is used as client. In this case, we need to check if
-                                // the message is a text message or an image message.
                                 if image_messages.len() == 1 {
                                     if !image_messages[0].contains_key("text") {
                                         return Err(PyApiErr::from(
@@ -1786,6 +1840,7 @@ impl Runner {
                                     messages_vec.push(message_map);
                                     continue;
                                 }
+
                                 if role != "user" {
                                     return Err(PyApiErr::from(
                                         "Role for an image message must be `user`, but it is {role}",
@@ -1804,9 +1859,17 @@ impl Runner {
                                         Some(Either::Left(x)) if x == "text" => {
                                             items.push(ContentPart::Text {
                                                 text: image_message
-                                                    .get("text").as_ref()
-                                                    .context("Text sub-content must have `text` key.")?.as_ref()
-                                                    .left().context("Text sub-content `text` key must be a string.")?.clone(),
+                                                    .get("text")
+                                                    .as_ref()
+                                                    .context(
+                                                        "Text sub-content must have `text` key.",
+                                                    )?
+                                                    .as_ref()
+                                                    .left()
+                                                    .context(
+                                                        "Text sub-content `text` key must be a string.",
+                                                    )?
+                                                    .clone(),
                                             });
                                         }
                                         Some(Either::Left(x)) if x == "image_url" => {
@@ -1814,12 +1877,18 @@ impl Runner {
                                                 image_url: image_message
                                                     .get("image_url")
                                                     .as_ref()
-                                                    .context("Image sub-content must have `image_url` key.")?
+                                                    .context(
+                                                        "Image sub-content must have `image_url` key.",
+                                                    )?
                                                     .as_ref()
                                                     .right()
-                                                    .context("Image sub-content `image_url` key must be an object.")?
+                                                    .context(
+                                                        "Image sub-content `image_url` key must be an object.",
+                                                    )?
                                                     .get("url")
-                                                    .context("Image sub-content `image_url` object must have a `url` key.")?
+                                                    .context(
+                                                        "Image sub-content `image_url` object must have a `url` key.",
+                                                    )?
                                                     .clone(),
                                             });
                                         }
@@ -1828,16 +1897,26 @@ impl Runner {
                                                 audio_url: image_message
                                                     .get("audio_url")
                                                     .as_ref()
-                                                    .context("Audio sub-content must have `audio_url` key.")?
+                                                    .context(
+                                                        "Audio sub-content must have `audio_url` key.",
+                                                    )?
                                                     .as_ref()
                                                     .right()
-                                                    .context("Audio sub-content `audio_url` key must be an object.")?
+                                                    .context(
+                                                        "Audio sub-content `audio_url` key must be an object.",
+                                                    )?
                                                     .get("url")
-                                                    .context("Audio sub-content `audio_url` object must have a `url` key.")?
+                                                    .context(
+                                                        "Audio sub-content `audio_url` object must have a `url` key.",
+                                                    )?
                                                     .clone(),
                                             });
                                         }
-                                        _ => return Err(PyApiErr::from("Expected array content sub-content to be of format {{`type`: `text`, `text`: ...}} and {{`type`: `url`, `image_url`: {{`url`: ...}}}}"))
+                                        _ => {
+                                            return Err(PyApiErr::from(
+                                                "Expected array content sub-content to be of format {{`type`: `text`, `text`: ...}} and {{`type`: `url`, `image_url`: {{`url`: ...}}}}",
+                                            ))
+                                        }
                                     }
                                 }
 
@@ -1893,8 +1972,10 @@ impl Runner {
                                         "type".to_string(),
                                         Value::String("text".to_string()),
                                     );
-                                    content_text_map
-                                        .insert("text".to_string(), Value::String(text_content));
+                                    content_text_map.insert(
+                                        "text".to_string(),
+                                        Value::String(text_content),
+                                    );
                                     content_map.push(content_text_map);
                                 }
 
@@ -1906,33 +1987,35 @@ impl Runner {
                             }
                         }
                     }
-                    if !image_urls.is_empty() || !audio_urls.is_empty() {
-                        let mut images = Vec::new();
-                        for url in image_urls {
-                            let url_unparsed = url.trim();
 
-                            let image = util::parse_image_url(url_unparsed)?;
-                            images.push(image);
-                        }
-                        let mut audios = Vec::new();
-                        for url in audio_urls {
-                            let url_unparsed = url.trim();
-                            let audio = util::parse_audio_url(url_unparsed)?;
-                            audios.push(audio);
-                        }
-                        RequestMessage::VisionChat {
-                            messages: messages_vec,
-                            images,
-                            audios,
-                            enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
-                        }
-                    } else {
-                        RequestMessage::Chat {
-                            messages: messages_vec,
-                            enable_thinking: request.enable_thinking,
-                            reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
-                        }
+                    let mut attachments = Vec::new();
+                    for url in image_urls {
+                        let image = util::parse_image_url(url.trim())?;
+                        attachments.push(mistralrs_core::ChatAttachment::Image(image));
+                    }
+                    for url in audio_urls {
+                        let audio = util::parse_audio_url(url.trim())?;
+                        attachments.push(mistralrs_core::ChatAttachment::Audio(audio));
+                    }
+
+                    let reasoning_effort = parse_reasoning_effort(&request.reasoning_effort);
+                    let thinking = mistralrs_core::ThinkingMode::from_options(
+                        request.enable_thinking,
+                        reasoning_effort,
+                    );
+
+                    InferenceOperation::Chat {
+                        messages: messages_vec,
+                        attachments,
+                        thinking,
+                        sampling_params: build_sampling_params(&request, stop_toks, dry_params),
+                        return_logprobs: request.logprobs,
+                        constraint: constraint.clone(),
+                        tools: tools.clone(),
+                        tool_choice: tool_choice.clone(),
+                        logits_processors: None,
+                        return_raw_logits: false,
+                        web_search_options: request.web_search_options.clone(),
                     }
                 }
                 Either::Right(ref prompt) => {
@@ -1944,60 +2027,40 @@ impl Runner {
                     message_map.insert("role".to_string(), Either::Left("user".to_string()));
                     message_map.insert("content".to_string(), Either::Left(prompt.to_string()));
                     messages.push(message_map);
-                    RequestMessage::Chat {
+
+                    let reasoning_effort = parse_reasoning_effort(&request.reasoning_effort);
+                    let thinking = mistralrs_core::ThinkingMode::from_options(
+                        request.enable_thinking,
+                        reasoning_effort,
+                    );
+
+                    InferenceOperation::Chat {
                         messages,
-                        enable_thinking: request.enable_thinking,
-                        reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
+                        attachments: Vec::new(),
+                        thinking,
+                        sampling_params: build_sampling_params(&request, stop_toks, dry_params),
+                        return_logprobs: request.logprobs,
+                        constraint: constraint.clone(),
+                        tools: tools.clone(),
+                        tool_choice: tool_choice.clone(),
+                        logits_processors: None,
+                        return_raw_logits: false,
+                        web_search_options: request.web_search_options.clone(),
                     }
                 }
             };
 
-            let tool_choice = request.tool_choice.as_ref().map(|x| match x {
-                ToolChoice::Auto => mistralrs_core::ToolChoice::Auto,
-                ToolChoice::NoTools => mistralrs_core::ToolChoice::None,
-            });
-
-            let tools = if let Some(tools) = &request.tool_schemas {
-                let mut new_tools = Vec::new();
-                for schema in tools {
-                    new_tools.push(serde_json::from_str::<Tool>(schema)?);
-                }
-                Some(new_tools)
-            } else {
-                None
-            };
-
             let model_request = _Request::Normal(Box::new(NormalRequest {
                 id: uuid::Uuid::now_v7(),
-                messages,
-                sampling_params: SamplingParams {
-                    temperature: request.temperature,
-                    top_k: request.top_k,
-                    top_p: request.top_p,
-                    top_n_logprobs: request.top_logprobs.unwrap_or(1),
-                    frequency_penalty: request.frequency_penalty,
-                    presence_penalty: request.presence_penalty,
-                    repetition_penalty: request.repetition_penalty,
-                    max_len: request.max_tokens,
-                    stop_toks,
-                    logits_bias: request.logit_bias.clone(),
-                    n_choices: request.n_choices,
-                    min_p: request.min_p,
-                    dry_params,
+                input: InferenceInput {
+                    op,
+                    exec: InferenceExec {
+                        is_streaming: request.stream,
+                        truncate_sequence: request.truncate_sequence,
+                    },
                 },
                 response: tx,
-                return_logprobs: request.logprobs,
-                is_streaming: request.stream,
-                constraint,
-                suffix: None,
-                tool_choice,
-                tools,
-                logits_processors: None,
-                return_raw_logits: false,
-                web_search_options: request.web_search_options.clone(),
                 model_id: Some(model_id.clone()),
-                truncate_sequence: request.truncate_sequence,
-                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
@@ -2073,39 +2136,41 @@ impl Runner {
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
                 id: uuid::Uuid::now_v7(),
-                messages: RequestMessage::Completion {
-                    text: request.prompt.clone(),
-                    echo_prompt: request.echo_prompt,
-                    best_of: request.best_of,
-                },
-                sampling_params: SamplingParams {
-                    temperature: request.temperature,
-                    top_k: request.top_k,
-                    top_p: request.top_p,
-                    top_n_logprobs: 1,
-                    frequency_penalty: request.frequency_penalty,
-                    presence_penalty: request.presence_penalty,
-                    repetition_penalty: request.repetition_penalty,
-                    max_len: request.max_tokens,
-                    stop_toks,
-                    logits_bias: request.logit_bias.clone(),
-                    n_choices: request.n_choices,
-                    min_p: request.min_p,
-                    dry_params,
+                input: InferenceInput {
+                    op: InferenceOperation::Completion {
+                        text: request.prompt.clone(),
+                        echo_prompt: request.echo_prompt,
+                        best_of: request.best_of,
+                        sampling_params: SamplingParams {
+                            temperature: request.temperature,
+                            top_k: request.top_k,
+                            top_p: request.top_p,
+                            top_n_logprobs: 1,
+                            frequency_penalty: request.frequency_penalty,
+                            presence_penalty: request.presence_penalty,
+                            repetition_penalty: request.repetition_penalty,
+                            max_len: request.max_tokens,
+                            stop_toks,
+                            logits_bias: request.logit_bias.clone(),
+                            n_choices: request.n_choices,
+                            min_p: request.min_p,
+                            dry_params,
+                        },
+                        return_logprobs: false,
+                        constraint,
+                        suffix: request.suffix.clone(),
+                        tools,
+                        tool_choice,
+                        logits_processors: None,
+                        return_raw_logits: false,
+                    },
+                    exec: InferenceExec {
+                        is_streaming: false,
+                        truncate_sequence: request.truncate_sequence,
+                    },
                 },
                 response: tx,
-                return_logprobs: false,
-                is_streaming: false,
-                constraint,
-                suffix: request.suffix.clone(),
-                tool_choice,
-                tools,
-                logits_processors: None,
-                return_raw_logits: false,
-                web_search_options: None,
                 model_id: Some(model_id.clone()),
-                truncate_sequence: request.truncate_sequence,
-                pipeline_continue_op_id: None,
             }));
 
             MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
