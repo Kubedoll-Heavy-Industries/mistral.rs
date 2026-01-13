@@ -388,6 +388,8 @@ pub struct Sequence {
     prompt_len: usize,
     max_len: Option<usize>,
     timestamp: u128,
+    /// UUID7 request ID for distributed tracing and pipeline parallelism correlation
+    request_id: uuid::Uuid,
     sampler: Arc<Sampler>,
     stop_tokens: Vec<u32>,
     stop_strings: Vec<String>,
@@ -466,10 +468,6 @@ pub struct Sequence {
     // Harmony format parsing context (for GPT-OSS models)
     harmony_context: Option<HarmonyContext>,
 
-    /// Pipeline parallelism op_id for KV cache preservation.
-    /// If Some, this request is part of a pipeline continuation and the cache
-    /// should NOT be reset if this op_id has already done its first forward.
-    pipeline_continue_op_id: Option<uuid::Uuid>,
 }
 
 impl BlockEngineSequence for Sequence {
@@ -537,6 +535,7 @@ impl Sequence {
         prompt: String,
         id: usize,
         timestamp: u128,
+        request_id: uuid::Uuid,
         layers: usize,
         responder: Sender<Response>,
         sampler: Sampler,
@@ -565,8 +564,6 @@ impl Sequence {
         //
         return_raw_logits: bool,
         eos_tokens: Vec<u32>,
-        // Pipeline parallelism
-        pipeline_continue_op_id: Option<uuid::Uuid>,
     ) -> Self {
         let prompt_len = tokens.len();
         let mut custom_metadata = if let Some(block_size) = block_size {
@@ -587,6 +584,7 @@ impl Sequence {
             prompt_len,
             id,
             timestamp,
+            request_id,
             state: RwLock::new(SequenceState::Waiting),
             normal_cache: vec![None; layers],
             normal_draft_cache: vec![None; layers],
@@ -642,7 +640,6 @@ impl Sequence {
             total_prompt_time: None,
             waitlisted_count: 0,
             harmony_context: None,
-            pipeline_continue_op_id,
         }
     }
 
@@ -701,31 +698,31 @@ impl Sequence {
         self
     }
 
-    /// This is the number of tokens. If the KV cache is Some, then it will use that.
+    /// This is the number of tokens in the sequence.
     pub fn len(&self) -> usize {
         if let Some(toks) = &self.prefill_prompt_toks {
             return toks.len();
         }
-        if self.is_tmp {
-            return self.tokens.len();
-        }
-        // Use xlora cache first because of non granular
-        if self.xlora_cache.as_ref().is_some_and(|c| c[0].is_some()) {
-            self.xlora_cache.as_ref().unwrap()[0]
-                .as_ref()
-                .unwrap()
-                .0
-                .dims()[2]
-                + 1
-        } else if let Some((_, x)) = &self.cache[0] {
-            x.dims()[2] + 1
-        } else {
-            self.tokens.len()
-        }
+        self.tokens.len()
     }
 
     pub fn id(&self) -> &usize {
         &self.id
+    }
+
+    pub fn request_id(&self) -> uuid::Uuid {
+        self.request_id
+    }
+
+    /// Get sequence position: None during prefill, Some(n) during decode
+    /// where n is the number of tokens generated so far (excluding prompt).
+    pub fn sequence_position(&self) -> Option<usize> {
+        if self.is_prompt() {
+            None
+        } else {
+            // During decode: tokens generated = current length - prompt length
+            Some(self.len().saturating_sub(self.prompt_len))
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -767,11 +764,15 @@ impl Sequence {
             // If chunked prefill is enabled, return only the current chunk
             if let Some(chunk_size) = self.prefill_chunk_size {
                 let start = self.prefill_chunk_offset;
+                if start >= toks.len() {
+                    return toks;
+                }
                 let end = (start + chunk_size).min(toks.len());
                 return &toks[start..end];
             }
             return toks;
         }
+
         &self.tokens
     }
 
@@ -789,13 +790,14 @@ impl Sequence {
         self.prompt = new;
     }
 
-    pub fn token_offset(&self) -> usize {
-        self.token_offset
+    /// Set the prompt length for pipeline continuation.
+    /// Used when the Sequence is created with chunk tokens but needs to track the full prompt length.
+    pub fn set_prompt_len(&mut self, len: usize) {
+        self.prompt_len = len;
     }
 
-    /// Get the pipeline continuation op_id, if this is a pipeline continue request.
-    pub fn pipeline_continue_op_id(&self) -> Option<uuid::Uuid> {
-        self.pipeline_continue_op_id
+    pub fn token_offset(&self) -> usize {
+        self.token_offset
     }
 
     /// Set the token offset for prefix caching.
@@ -865,6 +867,19 @@ impl Sequence {
     /// Set the maximum prefill chunk size for this sequence.
     pub fn set_prefill_chunk_size(&mut self, size: Option<usize>) {
         self.prefill_chunk_size = size;
+    }
+
+    /// Check if this is the final chunk of a chunked prefill sequence.
+    /// Returns true if no chunking is configured, or if the current chunk
+    /// includes the last tokens of the prompt.
+    pub fn is_final_prefill_chunk(&self) -> bool {
+        if let (Some(chunk_size), Some(toks)) = (self.prefill_chunk_size, &self.prefill_prompt_toks) {
+            let start = self.prefill_chunk_offset;
+            let remaining = toks.len().saturating_sub(start);
+            remaining <= chunk_size
+        } else {
+            true  // No chunking or no tokens = always final
+        }
     }
 
     /// Get the prefill prompt tokens if set.
@@ -967,6 +982,32 @@ impl Sequence {
         self.custom_metadata.append_token_to_blocks(tok as usize);
     }
 
+    /// Append raw tokens for pipeline parallelism continuation.
+    /// Unlike `add_token()`, this doesn't update logprobs or completion bytes -
+    /// it just tracks the token for position/length calculation.
+    pub fn append_tokens_for_pp(&mut self, tokens: &[u32]) {
+        for &tok in tokens {
+            self.tokens.push(tok);
+            self.custom_metadata.append_token_to_blocks(tok as usize);
+        }
+    }
+
+    /// Replace tokens for pipeline parallelism continuation.
+    /// Used by Stage 1+ to set just the current chunk's tokens (not accumulate all).
+    /// This allows the forward pass to process only the new chunk while token_offset
+    /// provides the correct RoPE position.
+    ///
+    /// IMPORTANT: Does NOT modify block metadata (paged attention state) because
+    /// KV cache grows incrementally via forward passes. Only replaces the token
+    /// array which controls which tokens are embedded/processed.
+    pub fn set_tokens_for_pp(&mut self, tokens: &[u32]) {
+        // Only replace token array - do NOT touch block metadata
+        // The KV cache (and its block tracking) grows via forward passes,
+        // we just need to control which tokens get processed
+        self.tokens.clear();
+        self.tokens.extend_from_slice(tokens);
+    }
+
     /// Internal api to remove n raw tokens.
     pub(crate) fn remove_tmp_tok(&mut self, n: usize) {
         self.is_tmp = false;
@@ -1011,6 +1052,12 @@ impl Sequence {
 
     pub fn responder(&self) -> Sender<Response> {
         self.responder.clone()
+    }
+
+    /// Update the responder channel for pipeline parallelism.
+    /// Used when reusing a sequence across multiple activations.
+    pub fn set_responder(&mut self, responder: Sender<Response>) {
+        self.responder = responder;
     }
 
     pub fn creation_time(&self) -> u64 {
