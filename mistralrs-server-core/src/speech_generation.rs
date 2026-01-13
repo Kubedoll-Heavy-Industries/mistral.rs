@@ -10,8 +10,7 @@ use axum::{
     response::IntoResponse,
 };
 use mistralrs_core::{
-    speech_utils::{self, Sample},
-    Constraint, MistralRs, NormalRequest, Request, Response, SamplingParams,
+    speech_utils::{self, Sample}, MistralRs, NormalRequest, Request, Response,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 

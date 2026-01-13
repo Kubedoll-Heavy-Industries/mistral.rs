@@ -1199,7 +1199,7 @@ impl Pipeline for NormalPipeline {
         // IMPORTANT: during decode, `input_ids` is typically only the current token (seq_len=1),
         // while pipeline-parallel workers need the full token history to correctly reconstruct
         // sparse KV cache. When available, `input_ids_full` carries the full token sequence.
-        let (tokens, total_layers) = if self.hook.is_some() {
+        let (tokens, _total_layers) = if self.hook.is_some() {
             let tokens_tensor = input_ids_full.as_ref().unwrap_or(&input_ids);
             let tokens = tokens_tensor.flatten_all()?.to_vec1::<u32>()?;
             let total_layers = self.model.config().num_layers;
@@ -1208,7 +1208,7 @@ impl Pipeline for NormalPipeline {
             (vec![], 0) // Dummy values when no hook
         };
 
-        let mut logits = match self.model.is_xlora() {
+        let logits = match self.model.is_xlora() {
             false => {
                 let paged_attn_meta = paged_attn_meta
                     .as_ref()

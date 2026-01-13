@@ -26,9 +26,7 @@
 
 use std::path::PathBuf;
 
-use text_embeddings_backend_core::{
-    Backend, BackendError, Batch, Embeddings, ModelType, Pool, Predictions,
-};
+use text_embeddings_backend_core::{BackendError, Batch, Pool};
 
 #[cfg(feature = "tei-backend")]
 use text_embeddings_backend_candle::CandleBackend;

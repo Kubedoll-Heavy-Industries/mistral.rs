@@ -4,8 +4,6 @@ use mistralrs_audio::AudioInput;
 use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokenizers::Tokenizer;
-
 use crate::{
     pipeline::DiffusionGenerationParams, response::Response, sampler::SamplingParams,
     tools::ToolChoice, CustomLogitsProcessor, Tool,
