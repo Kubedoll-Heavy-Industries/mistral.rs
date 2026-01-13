@@ -86,6 +86,63 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     fn supports_hooks(&self) -> bool {
         false
     }
+
+    // === Building blocks for pipeline-level orchestration ===
+    // These methods enable the pipeline to control which stages execute,
+    // necessary for distributed inference with hooks.
+
+    /// Get input embeddings from token IDs (first stage only).
+    ///
+    /// Returns embeddings tensor [batch, seq_len, hidden_dim].
+    ///
+    /// Default implementation returns error - models must override to support
+    /// pipeline parallelism.
+    fn get_input_embeddings(
+        &self,
+        _input_ids: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "Model does not support get_input_embeddings - pipeline parallelism not implemented".to_string()
+        ))
+    }
+
+    /// Run transformer layers on input activations (all stages).
+    ///
+    /// Takes either embeddings (first stage) or received activations (middle/last stages).
+    /// Returns hidden states tensor [batch, seq_len, hidden_dim].
+    ///
+    /// Default implementation returns error - models must override to support
+    /// pipeline parallelism.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_layers(
+        &self,
+        _input_ids: &Tensor,
+        _x: Tensor,
+        _seqlen_offsets: &[usize],
+        _metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        _flash_params: &FlashParams,
+    ) -> candle_core::Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "Model does not support forward_layers - pipeline parallelism not implemented".to_string()
+        ))
+    }
+
+    /// Apply lm_head to convert hidden states to logits (last stage only).
+    ///
+    /// Takes hidden states [batch, seq_len, hidden_dim].
+    /// Returns logits tensor [batch, vocab_size] (last position extracted).
+    ///
+    /// Default implementation returns error - models must override to support
+    /// pipeline parallelism.
+    fn apply_lm_head(
+        &self,
+        _x: Tensor,
+        _context_lens: Vec<(usize, usize)>,
+    ) -> candle_core::Result<Tensor> {
+        Err(candle_core::Error::Msg(
+            "Model does not support apply_lm_head - pipeline parallelism not implemented".to_string()
+        ))
+    }
 }
 
 /// Metadata for loading a model with ISQ or device mapping.
