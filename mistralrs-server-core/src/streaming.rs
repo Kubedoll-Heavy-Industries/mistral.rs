@@ -1,6 +1,7 @@
 //! SSE streaming utilities.
 
 use std::env;
+use std::time::Instant;
 
 use mistralrs_core::Response;
 use tokio::sync::mpsc::Receiver;
@@ -39,6 +40,10 @@ pub struct BaseStreamer<R, C, D> {
     pub on_chunk: Option<C>,
     /// Optional callback to execute when streaming completes
     pub on_done: Option<D>,
+    /// Time when streaming started (for TTFT calculation)
+    pub start_time: Instant,
+    /// Whether the first token event has been recorded
+    pub first_token_recorded: bool,
 }
 
 /// Generic function to create a SSE streamer with optional callbacks.
@@ -58,6 +63,8 @@ pub(crate) fn base_create_streamer<R, C, D>(
         chunks: Vec::new(),
         on_chunk,
         on_done,
+        start_time: Instant::now(),
+        first_token_recorded: false,
     }
 }
 

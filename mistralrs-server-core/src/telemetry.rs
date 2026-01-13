@@ -135,12 +135,23 @@ macro_rules! llm_span {
             "llm.provider" = "mistral.rs",
             "gen_ai.request.model" = %$model,
             "gen_ai.provider.name" = "mistral.rs",
-            // These will be filled in later with span.record()
+            // Token counts - filled via record_full_usage()
             "llm.token_count.prompt" = tracing::field::Empty,
             "llm.token_count.completion" = tracing::field::Empty,
             "llm.token_count.total" = tracing::field::Empty,
             "gen_ai.usage.input_tokens" = tracing::field::Empty,
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
+            // Sampling parameters - filled via record_sampling_params()
+            "llm.invocation_parameters" = tracing::field::Empty,
+            "gen_ai.request.temperature" = tracing::field::Empty,
+            "gen_ai.request.top_p" = tracing::field::Empty,
+            "gen_ai.request.top_k" = tracing::field::Empty,
+            "gen_ai.request.max_tokens" = tracing::field::Empty,
+            "gen_ai.request.frequency_penalty" = tracing::field::Empty,
+            "gen_ai.request.presence_penalty" = tracing::field::Empty,
+            // Stop reason - filled via record_stop_reason()
+            "llm.stop_reason" = tracing::field::Empty,
+            "gen_ai.response.finish_reason" = tracing::field::Empty,
         )
     };
     ($model:expr, $($field:tt)*) => {
@@ -152,11 +163,23 @@ macro_rules! llm_span {
             "llm.provider" = "mistral.rs",
             "gen_ai.request.model" = %$model,
             "gen_ai.provider.name" = "mistral.rs",
+            // Token counts - filled via record_full_usage()
             "llm.token_count.prompt" = tracing::field::Empty,
             "llm.token_count.completion" = tracing::field::Empty,
             "llm.token_count.total" = tracing::field::Empty,
             "gen_ai.usage.input_tokens" = tracing::field::Empty,
             "gen_ai.usage.output_tokens" = tracing::field::Empty,
+            // Sampling parameters - filled via record_sampling_params()
+            "llm.invocation_parameters" = tracing::field::Empty,
+            "gen_ai.request.temperature" = tracing::field::Empty,
+            "gen_ai.request.top_p" = tracing::field::Empty,
+            "gen_ai.request.top_k" = tracing::field::Empty,
+            "gen_ai.request.max_tokens" = tracing::field::Empty,
+            "gen_ai.request.frequency_penalty" = tracing::field::Empty,
+            "gen_ai.request.presence_penalty" = tracing::field::Empty,
+            // Stop reason - filled via record_stop_reason()
+            "llm.stop_reason" = tracing::field::Empty,
+            "gen_ai.response.finish_reason" = tracing::field::Empty,
             $($field)*
         )
     };
@@ -177,7 +200,7 @@ macro_rules! embedding_span {
     };
 }
 
-/// Record token usage on a span.
+/// Record token usage on a span (basic version for compatibility).
 pub fn record_token_usage(
     span: &tracing::Span,
     prompt_tokens: usize,
@@ -193,6 +216,157 @@ pub fn record_token_usage(
     // OTel GenAI attributes
     span.record("gen_ai.usage.input_tokens", prompt_tokens as i64);
     span.record("gen_ai.usage.output_tokens", completion_tokens as i64);
+}
+
+/// Record full usage metrics from a mistralrs Usage struct.
+///
+/// This records token counts, throughput, and timing metrics.
+pub fn record_full_usage(
+    span: &tracing::Span,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    total_tokens: usize,
+    avg_tok_per_sec: f32,
+    avg_prompt_tok_per_sec: f32,
+    avg_compl_tok_per_sec: f32,
+    total_time_sec: f32,
+    total_prompt_time_sec: f32,
+    total_completion_time_sec: f32,
+) {
+    // OpenInference token attributes
+    span.record("llm.token_count.prompt", prompt_tokens as i64);
+    span.record("llm.token_count.completion", completion_tokens as i64);
+    span.record("llm.token_count.total", total_tokens as i64);
+
+    // OTel GenAI token attributes
+    span.record("gen_ai.usage.input_tokens", prompt_tokens as i64);
+    span.record("gen_ai.usage.output_tokens", completion_tokens as i64);
+
+    // Throughput metrics (tokens per second)
+    span.record(
+        "llm.performance.prompt_throughput_tok_per_sec",
+        avg_prompt_tok_per_sec as f64,
+    );
+    span.record(
+        "llm.performance.completion_throughput_tok_per_sec",
+        avg_compl_tok_per_sec as f64,
+    );
+    span.record(
+        "llm.performance.total_throughput_tok_per_sec",
+        avg_tok_per_sec as f64,
+    );
+
+    // Timing metrics (seconds)
+    span.record("llm.latency.prompt_time_sec", total_prompt_time_sec as f64);
+    span.record(
+        "llm.latency.completion_time_sec",
+        total_completion_time_sec as f64,
+    );
+    span.record("llm.latency.total_time_sec", total_time_sec as f64);
+}
+
+/// Record token usage on an embedding span.
+pub fn record_embedding_token_usage(span: &tracing::Span, total_tokens: usize) {
+    span.record("embedding.token_count.total", total_tokens as i64);
+}
+
+/// Record token usage on a reranker span.
+pub fn record_reranker_token_usage(span: &tracing::Span, total_tokens: usize) {
+    span.record("reranker.token_count.total", total_tokens as i64);
+}
+
+/// Record time-to-first-token (TTFT) as a tracing event.
+///
+/// This emits an info-level event with the TTFT duration, which will be
+/// exported as an OpenTelemetry span event if telemetry is enabled.
+pub fn record_ttft_event(ttft_ms: f64, model_name: &str) {
+    tracing::info!(
+        target: "openinference",
+        ttft_ms = ttft_ms,
+        model = %model_name,
+        "time_to_first_token"
+    );
+}
+
+/// Record sampling parameters on a span.
+///
+/// This records the inference parameters used for generation, following
+/// OpenInference and OTel GenAI semantic conventions.
+pub fn record_sampling_params(
+    span: &tracing::Span,
+    temperature: Option<f64>,
+    top_k: Option<usize>,
+    top_p: Option<f64>,
+    min_p: Option<f64>,
+    max_tokens: Option<usize>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
+) {
+    // Build JSON object for llm.invocation_parameters
+    let mut params = serde_json::Map::new();
+    if let Some(v) = temperature {
+        params.insert("temperature".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = top_k {
+        params.insert("top_k".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = top_p {
+        params.insert("top_p".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = min_p {
+        params.insert("min_p".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = max_tokens {
+        params.insert("max_tokens".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = frequency_penalty {
+        params.insert("frequency_penalty".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = presence_penalty {
+        params.insert("presence_penalty".to_string(), serde_json::Value::from(v));
+    }
+    if let Some(v) = repetition_penalty {
+        params.insert(
+            "repetition_penalty".to_string(),
+            serde_json::Value::from(v),
+        );
+    }
+
+    // Record JSON representation for OpenInference
+    if !params.is_empty() {
+        if let Ok(json) = serde_json::to_string(&serde_json::Value::Object(params)) {
+            span.record("llm.invocation_parameters", json.as_str());
+        }
+    }
+
+    // Record individual OTel GenAI attributes
+    if let Some(v) = temperature {
+        span.record("gen_ai.request.temperature", v);
+    }
+    if let Some(v) = top_p {
+        span.record("gen_ai.request.top_p", v);
+    }
+    if let Some(v) = top_k {
+        span.record("gen_ai.request.top_k", v as i64);
+    }
+    if let Some(v) = max_tokens {
+        span.record("gen_ai.request.max_tokens", v as i64);
+    }
+    if let Some(v) = frequency_penalty {
+        span.record("gen_ai.request.frequency_penalty", v as f64);
+    }
+    if let Some(v) = presence_penalty {
+        span.record("gen_ai.request.presence_penalty", v as f64);
+    }
+}
+
+/// Record the stop reason for a generation.
+///
+/// This records why generation stopped (EOS, length limit, stop token, etc.)
+pub fn record_stop_reason(span: &tracing::Span, reason: &str) {
+    span.record("llm.stop_reason", reason);
+    span.record("gen_ai.response.finish_reason", reason);
 }
 
 /// Record timing metrics on a span.

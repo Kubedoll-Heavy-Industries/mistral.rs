@@ -18,6 +18,7 @@ use mistralrs_core::{
 use crate::{
     handler_core::{create_response_channel, send_request_with_model, ErrorToResponse, JsonError},
     openai::{RerankRequest, RerankResponse, RerankResult, RerankResultDocument, RerankUsage},
+    telemetry::record_reranker_token_usage,
     types::{ExtractedMistralRsState, SharedMistralRsState},
     util::{sanitize_error_message, validate_model_name},
 };
@@ -85,6 +86,15 @@ pub async fn rerank(
     match cross_encoder_rerank(state.clone(), &request, model_override.as_deref()).await {
         Ok(response) => {
             MistralRs::maybe_log_response(state.clone(), &response);
+
+            // Record token usage on the span
+            if let Some(ref usage) = response.usage {
+                record_reranker_token_usage(
+                    &tracing::Span::current(),
+                    usage.total_tokens as usize,
+                );
+            }
+
             RerankResponder::Json(response)
         }
         Err(e) => {

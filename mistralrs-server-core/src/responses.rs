@@ -1,6 +1,6 @@
 //! ## Responses API functionality and route handlers.
 
-use std::{pin::Pin, task::Poll, time::Duration};
+use std::{pin::Pin, task::Poll, time::{Duration, Instant}};
 
 use anyhow::Result;
 use axum::{
@@ -31,6 +31,7 @@ use crate::{
         ResponsesError, ResponsesObject, ResponsesOutput, ResponsesUsage,
     },
     streaming::{get_keep_alive_interval, BaseStreamer, DoneState},
+    telemetry::record_ttft_event,
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::sanitize_error_message,
 };
@@ -80,6 +81,20 @@ impl futures::Stream for ResponsesStreamer {
                     )))
                 }
                 Response::Chunk(chat_chunk) => {
+                    // Record TTFT on first content chunk
+                    if !self.first_token_recorded {
+                        let has_content = chat_chunk.choices.iter().any(|c| {
+                            c.delta.content.is_some()
+                                || c.delta.tool_calls.is_some()
+                                || c.delta.reasoning_content.is_some()
+                        });
+                        if has_content {
+                            let ttft = self.start_time.elapsed();
+                            record_ttft_event(ttft.as_secs_f64() * 1000.0, &chat_chunk.model);
+                            self.first_token_recorded = true;
+                        }
+                    }
+
                     // Convert ChatCompletionChunkResponse to ResponsesChunk
                     let mut delta_outputs = vec![];
 
@@ -406,6 +421,8 @@ pub async fn create_response(
             on_done: None,
             chunks: Vec::new(),
             store_chunks: store,
+            start_time: Instant::now(),
+            first_token_recorded: false,
         };
 
         // Store chunks for later retrieval if requested
