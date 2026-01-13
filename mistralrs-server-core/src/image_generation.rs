@@ -10,7 +10,7 @@ use axum::{
 };
 use mistralrs_core::{
     DiffusionGenerationParams, ImageGenerationResponse, InferenceExec, InferenceInput,
-    InferenceOperation, MistralRs, NormalRequest, Request, Response,
+    InferenceOperation, MistralRs, Request, Response,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 

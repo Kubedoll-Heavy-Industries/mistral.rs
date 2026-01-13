@@ -37,6 +37,7 @@ use candle_core::{Result, Tensor};
 /// - Position information (for RoPE)
 /// - Paged attention metadata
 /// - Any other model-specific runtime state
+#[allow(dead_code)] // Intentional API surface for pipeline parallelism
 pub trait LanguageModel: Send + Sync {
     /// Model-specific state for forward passes.
     /// Computed by the pipeline from Sequence state and passed to forward().

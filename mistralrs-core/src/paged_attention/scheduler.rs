@@ -363,7 +363,7 @@ impl PagedAttentionScheduler {
         // For chunked prefill: sequences with remaining prefill chunks stay in RunningPrompt.
         // Only transition to RunningCompletion when prefill is complete.
         self.running.iter().for_each(|seq| {
-            let mut seq_guard = get_mut_arcmutex!(seq);
+            let seq_guard = get_mut_arcmutex!(seq);
             if seq_guard.has_remaining_prefill() {
                 // Stay in RunningPrompt for next prefill chunk
                 seq_guard.set_state(SequenceState::RunningPrompt);

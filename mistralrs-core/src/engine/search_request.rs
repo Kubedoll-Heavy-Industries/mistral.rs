@@ -231,7 +231,7 @@ async fn do_extraction(
     tool_calls: &ToolCallResponse,
     web_search_options: &WebSearchOptions,
 ) -> NormalRequest {
-    let (messages, _tools, tool_choice, ws_opts) =
+    let (messages, _tools, _tool_choice, _ws_opts) =
         chat_op_fields_mut(&mut second_request.input.op);
 
     // Add assistant call message

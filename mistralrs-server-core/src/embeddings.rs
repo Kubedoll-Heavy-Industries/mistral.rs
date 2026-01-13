@@ -9,7 +9,7 @@ use axum::{
 use base64::{prelude::BASE64_STANDARD, Engine};
 use futures::future::join_all;
 use mistralrs_core::{
-    Constraint, MistralRs, NormalRequest, Request, Response, SamplingParams,
+    MistralRs, NormalRequest, Request, Response,
 };
 use tokio::sync::mpsc::Receiver;
 

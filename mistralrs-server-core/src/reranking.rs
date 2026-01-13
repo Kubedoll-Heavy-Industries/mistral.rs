@@ -12,7 +12,7 @@ use axum::{
     response::IntoResponse,
 };
 use mistralrs_core::{
-    Constraint, MistralRs, NormalRequest, Request, Response, SamplingParams,
+    MistralRs, NormalRequest, Request, Response,
 };
 
 use crate::{
