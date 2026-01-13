@@ -440,6 +440,30 @@ pub async fn sample_and_add_toks(
     for (sampled, seq) in std::iter::zip(sampled_vec, seqs.iter_mut()) {
         let next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let prompt_len = seq.prompt_tokens();
+            let seq_len = seq.len();
+            let is_first_completion_sample = seq_len == prompt_len;
+
+            let decoded = this
+                .tokenizer()
+                .and_then(|t| t.decode(&[next_token.token], false).ok())
+                .unwrap_or_else(|| "<no tokenizer>".to_string());
+
+            if is_first_completion_sample {
+                tracing::debug!(
+                    request_id = %seq.request_id(),
+                    seq_id = %seq.id(),
+                    prompt_len,
+                    seq_len,
+                    token_offset = seq.token_offset(),
+                    token_id = next_token.token,
+                    decoded = %decoded,
+                    "Sampled next token (first completion boundary)"
+                );
+            }
+        }
+
         let metadata = this.get_metadata();
         let eos_tok = if disable_eos_stop {
             None
@@ -465,6 +489,41 @@ pub async fn sample_sequence(
     multiple_sequences: bool,
 ) -> Result<Logprobs> {
     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
+
+    let debug_sampling = tracing::enabled!(tracing::Level::DEBUG)
+        && std::env::var("MISTRALRS_DEBUG_SAMPLING").is_ok_and(|v| v != "0");
+    let prompt_len = seq.prompt_tokens();
+    let seq_len = seq.len();
+    let is_first_completion_sample = seq_len == prompt_len;
+
+    if debug_sampling && is_first_completion_sample {
+        let logit_vec = logits.to_vec1::<f32>()?;
+
+        let mut top_indices: Vec<usize> = (0..logit_vec.len()).collect();
+        top_indices.sort_by(|&a, &b| {
+            logit_vec[b]
+                .partial_cmp(&logit_vec[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let argmax_idx = top_indices.first().copied().unwrap_or(0);
+        let topk = top_indices
+            .into_iter()
+            .take(5)
+            .map(|idx| (idx as u32, logit_vec[idx]))
+            .collect::<Vec<_>>();
+
+        tracing::debug!(
+            request_id = %seq.request_id(),
+            seq_id = %seq.id(),
+            prompt_len,
+            seq_len,
+            token_offset = seq.token_offset(),
+            argmax_token = argmax_idx as u32,
+            ?topk,
+            "Sampling diagnostics (pre-sample)"
+        );
+    }
 
     let sampler = seq.sampler();
     let ctx_clone = seq.get_toks().to_vec();
@@ -553,6 +612,16 @@ pub async fn sample_sequence(
         }
         None => first_lobprobs_response,
     };
+
+    if debug_sampling && is_first_completion_sample {
+        tracing::debug!(
+            request_id = %seq.request_id(),
+            seq_id = %seq.id(),
+            token_id = second_logprobs_response.token,
+            logprob = second_logprobs_response.logprob,
+            "Sampling diagnostics (chosen token)"
+        );
+    }
 
     match seq.recognizer {
         SequenceRecognizer::Llguidance(ref mut llg) => {

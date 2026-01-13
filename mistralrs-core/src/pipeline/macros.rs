@@ -1000,3 +1000,71 @@ macro_rules! pp_get_layer_input {
     }};
 }
 
+/// Invoke pre-layer hook for pipeline parallelism.
+///
+/// This macro handles the common pattern of checking for a hook, calling it,
+/// and replacing the activation tensor if the hook returns a replacement.
+///
+/// # Parameters
+/// * `$self` - The model instance (must have `.hook` and `.total_layers` fields)
+/// * `$activation_var` - The mutable variable holding the activation tensor
+/// * `$global_layer_idx` - The global layer index (accounts for partial layer loading)
+/// * `$tokens_vec` - Reference to token vector for KV cache reconstruction
+/// * `$request_id` - UUID for distributed tracing/correlation
+///
+/// # Example
+/// ```ignore
+/// pp_hook_layer_input!(self, xs, global_layer_idx, tokens_vec, request_id);
+/// ```
+#[doc(hidden)]
+#[macro_export]
+macro_rules! pp_hook_layer_input {
+    ($self:expr, $activation_var:ident, $global_layer_idx:expr, $tokens_vec:expr, $request_id:expr) => {
+        if let Some(ref hook) = $self.hook {
+            if let Some(injected) = hook.call_layer_input(
+                $global_layer_idx,
+                &$activation_var,
+                $self.total_layers,
+                &$tokens_vec,
+                $request_id,
+            )? {
+                $activation_var = injected;
+            }
+        }
+    };
+}
+
+/// Invoke post-layer hook for pipeline parallelism.
+///
+/// This macro handles the common pattern of checking for a hook, calling it,
+/// and replacing the activation tensor if the hook returns a replacement.
+///
+/// # Parameters
+/// * `$self` - The model instance (must have `.hook` and `.total_layers` fields)
+/// * `$activation_var` - The mutable variable holding the activation tensor
+/// * `$global_layer_idx` - The global layer index (accounts for partial layer loading)
+/// * `$tokens_vec` - Reference to token vector for KV cache reconstruction
+/// * `$request_id` - UUID for distributed tracing/correlation
+///
+/// # Example
+/// ```ignore
+/// pp_hook_layer_output!(self, xs, global_layer_idx, tokens_vec, request_id);
+/// ```
+#[doc(hidden)]
+#[macro_export]
+macro_rules! pp_hook_layer_output {
+    ($self:expr, $activation_var:ident, $global_layer_idx:expr, $tokens_vec:expr, $request_id:expr) => {
+        if let Some(ref hook) = $self.hook {
+            if let Some(replacement) = hook.call_layer_output(
+                $global_layer_idx,
+                &$activation_var,
+                $self.total_layers,
+                &$tokens_vec,
+                $request_id,
+            )? {
+                $activation_var = replacement;
+            }
+        }
+    };
+}
+
