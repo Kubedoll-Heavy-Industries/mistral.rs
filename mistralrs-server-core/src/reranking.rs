@@ -12,7 +12,7 @@ use axum::{
     response::IntoResponse,
 };
 use mistralrs_core::{
-    Constraint, MistralRs, NormalRequest, Request, RequestMessage, Response, SamplingParams,
+    Constraint, MistralRs, NormalRequest, Request, Response, SamplingParams,
 };
 
 use crate::{
@@ -110,25 +110,19 @@ async fn cross_encoder_rerank(
 
     let rerank_request = Request::Normal(Box::new(NormalRequest {
         id: state.next_request_id(),
-        messages: RequestMessage::Rerank {
-            query: request.query.clone(),
-            documents: documents.clone(),
-            truncate: true, // Always truncate for safety
-        },
-        sampling_params: SamplingParams::deterministic(),
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        suffix: None,
-        constraint: Constraint::None,
-        tool_choice: None,
-        tools: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
         model_id: model_id.map(|m| m.to_string()),
-        truncate_sequence: false,
-        pipeline_continue_op_id: None,
+        input: mistralrs_core::InferenceInput {
+            op: mistralrs_core::InferenceOperation::Rerank {
+                query: request.query.clone(),
+                documents: documents.clone(),
+                truncate: true,
+            },
+            exec: mistralrs_core::InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
+        },
     }));
 
     send_request_with_model(&state, rerank_request, model_id)

@@ -154,7 +154,7 @@ pub use gguf_lora_model::GgufLoraModelBuilder;
 pub use gguf_xlora_model::GgufXLoraModelBuilder;
 pub use lora_model::LoraModelBuilder;
 pub use messages::{
-    EmbeddingRequest, EmbeddingRequestBuilder, EmbeddingRequestInput, RequestBuilder, RequestLike,
+    Chat, EmbeddingRequest, EmbeddingRequestBuilder, EmbeddingRequestInput, RequestBuilder,
     TextMessageRole, TextMessages, VisionMessages,
 };
 pub use mistralrs_core::{

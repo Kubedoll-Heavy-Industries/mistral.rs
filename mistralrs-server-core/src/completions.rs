@@ -18,7 +18,7 @@ use axum::{
 };
 use mistralrs_core::{
     CompletionChunkResponse, CompletionResponse, Constraint, MistralRs, NormalRequest, Request,
-    RequestMessage, Response, SamplingParams,
+    Response, SamplingParams,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::warn;
@@ -221,49 +221,51 @@ pub fn parse_request(
     Ok((
         Request::Normal(Box::new(NormalRequest {
             id: state.next_request_id(),
-            messages: RequestMessage::Completion {
-                text: oairequest.prompt,
-                echo_prompt: oairequest.echo_prompt,
-                best_of: oairequest.best_of,
-            },
-            sampling_params: SamplingParams {
-                temperature: oairequest.temperature,
-                top_k: oairequest.top_k,
-                top_p: oairequest.top_p,
-                min_p: oairequest.min_p,
-                top_n_logprobs: 1,
-                frequency_penalty: oairequest.frequency_penalty,
-                presence_penalty: oairequest.presence_penalty,
-                repetition_penalty: oairequest.repetition_penalty,
-                max_len: oairequest.max_tokens,
-                stop_toks,
-                logits_bias: oairequest.logit_bias,
-                n_choices: oairequest.n_choices,
-                dry_params,
-            },
             response: tx,
-            return_logprobs: false,
-            is_streaming,
-            suffix: oairequest.suffix,
-            constraint: match oairequest.grammar {
-                Some(Grammar::Regex(regex)) => Constraint::Regex(regex),
-                Some(Grammar::Lark(lark)) => Constraint::Lark(lark),
-                Some(Grammar::JsonSchema(schema)) => Constraint::JsonSchema(schema),
-                Some(Grammar::Llguidance(llguidance)) => Constraint::Llguidance(llguidance),
-                None => Constraint::None,
-            },
-            tool_choice: oairequest.tool_choice,
-            tools: oairequest.tools,
-            logits_processors: None,
-            return_raw_logits: false,
-            web_search_options: None,
             model_id: if oairequest.model == "default" {
                 None
             } else {
                 Some(oairequest.model.clone())
             },
-            truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
-            pipeline_continue_op_id: None,
+            input: mistralrs_core::InferenceInput {
+                op: mistralrs_core::InferenceOperation::Completion {
+                    text: oairequest.prompt,
+                    echo_prompt: oairequest.echo_prompt,
+                    best_of: oairequest.best_of,
+                    sampling_params: SamplingParams {
+                        temperature: oairequest.temperature,
+                        top_k: oairequest.top_k,
+                        top_p: oairequest.top_p,
+                        min_p: oairequest.min_p,
+                        top_n_logprobs: 1,
+                        frequency_penalty: oairequest.frequency_penalty,
+                        presence_penalty: oairequest.presence_penalty,
+                        repetition_penalty: oairequest.repetition_penalty,
+                        max_len: oairequest.max_tokens,
+                        stop_toks,
+                        logits_bias: oairequest.logit_bias,
+                        n_choices: oairequest.n_choices,
+                        dry_params,
+                    },
+                    return_logprobs: false,
+                    constraint: match oairequest.grammar {
+                        Some(Grammar::Regex(regex)) => Constraint::Regex(regex),
+                        Some(Grammar::Lark(lark)) => Constraint::Lark(lark),
+                        Some(Grammar::JsonSchema(schema)) => Constraint::JsonSchema(schema),
+                        Some(Grammar::Llguidance(llguidance)) => Constraint::Llguidance(llguidance),
+                        None => Constraint::None,
+                    },
+                    suffix: oairequest.suffix,
+                    tools: oairequest.tools,
+                    tool_choice: oairequest.tool_choice,
+                    logits_processors: None,
+                    return_raw_logits: false,
+                },
+                exec: mistralrs_core::InferenceExec {
+                    is_streaming,
+                    truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
+                },
+            },
         })),
         is_streaming,
     ))

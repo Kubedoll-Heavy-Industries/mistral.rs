@@ -11,7 +11,7 @@ use axum::{
 };
 use mistralrs_core::{
     speech_utils::{self, Sample},
-    Constraint, MistralRs, NormalRequest, Request, RequestMessage, Response, SamplingParams,
+    Constraint, MistralRs, NormalRequest, Request, Response, SamplingParams,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -63,27 +63,21 @@ pub fn parse_request(
 
     let request = Request::Normal(Box::new(NormalRequest {
         id: state.next_request_id(),
-        messages: RequestMessage::SpeechGeneration {
-            prompt: oairequest.input,
-        },
-        sampling_params: SamplingParams::deterministic(),
         response: tx,
-        return_logprobs: false,
-        is_streaming: false,
-        suffix: None,
-        constraint: Constraint::None,
-        tool_choice: None,
-        tools: None,
-        logits_processors: None,
-        return_raw_logits: false,
-        web_search_options: None,
         model_id: if oairequest.model == "default" {
             None
         } else {
-            Some(oairequest.model.clone())
+            Some(oairequest.model)
         },
-        truncate_sequence: false,
-        pipeline_continue_op_id: None,
+        input: mistralrs_core::InferenceInput {
+            op: mistralrs_core::InferenceOperation::SpeechGeneration {
+                prompt: oairequest.input,
+            },
+            exec: mistralrs_core::InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
+        },
     }));
 
     Ok((request, oairequest.response_format))
