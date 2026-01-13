@@ -22,6 +22,7 @@ use crate::{
         EmbeddingData, EmbeddingEncodingFormat, EmbeddingInput, EmbeddingRequest,
         EmbeddingResponse, EmbeddingUsage, EmbeddingVector,
     },
+    telemetry::record_embedding_token_usage,
     types::{ExtractedMistralRsState, SharedMistralRsState},
     util::{sanitize_error_message, validate_model_name},
 };
@@ -213,6 +214,9 @@ pub async fn embeddings(
     };
 
     MistralRs::maybe_log_response(state.clone(), &response);
+
+    // Record token usage on the span
+    record_embedding_token_usage(&tracing::Span::current(), total_tokens);
 
     EmbeddingResponder::Json(response)
 }

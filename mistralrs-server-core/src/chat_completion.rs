@@ -35,7 +35,7 @@ use crate::{
         ResponseFormat,
     },
     streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
-    telemetry::record_token_usage,
+    telemetry::{record_full_usage, record_sampling_params, record_stop_reason, record_ttft_event},
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
 };
@@ -148,7 +148,21 @@ impl futures::Stream for ChatCompletionStreamer {
                     if response.choices.iter().all(|x| x.finish_reason.is_some()) {
                         self.done_state = DoneState::SendingDone;
                     }
-                    // Done now, just need to send the [DONE]
+
+                    // Record TTFT on first content chunk
+                    if !self.first_token_recorded {
+                        let has_content = response.choices.iter().any(|c| {
+                            c.delta.content.is_some()
+                                || c.delta.tool_calls.is_some()
+                                || c.delta.reasoning_content.is_some()
+                        });
+                        if has_content {
+                            let ttft = self.start_time.elapsed();
+                            record_ttft_event(ttft.as_secs_f64() * 1000.0, &response.model);
+                            self.first_token_recorded = true;
+                        }
+                    }
+
                     MistralRs::maybe_log_response(self.state.clone(), &response);
 
                     if let Some(on_chunk) = &self.on_chunk {
@@ -596,13 +610,37 @@ pub async fn parse_request(
     fields(
         otel.kind = "server",
         llm.model_name = %oairequest.model,
-        openinference.span.kind = "LLM"
+        openinference.span.kind = "LLM",
+        // Sampling parameters - filled via record_sampling_params()
+        llm.invocation_parameters = tracing::field::Empty,
+        gen_ai.request.temperature = tracing::field::Empty,
+        gen_ai.request.top_p = tracing::field::Empty,
+        gen_ai.request.top_k = tracing::field::Empty,
+        gen_ai.request.max_tokens = tracing::field::Empty,
+        gen_ai.request.frequency_penalty = tracing::field::Empty,
+        gen_ai.request.presence_penalty = tracing::field::Empty,
+        // Stop reason - filled when response is received
+        llm.stop_reason = tracing::field::Empty,
+        gen_ai.response.finish_reason = tracing::field::Empty,
     )
 )]
 pub async fn chatcompletions(
     State(state): ExtractedMistralRsState,
     Json(oairequest): Json<ChatCompletionRequest>,
 ) -> ChatCompletionResponder {
+    // Record sampling parameters on the span
+    record_sampling_params(
+        &tracing::Span::current(),
+        oairequest.temperature,
+        oairequest.top_k,
+        oairequest.top_p,
+        oairequest.min_p,
+        oairequest.max_tokens,
+        oairequest.frequency_penalty,
+        oairequest.presence_penalty,
+        oairequest.repetition_penalty,
+    );
+
     let (tx, mut rx) = create_response_channel(None);
 
     // Extract model_id for routing before parsing
@@ -626,13 +664,26 @@ pub async fn chatcompletions(
     } else {
         let response = process_non_streaming_response(&mut rx, state).await;
 
-        // Record token usage on the span for non-streaming responses
+        // Record full usage metrics on the span for non-streaming responses
         if let ChatCompletionResponder::Json(ref json_resp) = response {
-            record_token_usage(
+            let usage = &json_resp.usage;
+            record_full_usage(
                 &tracing::Span::current(),
-                json_resp.usage.prompt_tokens,
-                json_resp.usage.completion_tokens,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                usage.avg_tok_per_sec,
+                usage.avg_prompt_tok_per_sec,
+                usage.avg_compl_tok_per_sec,
+                usage.total_time_sec,
+                usage.total_prompt_time_sec,
+                usage.total_completion_time_sec,
             );
+
+            // Record stop reason from first choice
+            if let Some(choice) = json_resp.choices.first() {
+                record_stop_reason(&tracing::Span::current(), &choice.finish_reason);
+            }
         }
 
         response
