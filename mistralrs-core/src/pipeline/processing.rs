@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 
 use crate::{
     vision_models::{preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig},
+    request::ThinkingMode,
     MessageContent, Pipeline, Tool,
 };
 
@@ -37,7 +38,7 @@ pub trait Processor {
         messages: Vec<IndexMap<String, MessageContent>>,
         add_generation_prompt: bool,
         add_special_tokens: bool,
-        enable_thinking: Option<bool>,
+        thinking: Option<ThinkingMode>,
         tools: Vec<Tool>,
     ) -> Result<(Vec<u32>, String)> {
         // for message in messages.iter_mut() {
@@ -54,7 +55,7 @@ pub trait Processor {
             pipeline,
             messages,
             add_generation_prompt,
-            enable_thinking,
+            thinking,
             self.template_action(),
             tools,
         )?;
@@ -103,10 +104,16 @@ pub(crate) fn apply_chat_template(
     pipeline: &dyn Pipeline,
     messages: Vec<IndexMap<String, MessageContent>>,
     add_generation_prompt: bool,
-    enable_thinking: Option<bool>,
+    thinking: Option<ThinkingMode>,
     action: MessagesAction,
     tools: Vec<Tool>,
 ) -> Result<String> {
+    let (enable_thinking, reasoning_effort) = match thinking {
+        None => (None, None),
+        Some(ThinkingMode::Bool(b)) => (Some(b), None),
+        Some(ThinkingMode::Effort(e)) => (Some(true), Some(e)),
+    };
+
     let messages = match action {
         MessagesAction::Keep => messages,
         MessagesAction::FlattenOnlyText => {
@@ -144,7 +151,7 @@ pub(crate) fn apply_chat_template(
         messages,
         add_generation_prompt,
         enable_thinking,
-        None, // reasoning_effort - passed through from request when needed
+        reasoning_effort,
         template,
         bos_tok,
         eos_tok,
