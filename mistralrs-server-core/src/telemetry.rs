@@ -4,10 +4,31 @@
 //! - OTLP exporter configuration
 //! - Trace context extraction from HTTP headers
 //! - OpenInference span builders for LLM operations
+//!
+//! ## Semantic Conventions
+//!
+//! We follow two overlapping standards:
+//!
+//! ### OpenTelemetry GenAI Semantic Conventions (Official)
+//! - `gen_ai.operation.name` - REQUIRED: "chat", "text_completion", "embeddings"
+//! - `gen_ai.provider.name` - REQUIRED: Provider identifier (e.g., "mistral.rs")
+//! - `gen_ai.request.model` - Model name
+//! - `gen_ai.usage.input_tokens` / `gen_ai.usage.output_tokens` - Token counts
+//! - `gen_ai.response.finish_reasons` - Array of stop reasons
+//! - Native span timing (start/end) - Duration calculated by backends
+//!
+//! ### OpenInference (Arize Phoenix, LangSmith)
+//! - `openinference.span.kind` - REQUIRED: "LLM", "EMBEDDING", "CHAIN", etc.
+//! - `llm.model_name`, `llm.token_count.*`, `llm.invocation_parameters`
+//!
+//! ### Custom Extensions (not in specs)
+//! - `llm.performance.*` - Throughput metrics (tokens/sec)
+//! - `llm.latency.*` - Timing breakdown (prompt, completion)
 
 use opentelemetry::{global, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
+    metrics::SdkMeterProvider,
     propagation::TraceContextPropagator,
     trace::{Sampler, SdkTracerProvider},
     Resource,
@@ -51,49 +72,95 @@ impl Default for TelemetryConfig {
     }
 }
 
-/// Initialize the OpenTelemetry tracer provider with OTLP export.
+/// Telemetry providers returned by [`init_telemetry`].
+///
+/// Holds both tracer and meter providers for proper lifecycle management.
+pub struct TelemetryProviders {
+    /// OpenTelemetry tracer provider for distributed tracing.
+    pub tracer: SdkTracerProvider,
+    /// OpenTelemetry meter provider for metrics.
+    pub meter: SdkMeterProvider,
+}
+
+/// Initialize OpenTelemetry tracer and meter providers with OTLP export.
+///
+/// This sets up:
+/// - Tracer provider for distributed tracing (spans)
+/// - Meter provider for metrics (histograms, counters, gauges)
+/// - W3C trace context propagation
+/// - Global metrics registry from mistralrs-core
 ///
 /// Returns `None` if no OTLP endpoint is configured.
-pub fn init_telemetry(config: &TelemetryConfig) -> Option<SdkTracerProvider> {
+pub fn init_telemetry(config: &TelemetryConfig) -> Option<TelemetryProviders> {
     let endpoint = config.otlp_endpoint.as_ref()?;
 
     // Set up trace context propagation (W3C format)
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    // Build the OTLP exporter
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .with_endpoint(endpoint)
-        .with_timeout(Duration::from_secs(10))
-        .build()
-        .expect("Failed to create OTLP exporter");
-
-    // Build the tracer provider
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_sampler(Sampler::TraceIdRatioBased(config.sampling_ratio))
-        .with_resource(Resource::builder().with_attributes(vec![
+    // Shared resource attributes
+    let resource = Resource::builder()
+        .with_attributes(vec![
             KeyValue::new("service.name", config.service_name.clone()),
             KeyValue::new("service.version", config.service_version.clone()),
             KeyValue::new("telemetry.sdk.language", "rust"),
             KeyValue::new("telemetry.sdk.name", "opentelemetry"),
-        ]).build())
+        ])
         .build();
 
-    global::set_tracer_provider(provider.clone());
+    // Build the OTLP span exporter
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create OTLP span exporter");
+
+    // Build the tracer provider
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
+        .with_sampler(Sampler::TraceIdRatioBased(config.sampling_ratio))
+        .with_resource(resource.clone())
+        .build();
+
+    global::set_tracer_provider(tracer_provider.clone());
+
+    // Build the OTLP metrics exporter
+    let metrics_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create OTLP metrics exporter");
+
+    // Build the meter provider with periodic reader
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(metrics_exporter)
+        .with_resource(resource)
+        .build();
+
+    global::set_meter_provider(meter_provider.clone());
+
+    // Initialize the mistralrs-core metrics registry
+    mistralrs_core::telemetry::init_metrics(&meter_provider);
 
     tracing::info!(
         endpoint = %endpoint,
         service = %config.service_name,
-        "OpenTelemetry OTLP exporter initialized"
+        "OpenTelemetry OTLP exporter initialized (traces + metrics)"
     );
 
-    Some(provider)
+    Some(TelemetryProviders {
+        tracer: tracer_provider,
+        meter: meter_provider,
+    })
 }
 
-/// Shutdown telemetry and flush pending spans.
-pub fn shutdown_telemetry(provider: SdkTracerProvider) {
-    let _ = provider.shutdown();
+/// Shutdown telemetry and flush pending data.
+///
+/// This flushes both traces and metrics before shutting down.
+pub fn shutdown_telemetry(providers: TelemetryProviders) {
+    let _ = providers.meter.shutdown();
+    let _ = providers.tracer.shutdown();
 }
 
 /// Extract trace context from HTTP headers.
@@ -120,87 +187,105 @@ pub fn extract_trace_context(
     propagator.extract(&HeaderExtractor(headers))
 }
 
-/// Create a tracing span with OpenInference LLM attributes.
+/// Create a tracing span with OTel GenAI and OpenInference attributes.
 ///
-/// This is a convenience macro that creates a span with the correct
-/// OpenInference attributes for LLM operations.
+/// This macro creates a span with attributes from both standards for
+/// maximum compatibility with observability backends.
+///
+/// # Arguments
+/// * `$operation` - The operation name: "chat", "text_completion", "embeddings"
+/// * `$model` - The model name/identifier
 #[macro_export]
 macro_rules! llm_span {
-    ($model:expr) => {
+    ($operation:expr, $model:expr) => {
         tracing::info_span!(
             "llm",
-            otel.name = format!("llm {}", $model),
+            // OTel GenAI span naming: "{operation} {model}"
+            otel.name = format!("{} {}", $operation, $model),
+            // OTel GenAI REQUIRED attributes
+            "gen_ai.operation.name" = $operation,
+            "gen_ai.provider.name" = "mistral.rs",
+            "gen_ai.request.model" = %$model,
+            // OpenInference REQUIRED attributes
             "openinference.span.kind" = "LLM",
             "llm.model_name" = %$model,
             "llm.provider" = "mistral.rs",
-            "gen_ai.request.model" = %$model,
-            "gen_ai.provider.name" = "mistral.rs",
-            // Token counts - filled via record_full_usage()
+            // Token counts (OTel GenAI + OpenInference)
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.output_tokens" = tracing::field::Empty,
             "llm.token_count.prompt" = tracing::field::Empty,
             "llm.token_count.completion" = tracing::field::Empty,
             "llm.token_count.total" = tracing::field::Empty,
-            "gen_ai.usage.input_tokens" = tracing::field::Empty,
-            "gen_ai.usage.output_tokens" = tracing::field::Empty,
-            // Sampling parameters - filled via record_sampling_params()
-            "llm.invocation_parameters" = tracing::field::Empty,
+            // Sampling parameters (OTel GenAI + OpenInference)
             "gen_ai.request.temperature" = tracing::field::Empty,
             "gen_ai.request.top_p" = tracing::field::Empty,
             "gen_ai.request.top_k" = tracing::field::Empty,
             "gen_ai.request.max_tokens" = tracing::field::Empty,
             "gen_ai.request.frequency_penalty" = tracing::field::Empty,
             "gen_ai.request.presence_penalty" = tracing::field::Empty,
-            // Stop reason - filled via record_stop_reason()
+            "llm.invocation_parameters" = tracing::field::Empty,
+            // Stop reason (OTel uses array but we record single value)
+            "gen_ai.response.finish_reasons" = tracing::field::Empty,
             "llm.stop_reason" = tracing::field::Empty,
-            "gen_ai.response.finish_reason" = tracing::field::Empty,
         )
     };
-    ($model:expr, $($field:tt)*) => {
+    ($operation:expr, $model:expr, $($field:tt)*) => {
         tracing::info_span!(
             "llm",
-            otel.name = format!("llm {}", $model),
+            otel.name = format!("{} {}", $operation, $model),
+            "gen_ai.operation.name" = $operation,
+            "gen_ai.provider.name" = "mistral.rs",
+            "gen_ai.request.model" = %$model,
             "openinference.span.kind" = "LLM",
             "llm.model_name" = %$model,
             "llm.provider" = "mistral.rs",
-            "gen_ai.request.model" = %$model,
-            "gen_ai.provider.name" = "mistral.rs",
-            // Token counts - filled via record_full_usage()
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
+            "gen_ai.usage.output_tokens" = tracing::field::Empty,
             "llm.token_count.prompt" = tracing::field::Empty,
             "llm.token_count.completion" = tracing::field::Empty,
             "llm.token_count.total" = tracing::field::Empty,
-            "gen_ai.usage.input_tokens" = tracing::field::Empty,
-            "gen_ai.usage.output_tokens" = tracing::field::Empty,
-            // Sampling parameters - filled via record_sampling_params()
-            "llm.invocation_parameters" = tracing::field::Empty,
             "gen_ai.request.temperature" = tracing::field::Empty,
             "gen_ai.request.top_p" = tracing::field::Empty,
             "gen_ai.request.top_k" = tracing::field::Empty,
             "gen_ai.request.max_tokens" = tracing::field::Empty,
             "gen_ai.request.frequency_penalty" = tracing::field::Empty,
             "gen_ai.request.presence_penalty" = tracing::field::Empty,
-            // Stop reason - filled via record_stop_reason()
+            "llm.invocation_parameters" = tracing::field::Empty,
+            "gen_ai.response.finish_reasons" = tracing::field::Empty,
             "llm.stop_reason" = tracing::field::Empty,
-            "gen_ai.response.finish_reason" = tracing::field::Empty,
             $($field)*
         )
     };
 }
 
 /// Create a tracing span for embedding operations.
+///
+/// Follows OTel GenAI and OpenInference semantic conventions.
 #[macro_export]
 macro_rules! embedding_span {
     ($model:expr) => {
         tracing::info_span!(
             "embedding",
-            otel.name = format!("embedding {}", $model),
+            // OTel GenAI span naming: "embeddings {model}"
+            otel.name = format!("embeddings {}", $model),
+            // OTel GenAI REQUIRED attributes
+            "gen_ai.operation.name" = "embeddings",
+            "gen_ai.provider.name" = "mistral.rs",
+            "gen_ai.request.model" = %$model,
+            // OpenInference REQUIRED attributes
             "openinference.span.kind" = "EMBEDDING",
             "embedding.model_name" = %$model,
-            "llm.provider" = "mistral.rs",
+            // Token usage
+            "gen_ai.usage.input_tokens" = tracing::field::Empty,
             "embedding.token_count.total" = tracing::field::Empty,
         )
     };
 }
 
-/// Record token usage on a span (basic version for compatibility).
+/// Record token usage on a span.
+///
+/// Records both OTel GenAI (`gen_ai.usage.*`) and OpenInference (`llm.token_count.*`)
+/// attributes for compatibility with different observability backends.
 pub fn record_token_usage(
     span: &tracing::Span,
     prompt_tokens: usize,
@@ -208,19 +293,25 @@ pub fn record_token_usage(
 ) {
     let total = prompt_tokens + completion_tokens;
 
+    // OTel GenAI attributes (RECOMMENDED)
+    span.record("gen_ai.usage.input_tokens", prompt_tokens as i64);
+    span.record("gen_ai.usage.output_tokens", completion_tokens as i64);
+
     // OpenInference attributes
     span.record("llm.token_count.prompt", prompt_tokens as i64);
     span.record("llm.token_count.completion", completion_tokens as i64);
     span.record("llm.token_count.total", total as i64);
-
-    // OTel GenAI attributes
-    span.record("gen_ai.usage.input_tokens", prompt_tokens as i64);
-    span.record("gen_ai.usage.output_tokens", completion_tokens as i64);
 }
 
 /// Record full usage metrics from a mistralrs Usage struct.
 ///
-/// This records token counts, throughput, and timing metrics.
+/// This records:
+/// - Token counts (OTel GenAI + OpenInference standard)
+/// - Throughput metrics (custom `llm.performance.*` - not in specs)
+/// - Timing breakdown (custom `llm.latency.*` - not in specs)
+///
+/// Note: OTel recommends native span timing for duration. The custom timing
+/// attributes provide additional granularity (prompt vs completion phases).
 pub fn record_full_usage(
     span: &tracing::Span,
     prompt_tokens: usize,
@@ -233,16 +324,17 @@ pub fn record_full_usage(
     total_prompt_time_sec: f32,
     total_completion_time_sec: f32,
 ) {
+    // OTel GenAI token attributes (RECOMMENDED)
+    span.record("gen_ai.usage.input_tokens", prompt_tokens as i64);
+    span.record("gen_ai.usage.output_tokens", completion_tokens as i64);
+
     // OpenInference token attributes
     span.record("llm.token_count.prompt", prompt_tokens as i64);
     span.record("llm.token_count.completion", completion_tokens as i64);
     span.record("llm.token_count.total", total_tokens as i64);
 
-    // OTel GenAI token attributes
-    span.record("gen_ai.usage.input_tokens", prompt_tokens as i64);
-    span.record("gen_ai.usage.output_tokens", completion_tokens as i64);
-
-    // Throughput metrics (tokens per second)
+    // Custom: Throughput metrics (tokens per second)
+    // Not in OTel/OpenInference specs - derived from token counts and timing
     span.record(
         "llm.performance.prompt_throughput_tok_per_sec",
         avg_prompt_tok_per_sec as f64,
@@ -256,7 +348,8 @@ pub fn record_full_usage(
         avg_tok_per_sec as f64,
     );
 
-    // Timing metrics (seconds)
+    // Custom: Timing breakdown (seconds)
+    // OTel uses metrics (gen_ai.server.time_to_first_token histogram) not span attrs
     span.record("llm.latency.prompt_time_sec", total_prompt_time_sec as f64);
     span.record(
         "llm.latency.completion_time_sec",
@@ -266,7 +359,12 @@ pub fn record_full_usage(
 }
 
 /// Record token usage on an embedding span.
+///
+/// Records both OTel GenAI and OpenInference attributes.
 pub fn record_embedding_token_usage(span: &tracing::Span, total_tokens: usize) {
+    // OTel GenAI
+    span.record("gen_ai.usage.input_tokens", total_tokens as i64);
+    // OpenInference
     span.record("embedding.token_count.total", total_tokens as i64);
 }
 
@@ -279,10 +377,15 @@ pub fn record_reranker_token_usage(span: &tracing::Span, total_tokens: usize) {
 ///
 /// This emits an info-level event with the TTFT duration, which will be
 /// exported as an OpenTelemetry span event if telemetry is enabled.
-pub fn record_ttft_event(ttft_ms: f64, model_name: &str) {
+///
+/// # Arguments
+/// * `ttft` - Time to first token as a Duration
+/// * `model_name` - The model identifier
+pub fn record_ttft_event(ttft: std::time::Duration, model_name: &str) {
     tracing::info!(
         target: "openinference",
-        ttft_ms = ttft_ms,
+        ttft_secs = ttft.as_secs_f64(),
+        ttft_ms = ttft.as_millis() as f64,
         model = %model_name,
         "time_to_first_token"
     );
@@ -361,12 +464,18 @@ pub fn record_sampling_params(
     }
 }
 
-/// Record the stop reason for a generation.
+/// Record the stop/finish reason for a generation.
 ///
 /// This records why generation stopped (EOS, length limit, stop token, etc.)
+/// following OTel GenAI and OpenInference conventions.
+///
+/// Note: OTel spec uses `finish_reasons` (plural, array) but we record a single
+/// string value which backends typically handle correctly.
 pub fn record_stop_reason(span: &tracing::Span, reason: &str) {
+    // OTel GenAI (plural, but we record single value)
+    span.record("gen_ai.response.finish_reasons", reason);
+    // OpenInference
     span.record("llm.stop_reason", reason);
-    span.record("gen_ai.response.finish_reason", reason);
 }
 
 /// Record timing metrics on a span.

@@ -77,6 +77,9 @@ mod xlora_models;
 
 /// Text Embeddings Inference (TEI) backend for BERT-family embedding/reranking
 pub mod tei_backend;
+
+/// OpenTelemetry metrics and telemetry infrastructure.
+pub mod telemetry;
 #[cfg(feature = "tei-backend")]
 pub use tei_backend::{
     TeiBackend, TeiConfig, TeiLoaderBuilder, TeiModelKind, TeiPool, TeiSpecificConfig,

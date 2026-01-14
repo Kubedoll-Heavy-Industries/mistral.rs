@@ -44,9 +44,9 @@ intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics"] }
 opentelemetry-semantic-conventions = "0.31"
 futures = "0.3"
 clap = { version = "4.5.39", features = ["derive", "wrap_help"] }

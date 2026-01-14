@@ -1,6 +1,6 @@
 //! ## Chat Completions functionality and route handler.
 
-use std::{ops::Deref, pin::Pin, task::Poll, time::Duration};
+use std::{ops::Deref, pin::Pin, task::Poll, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -158,7 +158,11 @@ impl futures::Stream for ChatCompletionStreamer {
                         });
                         if has_content {
                             let ttft = self.start_time.elapsed();
-                            record_ttft_event(ttft.as_secs_f64() * 1000.0, &response.model);
+                            record_ttft_event(ttft, &response.model);
+                            // Also record to OTel metrics
+                            if let Some(metrics) = mistralrs_core::telemetry::try_metrics() {
+                                metrics.record_ttft(ttft.as_secs_f64(), &response.model);
+                            }
                             self.first_token_recorded = true;
                         }
                     }
@@ -608,26 +612,40 @@ pub async fn parse_request(
     name = "chat_completion",
     skip(state, oairequest),
     fields(
-        otel.kind = "server",
-        llm.model_name = %oairequest.model,
+        // OTel GenAI REQUIRED attributes
+        gen_ai.operation.name = "chat",
+        gen_ai.provider.name = "mistral.rs",
+        gen_ai.request.model = %oairequest.model,
+        // OpenInference REQUIRED attributes
         openinference.span.kind = "LLM",
+        llm.model_name = %oairequest.model,
+        llm.provider = "mistral.rs",
+        // Token counts - filled via record_full_usage()
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        llm.token_count.prompt = tracing::field::Empty,
+        llm.token_count.completion = tracing::field::Empty,
+        llm.token_count.total = tracing::field::Empty,
         // Sampling parameters - filled via record_sampling_params()
-        llm.invocation_parameters = tracing::field::Empty,
         gen_ai.request.temperature = tracing::field::Empty,
         gen_ai.request.top_p = tracing::field::Empty,
         gen_ai.request.top_k = tracing::field::Empty,
         gen_ai.request.max_tokens = tracing::field::Empty,
         gen_ai.request.frequency_penalty = tracing::field::Empty,
         gen_ai.request.presence_penalty = tracing::field::Empty,
-        // Stop reason - filled when response is received
+        llm.invocation_parameters = tracing::field::Empty,
+        // Stop reason - filled via record_stop_reason()
+        gen_ai.response.finish_reasons = tracing::field::Empty,
         llm.stop_reason = tracing::field::Empty,
-        gen_ai.response.finish_reason = tracing::field::Empty,
     )
 )]
 pub async fn chatcompletions(
     State(state): ExtractedMistralRsState,
     Json(oairequest): Json<ChatCompletionRequest>,
 ) -> ChatCompletionResponder {
+    let start_time = Instant::now();
+    let model_name = oairequest.model.clone();
+
     // Record sampling parameters on the span
     record_sampling_params(
         &tracing::Span::current(),
@@ -683,6 +701,18 @@ pub async fn chatcompletions(
             // Record stop reason from first choice
             if let Some(choice) = json_resp.choices.first() {
                 record_stop_reason(&tracing::Span::current(), &choice.finish_reason);
+            }
+
+            // Record OTel metrics
+            if let Some(metrics) = mistralrs_core::telemetry::try_metrics() {
+                metrics.record_request(
+                    start_time.elapsed().as_secs_f64(),
+                    &model_name,
+                    "chat",
+                    "success",
+                    usage.prompt_tokens as u64,
+                    usage.completion_tokens as u64,
+                );
             }
         }
 
