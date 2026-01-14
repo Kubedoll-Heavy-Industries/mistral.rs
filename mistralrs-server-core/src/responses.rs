@@ -90,7 +90,11 @@ impl futures::Stream for ResponsesStreamer {
                         });
                         if has_content {
                             let ttft = self.start_time.elapsed();
-                            record_ttft_event(ttft.as_secs_f64() * 1000.0, &chat_chunk.model);
+                            record_ttft_event(ttft, &chat_chunk.model);
+                            // Also record to OTel metrics
+                            if let Some(metrics) = mistralrs_core::telemetry::try_metrics() {
+                                metrics.record_ttft(ttft.as_secs_f64(), &chat_chunk.model);
+                            }
                             self.first_token_recorded = true;
                         }
                     }
