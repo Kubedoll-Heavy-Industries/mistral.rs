@@ -925,6 +925,11 @@ impl Loader for NormalLoader {
             // This ensures PagedAttention allocates KV cache proportional to this node's layers,
             // not the full model's layers.
             let base_config = model.config();
+            info!(
+                "PagedAttention KV cache: layer_range={:?}, base_config_num_layers={}",
+                self.config.layer_range,
+                base_config.num_layers()
+            );
             let paged_attn_model_config: Box<dyn ModelConfigLike> =
                 if let Some(ref range) = self.config.layer_range {
                     Box::new(ModelConfigMetadata {
@@ -949,6 +954,10 @@ impl Loader for NormalLoader {
                         v_head_dim: base_config.v_head_dim(),
                     })
                 };
+            info!(
+                "PagedAttention KV cache: using num_layers={} for cache calculation",
+                paged_attn_model_config.num_layers()
+            );
 
             let cache_config = calculate_cache_config(
                 paged_attn_config.mem_gpu,

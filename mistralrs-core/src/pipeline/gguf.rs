@@ -565,6 +565,12 @@ impl Loader for GGUFLoader {
             // For pipeline parallelism, adjust num_layers to loaded layers only.
             // This ensures PagedAttention allocates KV cache proportional to this node's layers,
             // not the full model's layers.
+            info!(
+                "PagedAttention KV cache: layer_range={:?}, total_layers={}, model_config_num_layers={}",
+                self.config.layer_range,
+                total_layers,
+                model_config_metadata.num_layers()
+            );
             let paged_attn_model_config: Box<dyn ModelConfigLike> =
                 if let Some(ref range) = self.config.layer_range {
                     Box::new(ModelConfigMetadata {
@@ -589,6 +595,10 @@ impl Loader for GGUFLoader {
                         v_head_dim: model_config_metadata.v_head_dim(),
                     })
                 };
+            info!(
+                "PagedAttention KV cache: using num_layers={} for cache calculation",
+                paged_attn_model_config.num_layers()
+            );
             let cache_config = calculate_cache_config(
                 paged_attn_config.mem_gpu,
                 paged_attn_config.block_size,

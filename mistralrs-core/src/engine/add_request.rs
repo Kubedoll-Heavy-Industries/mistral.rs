@@ -1,5 +1,5 @@
 use crate::{
-    pipeline::{CacheBackendMetadata, CacheInstruction, ForwardInputsResult, NormalCache, RerankInputs},
+    pipeline::{CacheBackendMetadata, CacheInstruction, ForwardInputsResult, NormalCache, RerankInputs, text_models_inputs_processor::PagedAttentionMeta},
     prefix_cacher::MatchingCache,
     request::{
         DetokenizeRequest, InferenceOperation, NormalRequest, PipelineContinueRequest, TokenizeRequest,
@@ -13,6 +13,7 @@ use either::Either;
 use rand::SeedableRng;
 use rand_isaac::Isaac64Rng;
 use std::{
+    collections::HashMap,
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     time::{SystemTime, UNIX_EPOCH},
@@ -1171,16 +1172,39 @@ impl Engine {
         // (i.e., build KV) even though they are not the first forward.
         let is_prompt_step = sequence_position < initial_seq_len;
 
-        let pre_op = if is_first_forward {
-            CacheInstruction::Reset {
-                load_preallocated_cache: false,
-                reset_non_granular: false,
+        // Construct backend_metadata based on whether PagedAttention is enabled
+        let backend_metadata = {
+            let scheduler = get_mut_arcmutex!(self.scheduler);
+            if let (Some(block_engine), Some(block_size)) = (scheduler.block_engine(), scheduler.block_size()) {
+                // PagedAttention is enabled - allocate/manage blocks and use PagedAttention metadata
+                let sliding_window = get_mut_arcmutex!(self.pipeline).get_metadata().sliding_window;
+
+                // For PagedAttention, block allocation happens during input processing
+                // The block_engine is passed via PagedAttentionMeta and handles allocation internally
+                let metadata = PagedAttentionMeta {
+                    block_size,
+                    sliding_window,
+                    block_engine,
+                };
+
+                CacheBackendMetadata::PagedAttention {
+                    metadata,
+                    blocks_to_copy: HashMap::new(),
+                }
+            } else {
+                // DefaultScheduler - use cache instructions
+                let pre_op = if is_first_forward {
+                    CacheInstruction::Reset {
+                        load_preallocated_cache: false,
+                        reset_non_granular: false,
+                    }
+                } else {
+                    CacheInstruction::In
+                };
+                let post_op = CacheInstruction::Out;
+                CacheBackendMetadata::DefaultInstructions { pre_op, post_op }
             }
-        } else {
-            CacheInstruction::In
         };
-        let post_op = CacheInstruction::Out;
-        let backend_metadata = CacheBackendMetadata::DefaultInstructions { pre_op, post_op };
 
         // Phase 3: Check stage type (brief lock)
         let is_first_stage = {
