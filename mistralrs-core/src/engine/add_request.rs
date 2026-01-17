@@ -1078,46 +1078,56 @@ impl Engine {
                 .duration_since(UNIX_EPOCH)
                 .expect("Time travel has occurred!");
 
+            let block_size = {
+                let scheduler = get_mut_arcmutex!(self.scheduler);
+                scheduler.block_size()
+            };
+
             let mut seq = Sequence::new_waiting(
                 tokens.clone(),
-                String::new(), // No prompt text needed for pipeline continuation
+                String::new(),
                 *get_mut_arcmutex!(self.id).deref(),
                 now.as_millis(),
                 request_id,
                 num_hidden_layers,
                 request.response.clone(),
                 sampler,
-                vec![], // stop_toks
-                vec![], // stop_strings
-                None,   // max_len - unlimited for pipeline sequences
-                false,  // return_logprobs
-                false,  // is_xlora
+                vec![],
+                vec![],
+                None,
+                false,
+                false,
                 group,
-                0,      // response_index
+                0,
                 now.as_secs(),
                 SequenceRecognizer::None,
-                None,   // suffix
-                None,   // echo_prompt
-                None,   // images
-                None,   // audios
-                None,   // block_size
-                None,   // tool_matcher
-                None,   // image_generation_format
+                None,
+                None,
+                None,
+                None,
+                block_size,
+                None,
+                None,
                 SeqStepType::PromptAndDecode,
-                None,   // diffusion_params
-                None,   // seq_preallocated_cache
-                true,   // return_raw_logits - always true for pipeline parallelism
+                None,
+                None,
+                true,
                 eos_toks,
             );
 
-            // Configure sequence for pipeline continuation
             seq.set_prompt_len(initial_seq_len);
             seq.set_token_offset(sequence_position);
             seq.set_state(SequenceState::RunningPrompt);
 
+            if block_size.is_some() {
+                let scheduler = get_mut_arcmutex!(self.scheduler);
+                if let Some(block_engine) = scheduler.block_engine() {
+                    get_mut_arcmutex!(block_engine).allocate(&mut seq);
+                }
+            }
+
             *get_mut_arcmutex!(self.id) += 1;
 
-            // Store in pipeline_sequences
             {
                 let mut seqs = self.pipeline_sequences.lock().unwrap();
                 seqs.insert(request_id, seq);
