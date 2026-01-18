@@ -484,12 +484,6 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        // Generate request ID for correlation across pipeline stages
-        let request_id = uuid::Uuid::now_v7();
-
-        // Extract tokens for pipeline parallelism hooks
-        let tokens_vec: Vec<u32> = x.flatten_all()?.to_vec1()?;
-
         // For pipeline parallelism: non-first stages don't use tok_embeddings.
         // Instead, the hook will inject the activation at the first local layer.
         // Create a placeholder that will be replaced by the hook.
@@ -519,16 +513,9 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use global layer index for hooks
-            let global_layer_idx = self.layer_start + i;
-
-            // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
             }
-
-            // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
-            crate::pp_hook_layer_input!(self, layer_in, global_layer_idx, tokens_vec, request_id);
 
             let x = layer_in;
             let residual = &x;
@@ -551,9 +538,6 @@ impl ModelWeights {
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
             layer_in = (x + residual)?;
-
-            // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
-            crate::pp_hook_layer_output!(self, layer_in, global_layer_idx, tokens_vec, request_id);
         }
 
         // Last stage (or no PP): run final norm and lm_head

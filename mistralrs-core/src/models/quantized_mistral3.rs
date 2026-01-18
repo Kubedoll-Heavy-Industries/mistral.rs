@@ -744,12 +744,6 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        // Generate request ID for correlation across pipeline stages
-        let request_id = uuid::Uuid::now_v7();
-
-        // Extract tokens for pipeline parallelism hooks
-        let tokens_vec: Vec<u32> = x.flatten_all()?.to_vec1()?;
-
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;
 
@@ -770,16 +764,10 @@ impl ModelWeights {
         });
 
         for (i, layer) in self.layers.iter().enumerate() {
-            // Global layer index for hooks (accounts for partial layer loading)
-            let global_layer_idx = self.layer_start + i;
-
             // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
             }
-
-            // Pre-layer hook: can inject activations from previous pipeline stage
-            crate::pp_hook_layer_input!(self, layer_in, global_layer_idx, tokens_vec, request_id);
 
             let x = layer.attention_norm.forward(&layer_in)?;
             let attn = layer.forward_attn(
@@ -801,9 +789,6 @@ impl ModelWeights {
             let x = layer.mlp.forward(&x)?;
 
             layer_in = (x + residual)?;
-
-            // Post-layer hook: can capture/replace activations for next pipeline stage
-            crate::pp_hook_layer_output!(self, layer_in, global_layer_idx, tokens_vec, request_id);
         }
 
         let layer_in = layer_in.to_device(&self.device)?;
