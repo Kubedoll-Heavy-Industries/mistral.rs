@@ -552,13 +552,8 @@ impl ModelWeights {
         start_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        request_id: uuid::Uuid,
+        _request_id: uuid::Uuid,
     ) -> Result<Tensor> {
-        // request_id passed from ModelInputs for correlation with init_pipeline_request
-
-        // Extract tokens for pipeline parallelism hooks
-        let tokens_vec: Vec<u32> = x.flatten_all()?.to_vec1()?;
-
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_causal_mask_matrix(
@@ -577,16 +572,9 @@ impl ModelWeights {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use global layer index for hooks
-            let global_layer_idx = self.layer_start + i;
-
-            // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
             }
-
-            // Pre-layer hook: allow hook to inject activations (e.g., from previous stage)
-            crate::pp_hook_layer_input!(self, layer_in, global_layer_idx, tokens_vec, request_id);
 
             let x = layer_in;
             let residual = &x;
@@ -609,9 +597,6 @@ impl ModelWeights {
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
             layer_in = (x + residual)?;
-
-            // Post-layer hook: allow hook to capture/replace activations (e.g., send to next stage)
-            crate::pp_hook_layer_output!(self, layer_in, global_layer_idx, tokens_vec, request_id);
         }
         let x = self.norm.forward(&layer_in)?;
         extract_logits(

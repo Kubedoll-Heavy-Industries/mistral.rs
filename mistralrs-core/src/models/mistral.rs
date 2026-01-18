@@ -559,16 +559,6 @@ impl Model {
         })
     }
 
-    /// Set a pipeline hook for distributed inference.
-    pub fn set_hook(&mut self, hook: HookContainer) {
-        self.hook = Some(hook);
-    }
-
-    /// Get the current pipeline hook.
-    pub fn get_hook(&self) -> Option<&HookContainer> {
-        self.hook.as_ref()
-    }
-
     pub fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.forward(input_ids)
     }
@@ -601,12 +591,6 @@ impl Model {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        // Generate request ID for correlation across pipeline stages
-        let request_id = uuid::Uuid::now_v7();
-
-        // Extract tokens for pipeline parallelism hooks
-        let tokens_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
-
         let mut xs = input_embeds;
         let cache = &mut self.cache.normal().0;
         let attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
@@ -627,12 +611,9 @@ impl Model {
                 .unwrap_or(true)
         });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Global layer index for hooks (accounts for partial layer loading)
+            // Global layer index for device mapping (accounts for partial layer loading)
             let global_layer_idx = self.layer_start + i;
             xs = self.mapper.map(xs, global_layer_idx)?;
-
-            // Pre-layer hook: can inject activations from previous pipeline stage
-            crate::pp_hook_layer_input!(self, xs, global_layer_idx, tokens_vec, request_id);
 
             xs = layer.forward(
                 &xs,
@@ -641,15 +622,12 @@ impl Model {
                     .map(|m| m.to_device(xs.device()).unwrap())
                     .as_ref(),
                 seqlen_offsets,
-                &mut cache[i], // Local index for cache
+                &mut cache[i],
                 metadata
                     .as_ref()
                     .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                 flash_params,
             )?;
-
-            // Post-layer hook: can capture/replace activations for next pipeline stage
-            crate::pp_hook_layer_output!(self, xs, global_layer_idx, tokens_vec, request_id);
         }
 
         let xs = xs.to_device(&self.device)?;
