@@ -113,9 +113,16 @@ pub async fn send_raw_responses(
     };
     assert_eq!(input_seqs.len(), 1);
 
+    // Move logits to CPU before storing. This must happen on the model thread
+    // which has CUDA/Metal context. The channel receiver won't have GPU context.
+    let cpu_logits_chunks: Vec<Tensor> = logits_chunks
+        .into_iter()
+        .map(|t| t.to_device(&candle_core::Device::Cpu))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+
     let seq = &mut *input_seqs[0];
 
-    seq.add_raw_choice_to_group(logits_chunks);
+    seq.add_raw_choice_to_group(cpu_logits_chunks);
 
     let group = seq.get_mut_group();
     group

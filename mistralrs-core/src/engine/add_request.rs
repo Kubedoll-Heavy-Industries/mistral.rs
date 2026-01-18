@@ -1280,11 +1280,27 @@ impl Engine {
 
             match result {
                 Ok(logits) => {
-                    // Send logits tensor directly in Response::Raw
+                    // Move logits to CPU before sending through channel.
+                    // This must happen on the model thread which has the CUDA/Metal context.
+                    // The receiving tokio task won't have GPU context.
+                    let cpu_logits = match logits.to_device(&candle_core::Device::Cpu) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!(%request_id, error = %e, "Failed to move logits to CPU");
+                            let _ = request
+                                .response
+                                .send(Response::InternalError(
+                                    format!("Failed to move logits to CPU: {e}").into(),
+                                ))
+                                .await;
+                            return;
+                        }
+                    };
+                    // Send CPU logits tensor in Response::Raw
                     let _ = request
                         .response
                         .send(Response::Raw {
-                            logits_chunks: vec![logits],
+                            logits_chunks: vec![cpu_logits],
                             tokens: vec![],
                         })
                         .await;
