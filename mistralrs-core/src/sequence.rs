@@ -167,6 +167,23 @@ impl SequenceCustomMetadata {
             self.pop_token_from_blocks();
         }
     }
+
+    /// Reset logical token blocks, clearing all entries.
+    /// Used when replacing tokens in pipeline parallelism.
+    fn reset_blocks(&mut self) {
+        match self {
+            Self::PagedAttention {
+                logical_token_blocks,
+                physical_blocks_prefill: _,
+                block_size,
+            } => {
+                // Clear all blocks and start fresh with one empty block
+                logical_token_blocks.clear();
+                logical_token_blocks.push(LogicalTokenBlock::new(*block_size));
+            }
+            Self::None => (),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1450,8 +1467,14 @@ impl Sequence {
 
     /// Set tokens directly (replacing existing tokens).
     /// Used when receiving a sequence from an upstream worker.
+    ///
+    /// This resets the logical token blocks before appending, ensuring the block
+    /// count matches the token count. Without this, subsequent calls would accumulate
+    /// blocks incorrectly, causing slot mapping mismatches and CUDA memory errors.
     pub fn set_tokens_for_pp(&mut self, tokens: &[u32]) {
         self.tokens = tokens.to_vec();
+        // Reset blocks before appending to avoid accumulation across activations
+        self.custom_metadata.reset_blocks();
         self.custom_metadata
             .append_tokens_to_blocks(self.tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
     }
