@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
 
     println!("\nSending chat request...");
     println!("The model will automatically use MCP tools if needed to answer the question.");
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("\nResponse:");
     println!("{}", response.choices[0].message.content.as_ref().unwrap());

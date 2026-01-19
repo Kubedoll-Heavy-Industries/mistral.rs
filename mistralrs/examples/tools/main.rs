@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
         .set_tools(tools)
         .set_tool_choice(ToolChoice::Auto);
 
-    let response = model.send_chat_request(messages.clone()).await?;
+    let response = model.send_chat_request(messages.clone().into()).await?;
 
     let message = &response.choices[0].message;
 
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
                 .add_tool_message(result, called.id.clone())
                 .set_tool_choice(ToolChoice::None);
 
-            let response = model.send_chat_request(messages.clone()).await?;
+            let response = model.send_chat_request(messages.clone().into()).await?;
 
             let message = &response.choices[0].message;
             println!("Output of model: {:?}", message.content);

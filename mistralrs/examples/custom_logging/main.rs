@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
             "Give me two sentences about the Mount Washington summit weather.",
         );
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
     let answer = response.choices[0].message.content.as_ref().unwrap();
     println!("Model response:\n{answer}");
 

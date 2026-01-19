@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
         ))
         .add_message(TextMessageRole::User, "Please write a few jokes.");
 
-    let response = model.send_chat_request(request).await?;
+    let response = model.send_chat_request(request.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 

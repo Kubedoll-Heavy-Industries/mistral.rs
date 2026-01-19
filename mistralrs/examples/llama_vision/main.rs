@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         &model,
     )?;
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
     dbg!(

@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
             "If all dogs are mammals, and all mammals are animals, are dogs animals?",
         );
 
-    let response = model.send_chat_request(request).await?;
+    let response = model.send_chat_request(request.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 

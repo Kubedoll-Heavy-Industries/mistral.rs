@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         .set_tools(vec![tool])
         .set_tool_choice(ToolChoice::Auto);
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
     Ok(())
 }

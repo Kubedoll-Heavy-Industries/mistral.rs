@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
         "Please write a mathematical equation where a few numbers are added.",
     );
 
-    let response = model.send_chat_request(request).await?;
+    let response = model.send_chat_request(request.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 

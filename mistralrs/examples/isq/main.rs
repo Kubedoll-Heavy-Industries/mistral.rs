@@ -22,7 +22,7 @@ async fn main() -> Result<()> {
             "Hello! How are you? Please write generic binary search function in Rust.",
         );
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
     dbg!(
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     let messages = TextMessages::new().add_message(TextMessageRole::User, "Why is the sky blue?");
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
     dbg!(

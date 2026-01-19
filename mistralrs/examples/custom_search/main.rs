@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
     let messages =
         RequestBuilder::from(messages).with_web_search_options(WebSearchOptions::default());
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 

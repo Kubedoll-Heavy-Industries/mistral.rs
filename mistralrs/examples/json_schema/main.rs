@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         .set_sampler_max_len(100)
         .add_message(TextMessageRole::User, "A sample address please.");
 
-    let response = model.send_chat_request(request).await?;
+    let response = model.send_chat_request(request.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 

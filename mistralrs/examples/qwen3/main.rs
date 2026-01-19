@@ -15,7 +15,7 @@ async fn main() -> Result<()> {
     // First question, thinking mode is enabled by default
     // ------------------------------------------------------------------
     messages = messages.add_message(TextMessageRole::User, "Hello! How many rs in strawberry?");
-    let response = model.send_chat_request(messages.clone()).await?;
+    let response = model.send_chat_request(messages.clone().into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 
@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
     // Second question, disable thinking mode with RequestBuilder or /no_think
     // ------------------------------------------------------------------
     messages = messages.add_message(TextMessageRole::User, "How many rs in blueberry? /no_think");
-    let response = model.send_chat_request(messages.clone()).await?;
+    let response = model.send_chat_request(messages.clone().into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     // Third question, reenable thinking mode with RequestBuilder or /think
     // ------------------------------------------------------------------
     messages = messages.add_message(TextMessageRole::User, "Are you sure? /think");
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
 

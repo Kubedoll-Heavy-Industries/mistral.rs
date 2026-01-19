@@ -423,7 +423,7 @@ impl<'a> AgentStream<'a> {
                             .set_tools(self.agent.tools.clone())
                             .set_tool_choice(self.agent.config.tool_choice.clone());
 
-                        match self.agent.model.stream_chat_request(request).await {
+                        match self.agent.model.stream_chat_request(request.into()).await {
                             Ok(stream) => {
                                 self.model_stream = Some(stream);
                                 self.state = AgentStreamState::Streaming {
@@ -514,7 +514,7 @@ impl Agent {
                 .set_tool_choice(self.config.tool_choice.clone());
 
             // Send request to model
-            let response = self.model.send_chat_request(request).await?;
+            let response = self.model.send_chat_request(request.into()).await?;
 
             let choice = response
                 .choices
@@ -612,7 +612,7 @@ impl Agent {
             .set_tool_choice(self.config.tool_choice.clone());
 
         // Start streaming
-        let stream = self.model.stream_chat_request(request).await?;
+        let stream = self.model.stream_chat_request(request.into()).await?;
 
         Ok(AgentStream {
             agent: self,

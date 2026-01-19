@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
         &model,
     )?;
 
-    let mut stream = model.stream_chat_request(messages).await?;
+    let mut stream = model.stream_chat_request(messages.into()).await?;
 
     while let Some(chunk) = stream.next().await {
         if let Response::Chunk(ChatCompletionChunkResponse { choices, .. }) = chunk {

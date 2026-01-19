@@ -28,7 +28,7 @@ async fn main() -> Result<()> {
             "Hello! How are you? Please write generic binary search function in Rust.",
         );
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
     dbg!(
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
         "Please write a mathematical equation where a few numbers are added.",
     );
 
-    let response = model.send_chat_request(request).await?;
+    let response = model.send_chat_request(request.into()).await?;
 
     println!(
         "Logprobs: {:?}",

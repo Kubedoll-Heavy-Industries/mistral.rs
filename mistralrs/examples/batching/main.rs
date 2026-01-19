@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
 
     let mut handles = Vec::new();
     for _ in 0..N_REQUESTS {
-        handles.push(model.send_chat_request(messages.clone()));
+        handles.push(model.send_chat_request(messages.clone().into()));
     }
     let responses = futures::future::join_all(handles)
         .await

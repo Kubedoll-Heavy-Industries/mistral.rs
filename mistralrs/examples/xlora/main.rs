@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     let messages =
         TextMessages::new().add_message(TextMessageRole::User, "Hello! What is graphene.");
 
-    let response = model.send_chat_request(messages).await?;
+    let response = model.send_chat_request(messages.into()).await?;
 
     println!("{}", response.choices[0].message.content.as_ref().unwrap());
     dbg!(
