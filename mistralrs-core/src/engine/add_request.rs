@@ -1336,10 +1336,16 @@ impl Engine {
     async fn handle_pipeline_cleanup(&self, request_id: uuid::Uuid) {
         tracing::debug!(%request_id, "Pipeline cleanup requested");
 
-        // Remove from pipeline_sequences (persistent sequence storage)
+        // Remove from pipeline_sequences and free associated PagedAttention blocks
         if let Ok(mut seqs) = self.pipeline_sequences.lock() {
-            if seqs.remove(&request_id).is_some() {
-                tracing::debug!(%request_id, "Removed sequence from pipeline_sequences");
+            if let Some(seq) = seqs.remove(&request_id) {
+                tracing::debug!(%request_id, seq_id = *seq.id(), "Removed sequence from pipeline_sequences");
+                // Free PagedAttention blocks allocated for this sequence
+                let scheduler = get_mut_arcmutex!(self.scheduler);
+                if let Some(block_engine) = scheduler.block_engine() {
+                    get_mut_arcmutex!(block_engine).free_sequence(*seq.id());
+                    tracing::debug!(%request_id, seq_id = *seq.id(), "Freed PagedAttention blocks");
+                }
             }
         }
 
