@@ -49,7 +49,7 @@ use crate::{
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
 use anyhow::{bail, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use either::Either;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
@@ -417,8 +417,54 @@ impl Loader for GGUFLoader {
                 None => all_layer_sizes,
             };
 
-            let non_mapped_size_in_bytes =
-                model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None)?;
+            // For pipeline parallelism, only include non-mapped tensors for stages that have them:
+            // - First stage (layer 0): token_embd
+            // - Last stage (final layer): output_norm + output/lm_head
+            // - Middle stages: neither
+            let non_mapped_size_in_bytes = match &self.config.layer_range {
+                Some(range) => {
+                    let is_first_stage = range.start == 0;
+                    let is_last_stage = range.end >= total_layers;
+
+                    let mut size = 0usize;
+
+                    // First stage needs token embeddings
+                    if is_first_stage {
+                        if let Ok(t) = model.model.tensor_info("token_embd.weight") {
+                            // Embeddings are dequantized to F32 at runtime
+                            size += t.shape.elem_count() * DType::F32.size_in_bytes();
+                        }
+                    }
+
+                    // Last stage needs output_norm and lm_head
+                    if is_last_stage {
+                        if let Ok(t) = model.model.tensor_info("output_norm.weight") {
+                            size += t.shape.elem_count() * DType::F32.size_in_bytes();
+                        }
+                        // output.weight (lm_head) - may be tied to token_embd
+                        if model.model.has_tensor("output.weight") {
+                            if let Ok(t) = model.model.tensor_info("output.weight") {
+                                size += t.shape.elem_count() / t.ggml_dtype.block_size() * t.ggml_dtype.type_size();
+                            }
+                        } else if let Ok(t) = model.model.tensor_info("token_embd.weight") {
+                            // Tied embeddings - reuse token_embd for output
+                            size += t.shape.elem_count() / t.ggml_dtype.block_size() * t.ggml_dtype.type_size();
+                        }
+                    }
+
+                    tracing::debug!(
+                        is_first_stage,
+                        is_last_stage,
+                        non_mapped_size_mib = size / (1024 * 1024),
+                        "Pipeline stage non-mapped size (embed/lm_head)"
+                    );
+                    size
+                }
+                None => {
+                    // No pipeline parallelism - include all non-mapped tensors
+                    model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None)?
+                }
+            };
             let total_model_size_in_bytes =
                 layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
 
