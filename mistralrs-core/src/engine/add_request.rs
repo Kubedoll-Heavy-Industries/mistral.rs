@@ -1196,8 +1196,17 @@ impl Engine {
                 let metadata = PagedAttentionMeta {
                     block_size,
                     sliding_window,
-                    block_engine,
+                    block_engine: block_engine.clone(),
                 };
+
+                // Re-allocate block tables for subsequent activations where tokens were replaced.
+                // set_tokens_for_pp resets logical blocks but doesn't update physical block tables,
+                // so we need to free the old allocation and re-allocate based on new token count.
+                if !is_first_activation {
+                    let mut engine = get_mut_arcmutex!(block_engine);
+                    engine.free_sequence(*seq.id());
+                    engine.allocate(&mut seq);
+                }
 
                 CacheBackendMetadata::PagedAttention {
                     metadata,
