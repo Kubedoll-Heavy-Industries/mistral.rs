@@ -3131,8 +3131,10 @@ dependencies = [
  "image",
  "indexmap 2.13.0",
  "mistralrs-core",
+ "mistralrs-macros",
  "rand 0.9.2",
  "reqwest",
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "tokio",
@@ -3275,6 +3277,16 @@ dependencies = [
  "uuid 1.19.0",
  "variantly",
  "vob",
+]
+
+[[package]]
+name = "mistralrs-macros"
+version = "0.7.0"
+dependencies = [
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]

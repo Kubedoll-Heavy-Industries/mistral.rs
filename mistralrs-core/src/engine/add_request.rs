@@ -625,6 +625,7 @@ impl Engine {
                 seq_preallocated_cache,
                 return_raw_logits,
                 eos_toks,
+                None, // pipeline_continue_op_id
             );
 
             // Pipeline continuation: configure the Sequence for PP non-first stages.
@@ -1113,6 +1114,7 @@ impl Engine {
                 None,
                 true,
                 eos_toks,
+                None, // pipeline_continue_op_id
             );
 
             seq.set_prompt_len(initial_seq_len);

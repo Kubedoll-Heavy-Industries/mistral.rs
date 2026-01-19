@@ -389,6 +389,8 @@ pub struct Sequence {
     prompt_len: usize,
     max_len: Option<usize>,
     timestamp: u128,
+    /// UUID7 request ID for distributed tracing and pipeline parallelism correlation
+    request_id: uuid::Uuid,
     sampler: Arc<Sampler>,
     stop_tokens: Vec<u32>,
     stop_strings: Vec<String>,
@@ -541,6 +543,7 @@ impl Sequence {
         prompt: String,
         id: usize,
         timestamp: u128,
+        request_id: uuid::Uuid,
         layers: usize,
         responder: Sender<Response>,
         sampler: Sampler,
@@ -591,6 +594,7 @@ impl Sequence {
             prompt_len,
             id,
             timestamp,
+            request_id,
             state: RwLock::new(SequenceState::Waiting),
             normal_cache: vec![None; layers],
             normal_draft_cache: vec![None; layers],
@@ -731,6 +735,11 @@ impl Sequence {
 
     pub fn id(&self) -> &usize {
         &self.id
+    }
+
+    /// Returns the UUID7 request ID for distributed tracing and pipeline parallelism.
+    pub fn request_id(&self) -> uuid::Uuid {
+        self.request_id
     }
 
     pub fn is_running(&self) -> bool {
@@ -1423,6 +1432,58 @@ impl Sequence {
         if let Some(ref mut ctx) = self.think_tag_context {
             ctx.finalize();
         }
+    }
+
+    // === Pipeline Parallelism Support ===
+
+    /// Set the prompt length for this sequence.
+    /// Used when a downstream worker receives a sequence continuation.
+    pub fn set_prompt_len(&mut self, len: usize) {
+        self.prompt_len = len;
+    }
+
+    /// Replace the responder channel for this sequence.
+    /// Used in pipeline parallelism when a downstream worker takes over response handling.
+    pub fn set_responder(&mut self, responder: Sender<Response>) {
+        self.responder = responder;
+    }
+
+    /// Set tokens directly (replacing existing tokens).
+    /// Used when receiving a sequence from an upstream worker.
+    pub fn set_tokens_for_pp(&mut self, tokens: &[u32]) {
+        self.tokens = tokens.to_vec();
+        self.custom_metadata
+            .append_tokens_to_blocks(self.tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+    }
+
+    /// Append tokens to the existing token sequence.
+    /// Used when receiving additional tokens from an upstream worker.
+    pub fn append_tokens_for_pp(&mut self, tokens: &[u32]) {
+        self.tokens.extend_from_slice(tokens);
+        self.custom_metadata
+            .append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+    }
+
+    /// Check if this is the final prefill chunk.
+    /// Returns true if there's no more chunked prefill work to do.
+    pub fn is_final_prefill_chunk(&self) -> bool {
+        match self.prefill_chunk_size {
+            None => true, // No chunking, so first chunk is final
+            Some(chunk_size) => {
+                let total_prefill_len = self
+                    .prefill_prompt_toks
+                    .as_ref()
+                    .map(|t| t.len())
+                    .unwrap_or(self.prompt_len);
+                self.prefill_chunk_offset + chunk_size >= total_prefill_len
+            }
+        }
+    }
+
+    /// Returns the current sequence position: how many tokens have been processed.
+    /// This is useful for pipeline parallelism to track progress.
+    pub fn sequence_position(&self) -> usize {
+        self.tokens.len()
     }
 }
 
