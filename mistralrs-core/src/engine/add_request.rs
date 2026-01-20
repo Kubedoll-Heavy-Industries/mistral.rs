@@ -1147,6 +1147,7 @@ impl Engine {
         } else {
             // Subsequent activation: Accumulate tokens for correct position tracking.
             // With one persistent sequence per request, seq.len() drives position calculation.
+            let is_prompt_chunk = sequence_position < initial_seq_len;
             let mut seqs = self.pipeline_sequences.lock().unwrap();
             if let Some(seq) = seqs.get_mut(&request_id) {
                 if is_first_stage {
@@ -1160,8 +1161,12 @@ impl Engine {
                 }
                 // Update responder so response goes to THIS request's channel
                 seq.set_responder(request.response.clone());
-                // Decode steps: transition to completion state
-                seq.set_state(SequenceState::RunningCompletion);
+                // Prefill chunks stay in prompt state; decode transitions to completion
+                if is_prompt_chunk {
+                    seq.set_state(SequenceState::RunningPrompt);
+                } else {
+                    seq.set_state(SequenceState::RunningCompletion);
+                }
             }
         }
 
