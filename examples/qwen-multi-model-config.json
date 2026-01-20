@@ -1,0 +1,14 @@
+{
+  "qwen3-4b": {
+    "Plain": {
+      "model_id": "Qwen/Qwen3-4B"
+    },
+    "in_situ_quant": "Q4K"
+  },
+  "qwen3-embedding": {
+    "Embedding": {
+      "model_id": "Qwen/Qwen3-Embedding-0.6B",
+      "arch": "qwen3embedding"
+    }
+  }
+}

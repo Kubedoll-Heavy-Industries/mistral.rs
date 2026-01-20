@@ -925,11 +925,22 @@ impl MistralRsForServerBuilder {
                 add_model_config = add_model_config.with_mcp_config(mcp_config);
             }
 
+            // Compute scheduler config for THIS specific model
+            // This is critical: embedding models don't support PagedAttention, so they need
+            // a DefaultScheduler even if the first model uses PagedAttention
+            let model_scheduler_config = init_scheduler_config(
+                &cache_config,
+                &pipeline,
+                self.max_seqs,
+                self.max_prefill_chunk_size,
+            )
+            .await;
+
             mistralrs
                 .add_model(
                     pipeline_name.clone(),
                     pipeline,
-                    scheduler_config.clone(),
+                    model_scheduler_config,
                     add_model_config,
                 )
                 .await
