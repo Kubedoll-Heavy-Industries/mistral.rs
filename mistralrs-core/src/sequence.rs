@@ -535,6 +535,16 @@ impl BlockEngineSequence for Sequence {
         }
     }
 
+    fn set_physical_blocks_prefill(&mut self, blocks: Vec<BlockRef>) {
+        match &mut self.custom_metadata {
+            SequenceCustomMetadata::PagedAttention {
+                physical_blocks_prefill,
+                ..
+            } => *physical_blocks_prefill = Some(blocks),
+            SequenceCustomMetadata::None => {}
+        }
+    }
+
     fn increment_waitlist_count(&mut self) -> usize {
         let prev = self.waitlisted_count;
         self.waitlisted_count += 1;

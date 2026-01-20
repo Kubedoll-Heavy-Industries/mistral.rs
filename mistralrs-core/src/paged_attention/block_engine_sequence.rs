@@ -3,6 +3,9 @@ use super::{BlockRef, LogicalTokenBlock};
 pub trait BlockEngineSequence {
     fn blocks_to_add_new_tok(&self) -> usize;
     fn take_physical_blocks_prefill(&mut self) -> Option<Vec<BlockRef>>;
+    /// Set physical blocks for allocation to preserve and grow.
+    /// Used in pipeline parallelism when growing block tables during decode.
+    fn set_physical_blocks_prefill(&mut self, blocks: Vec<BlockRef>);
     fn get_id(&self) -> usize;
     fn logical_token_blocks(&self) -> &[LogicalTokenBlock];
     /// Returns the previous count

@@ -22,6 +22,7 @@ use tracing::warn;
 
 use crate::{
     get_mut_arcmutex, handle_seq_error,
+    paged_attention::BlockEngineSequence,
     request::Request,
     sampler::Sampler,
     sequence::{Sequence, SequenceGroup},
@@ -1222,13 +1223,23 @@ impl Engine {
                     block_engine: block_engine.clone(),
                 };
 
-                // Re-allocate block tables for TAIL prefill chunks where tokens were replaced.
-                // set_tokens_for_pp resets logical blocks but doesn't update physical block tables.
-                // Decode steps on TAIL use append_tokens_for_pp which doesn't need reallocation.
-                if !is_first_activation && !is_first_stage && is_prompt_step {
+                // Handle block allocation for TAIL stages (non-first stage).
+                // - Prefill: free + allocate (KV cache rebuilt from chunk tokens)
+                // - Decode: preserve existing blocks + grow (KV cache must be preserved)
+                if !is_first_activation && !is_first_stage {
                     let mut engine = get_mut_arcmutex!(block_engine);
-                    engine.free_sequence(*seq.id());
-                    engine.allocate(&mut seq);
+                    if is_prompt_step {
+                        // TAIL prefill: tokens were replaced, rebuild blocks from scratch
+                        engine.free_sequence(*seq.id());
+                        engine.allocate(&mut seq);
+                    } else {
+                        // TAIL decode: preserve existing blocks, grow if needed
+                        // Take current block table and set as prefill blocks so allocate() preserves them
+                        if let Some(existing_blocks) = engine.block_tables.remove(seq.id()) {
+                            seq.set_physical_blocks_prefill(existing_blocks);
+                            engine.allocate(&mut seq);
+                        }
+                    }
                 }
 
                 CacheBackendMetadata::PagedAttention {
