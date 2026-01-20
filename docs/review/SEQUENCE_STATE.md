@@ -8,7 +8,7 @@
 The Sequence type represents a single inference request lifecycle. Modifications add pipeline parallelism support:
 
 - New `request_id` field (UUID7) for distributed tracing correlation
-- New methods: `set_tokens_for_pp`, `append_tokens_for_pp`, `set_responder`, `set_prompt_len`
+- New methods: `receive_tokens`, `set_responder`, `set_prompt_len`
 - Simplified `len()` method (now returns `self.tokens.len()` directly)
 - Chunked prefill helpers: `is_final_prefill_chunk`, `sequence_position`
 - Removed `pipeline_continue_op_id` (consolidated into `request_id`)
@@ -20,12 +20,11 @@ The Sequence type represents a single inference request lifecycle. Modifications
 - Properly threaded through constructor
 - UUID7 provides time-ordering for distributed tracing
 
-### 2. Good Encapsulation of PP Methods
+### 2. Unified Token Reception API
 ```rust
-/// Append raw tokens for pipeline parallelism continuation.
-/// Unlike `add_token()`, this doesn't update logprobs or completion bytes -
-/// it just tracks the token for position/length calculation.
-pub fn append_tokens_for_pp(&mut self, tokens: &[u32])
+/// Receive tokens from an upstream pipeline stage.
+/// - `is_prompt`: true for prefill chunks (replace), false for decode (append)
+pub fn receive_tokens(&mut self, tokens: &[u32], is_prompt: bool)
 ```
 
 ### 3. Proper Block Metadata Documentation
@@ -129,15 +128,11 @@ Replacing responder mid-sequence could send to wrong receiver.
 
 **Recommendation**: Document when this is safe (activation boundaries only).
 
-### Issue 8: `append_tokens_for_pp` vs `set_tokens_for_pp` Asymmetry
-**Location**: `sequence.rs:997-1005`
-**Severity**: Low
+### Issue 8: ~~`append_tokens_for_pp` vs `set_tokens_for_pp` Asymmetry~~ ✅ FIXED
+**Location**: `sequence.rs`
+**Severity**: ~~Low~~ Resolved
 
-One updates block metadata, the other doesn't. Could lead to subtle bugs.
-
-**Recommendation**: Consider renaming for clarity:
-- `append_tokens_for_pp` -> `append_tokens_with_blocks`
-- `set_tokens_for_pp` -> `replace_tokens_only`
+Unified into single `receive_tokens(tokens, is_prompt)` method that handles both prefill (replace) and decode (append) consistently. Both paths now update block metadata correctly.
 
 ## Recommendations Summary
 

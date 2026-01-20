@@ -1153,16 +1153,12 @@ impl Engine {
                 if is_first_stage {
                     // HEAD (Stage 0): Don't modify tokens or offset.
                     // Tokens accumulate naturally via add_token() during sampling.
-                    // For decode: position = seq.len() - 1 which increments correctly.
-                } else if is_prompt_chunk {
-                    // TAIL prefill chunks: Replace tokens with just this chunk.
-                    // Forward processes only chunk tokens; token_offset provides RoPE position.
-                    seq.set_tokens_for_pp(&tokens);
-                    seq.set_token_offset(sequence_position);
                 } else {
-                    // TAIL decode steps: Append the new token.
-                    // Position = seq.len() - 1 which increments correctly.
-                    seq.append_tokens_for_pp(&tokens);
+                    // TAIL stages: receive tokens from upstream
+                    seq.receive_tokens(&tokens, is_prompt_chunk);
+                    if is_prompt_chunk {
+                        seq.set_token_offset(sequence_position);
+                    }
                 }
                 // Update responder so response goes to THIS request's channel
                 seq.set_responder(request.response.clone());

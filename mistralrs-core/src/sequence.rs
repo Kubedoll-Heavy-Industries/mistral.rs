@@ -1475,33 +1475,36 @@ impl Sequence {
         self.responder = responder;
     }
 
-    /// Set tokens directly (replacing existing tokens).
-    /// Used when receiving a sequence from an upstream worker.
+    /// Receive tokens from an upstream pipeline stage.
     ///
-    /// This resets the logical token blocks before appending, ensuring the block
-    /// count matches the token count. Without this, subsequent calls would accumulate
-    /// blocks incorrectly, causing slot mapping mismatches and CUDA memory errors.
+    /// This is the unified API for handling tokens that arrive via activation,
+    /// whether during prefill or decode. The sequence doesn't need to know it's
+    /// part of pipeline parallelism - it just receives tokens.
     ///
-    /// Also clears prefill state so that `get_toks()` returns these tokens, not any
-    /// stale `prefill_prompt_toks` from the original sequence creation.
-    pub fn set_tokens_for_pp(&mut self, tokens: &[u32]) {
-        self.tokens = tokens.to_vec();
-        // Clear prefill state so get_toks() returns self.tokens
-        self.prefill_prompt_toks = None;
-        self.prefill_chunk_offset = 0;
-        self.prefill_chunk_size = None;
-        // Reset blocks before appending to avoid accumulation across activations
-        self.custom_metadata.reset_blocks();
-        self.custom_metadata
-            .append_tokens_to_blocks(self.tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
-    }
-
-    /// Append tokens to the existing token sequence.
-    /// Used when receiving additional tokens from an upstream worker.
-    pub fn append_tokens_for_pp(&mut self, tokens: &[u32]) {
-        self.tokens.extend_from_slice(tokens);
-        self.custom_metadata
-            .append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+    /// - `is_prompt`: true for prefill chunks (replace tokens), false for decode (append)
+    ///
+    /// For prefill: replaces tokens with just this chunk, clears stale prefill state,
+    /// and resets blocks. This ensures `get_toks()` returns exactly these tokens.
+    ///
+    /// For decode: appends tokens to the existing sequence and grows blocks.
+    pub fn receive_tokens(&mut self, tokens: &[u32], is_prompt: bool) {
+        if is_prompt {
+            // Prefill chunk: replace tokens with just this chunk
+            self.tokens = tokens.to_vec();
+            // Clear prefill state so get_toks() returns self.tokens
+            self.prefill_prompt_toks = None;
+            self.prefill_chunk_offset = 0;
+            self.prefill_chunk_size = None;
+            // Reset blocks to match new token count
+            self.custom_metadata.reset_blocks();
+            self.custom_metadata
+                .append_tokens_to_blocks(self.tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+        } else {
+            // Decode step: append tokens
+            self.tokens.extend_from_slice(tokens);
+            self.custom_metadata
+                .append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+        }
     }
 
     /// Check if this is the final prefill chunk.
