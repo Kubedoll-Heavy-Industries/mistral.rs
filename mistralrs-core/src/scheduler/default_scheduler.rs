@@ -175,10 +175,6 @@ pub struct DefaultScheduler<Backer: FcfsBacker> {
     running: Vec<Sequence>,
     method: DefaultSchedulerMethod,
     bucketing_manager: Box<dyn BucketingManager<Backer>>,
-    /// Pipeline parallelism sequences, keyed by request_id.
-    /// Separate from waiting/running because PP sequences persist across
-    /// multiple forward passes and need immediate access by request_id.
-    pp_sequences: HashMap<uuid::Uuid, Sequence>,
 }
 
 impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
@@ -191,7 +187,6 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
             waiting: Backer::new(),
             method,
             bucketing_manager,
-            pp_sequences: HashMap::new(),
         }
     }
 
@@ -349,21 +344,5 @@ impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
     }
     fn set_prefix_caching_enabled(&mut self, _enabled: bool) {
         // DefaultScheduler doesn't use PagedAttention prefix caching
-    }
-
-    fn has_pp_sequence(&self, request_id: uuid::Uuid) -> bool {
-        self.pp_sequences.contains_key(&request_id)
-    }
-
-    fn get_pp_sequence_mut(&mut self, request_id: uuid::Uuid) -> Option<&mut Sequence> {
-        self.pp_sequences.get_mut(&request_id)
-    }
-
-    fn add_pp_sequence(&mut self, seq: Sequence) {
-        self.pp_sequences.insert(seq.request_id(), seq);
-    }
-
-    fn remove_pp_sequence(&mut self, request_id: uuid::Uuid) -> Option<Sequence> {
-        self.pp_sequences.remove(&request_id)
     }
 }

@@ -181,6 +181,13 @@ pub struct Engine {
     /// Metadata for pipeline continuation requests keyed by request_id.
     /// Stores initial_seq_len for prefill/decode boundary detection.
     pipeline_continue_meta: Arc<std::sync::Mutex<HashMap<uuid::Uuid, PipelineContinueMeta>>>,
+
+    /// Persistent sequences for pipeline parallelism, keyed by request_id.
+    /// Unlike normal sequences that are created per-request, pipeline sequences
+    /// persist across multiple forward passes (one per activation).
+    /// KV cache lives on the Sequence and is naturally preserved.
+    /// Entry created on first activation, removed on cleanup signal.
+    pipeline_sequences: Arc<std::sync::Mutex<HashMap<uuid::Uuid, crate::sequence::Sequence>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -274,6 +281,7 @@ impl Engine {
             pipeline_first_forward_done: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pipeline_kv_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pipeline_continue_meta: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pipeline_sequences: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 

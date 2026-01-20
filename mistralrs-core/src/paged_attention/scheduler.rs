@@ -53,10 +53,6 @@ pub struct PagedAttentionScheduler {
     pub block_engine: Arc<tokio::sync::Mutex<BlockEngine>>,
     block_size: usize,
     prefix_caching_enabled: bool,
-    /// Pipeline parallelism sequences, keyed by request_id.
-    /// Separate from waiting/running because PP sequences persist across
-    /// multiple forward passes and need immediate access by request_id.
-    pp_sequences: HashMap<uuid::Uuid, Sequence>,
 }
 
 impl PagedAttentionScheduler {
@@ -74,7 +70,6 @@ impl PagedAttentionScheduler {
             block_size: cache_config.block_size,
             config,
             prefix_caching_enabled: true,
-            pp_sequences: HashMap::new(),
         }
     }
 
@@ -561,21 +556,5 @@ impl Scheduler for PagedAttentionScheduler {
     }
     fn advance_prefill_chunk_offsets(&mut self) {
         self.advance_prefill_chunk_offsets()
-    }
-
-    fn has_pp_sequence(&self, request_id: uuid::Uuid) -> bool {
-        self.pp_sequences.contains_key(&request_id)
-    }
-
-    fn get_pp_sequence_mut(&mut self, request_id: uuid::Uuid) -> Option<&mut Sequence> {
-        self.pp_sequences.get_mut(&request_id)
-    }
-
-    fn add_pp_sequence(&mut self, seq: Sequence) {
-        self.pp_sequences.insert(seq.request_id(), seq);
-    }
-
-    fn remove_pp_sequence(&mut self, request_id: uuid::Uuid) -> Option<Sequence> {
-        self.pp_sequences.remove(&request_id)
     }
 }
