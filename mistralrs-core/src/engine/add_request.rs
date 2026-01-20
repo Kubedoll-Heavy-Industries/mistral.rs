@@ -1039,6 +1039,16 @@ impl Engine {
             !seqs.contains_key(&request_id)
         };
 
+        // Check if this is first stage (HEAD) - needs external logits from downstream.
+        // First stage runs sampling locally, so tokens accumulate via add_token().
+        // Non-first stages receive tokens from upstream and must track them explicitly.
+        let is_first_stage = {
+            let pipeline = get_mut_arcmutex!(self.pipeline);
+            pipeline
+                .get_hook()
+                .is_some_and(|h| h.needs_external_logits())
+        };
+
         if is_first_activation {
             // First activation: Create new sequence with full setup
             let num_hidden_layers = get_mut_arcmutex!(self.pipeline)
@@ -1135,19 +1145,23 @@ impl Engine {
                 seqs.insert(request_id, seq);
             }
         } else {
-            // Subsequent activation: Replace tokens with current chunk (not accumulate)
-            // KV cache grows via CacheInstruction::In, token_offset provides RoPE position
+            // Subsequent activation: Accumulate tokens for correct position tracking.
+            // With one persistent sequence per request, seq.len() drives position calculation.
             let mut seqs = self.pipeline_sequences.lock().unwrap();
             if let Some(seq) = seqs.get_mut(&request_id) {
-                // Replace tokens with just this chunk - forward pass processes only new tokens
-                // while token_offset ensures correct RoPE positions
-                seq.set_tokens_for_pp(&tokens);
-                // Update token offset to match Stage 0's position
-                seq.set_token_offset(sequence_position);
+                if is_first_stage {
+                    // HEAD (Stage 0): Don't modify tokens.
+                    // Tokens accumulate naturally via add_token() during sampling.
+                    // Position = seq.len() - 1 which increments correctly.
+                } else {
+                    // TAIL (non-first stages): Append new tokens to track full sequence.
+                    // Position = seq.len() - 1 which increments correctly.
+                    seq.append_tokens_for_pp(&tokens);
+                }
                 // Update responder so response goes to THIS request's channel
                 seq.set_responder(request.response.clone());
-                // Reset state to prompt for fresh forward pass
-                seq.set_state(SequenceState::RunningPrompt);
+                // Decode steps: transition to completion state
+                seq.set_state(SequenceState::RunningCompletion);
             }
         }
 
@@ -1199,14 +1213,8 @@ impl Engine {
                     block_engine: block_engine.clone(),
                 };
 
-                // Re-allocate block tables for subsequent activations where tokens were replaced.
-                // set_tokens_for_pp resets logical blocks but doesn't update physical block tables,
-                // so we need to free the old allocation and re-allocate based on new token count.
-                if !is_first_activation {
-                    let mut engine = get_mut_arcmutex!(block_engine);
-                    engine.free_sequence(*seq.id());
-                    engine.allocate(&mut seq);
-                }
+                // Block allocation grows incrementally via get_slot_mappings() in make_completion_chunk.
+                // Since we append tokens instead of replacing them, no free/reallocate needed.
 
                 CacheBackendMetadata::PagedAttention {
                     metadata,
@@ -1227,15 +1235,7 @@ impl Engine {
             }
         };
 
-        // Phase 3: Check stage type (brief lock)
-        let is_first_stage = {
-            let pipeline = get_mut_arcmutex!(self.pipeline);
-            pipeline
-                .get_hook()
-                .is_some_and(|h| h.needs_external_logits())
-        };
-
-        // Phase 4: Execute pipeline operation
+        // Phase 3: Execute pipeline operation (is_first_stage already computed above)
         // Pipeline lock is held during operation but pipeline_sequences is free
         let mut seq_refs: Vec<&mut Sequence> = vec![&mut seq];
 
