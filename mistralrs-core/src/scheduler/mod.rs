@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub use default_scheduler::{DefaultScheduler, DefaultSchedulerMethod, DefaultSchedulerOutput};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::{
     engine::IntervalLogger,
@@ -81,4 +82,22 @@ pub trait Scheduler: Send + Sync {
     /// Called by the engine after processing a batch of prefill chunks.
     /// Default implementation does nothing (for schedulers that don't support chunked prefill).
     fn advance_prefill_chunk_offsets(&mut self) {}
+
+    // Pipeline parallelism support: sequences accessed by request_id (UUID)
+    // instead of being batched through schedule().
+
+    /// Check if a PP sequence exists by request_id.
+    fn has_pp_sequence(&self, request_id: Uuid) -> bool;
+
+    /// Get a mutable reference to a PP sequence by request_id.
+    /// Returns None if not found.
+    fn get_pp_sequence_mut(&mut self, request_id: Uuid) -> Option<&mut Sequence>;
+
+    /// Add a PP sequence. Unlike `add_seq()`, PP sequences persist across
+    /// multiple forward passes and are accessed directly by request_id.
+    fn add_pp_sequence(&mut self, seq: Sequence);
+
+    /// Remove and return a PP sequence by its request_id.
+    /// Used for cleanup when a request completes.
+    fn remove_pp_sequence(&mut self, request_id: Uuid) -> Option<Sequence>;
 }

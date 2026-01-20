@@ -1034,12 +1034,6 @@ impl Engine {
             }
         }
 
-        // Check if we have an existing sequence for this request
-        let is_first_activation = {
-            let seqs = self.pipeline_sequences.lock().unwrap();
-            !seqs.contains_key(&request_id)
-        };
-
         // Check if this is first stage (HEAD) - needs external logits from downstream.
         // First stage runs sampling locally, so tokens accumulate via add_token().
         // Non-first stages receive tokens from upstream and must track them explicitly.
@@ -1050,7 +1044,11 @@ impl Engine {
                 .is_some_and(|h| h.needs_external_logits())
         };
 
-        if is_first_activation {
+        // Check if we have an existing sequence for this request (in scheduler's PP storage)
+        let is_first_activation = !get_mut_arcmutex!(self.scheduler).has_pp_sequence(request_id);
+
+        // Get or create the sequence - owned for duration of forward pass
+        let mut seq = if is_first_activation {
             // First activation: Create new sequence with full setup
             let num_hidden_layers = get_mut_arcmutex!(self.pipeline)
                 .get_metadata()
@@ -1140,48 +1138,13 @@ impl Engine {
             }
 
             *get_mut_arcmutex!(self.id) += 1;
-
-            {
-                let mut seqs = self.pipeline_sequences.lock().unwrap();
-                seqs.insert(request_id, seq);
-            }
+            seq
         } else {
-            // Subsequent activation: Handle prefill chunks vs decode steps differently.
-            let is_prompt_chunk = sequence_position < initial_seq_len;
-            let mut seqs = self.pipeline_sequences.lock().unwrap();
-            if let Some(seq) = seqs.get_mut(&request_id) {
-                if is_first_stage {
-                    // HEAD (Stage 0): Don't modify tokens or offset.
-                    // Tokens accumulate naturally via add_token() during sampling.
-                } else {
-                    // TAIL stages: receive tokens from upstream
-                    seq.receive_tokens(&tokens, is_prompt_chunk);
-                    if is_prompt_chunk {
-                        seq.set_token_offset(sequence_position);
-                    }
-                }
-                // Update responder so response goes to THIS request's channel
-                seq.set_responder(request.response.clone());
-                // Prefill chunks stay in prompt state; decode transitions to completion
-                if is_prompt_chunk {
-                    seq.set_state(SequenceState::RunningPrompt);
-                } else {
-                    seq.set_state(SequenceState::RunningCompletion);
-                }
-            }
-        }
-
-        // Run forward pass directly, bypassing scheduler
-        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
-
-        // Phase 1: Extract sequence from map to release lock during await
-        // This prevents deadlock when multiple pipeline requests run concurrently
-        let mut seq = {
-            let mut seqs = self.pipeline_sequences.lock().unwrap();
-            match seqs.remove(&request_id) {
+            // Subsequent activation: Remove from scheduler, update, then proceed to forward
+            let mut seq = match get_mut_arcmutex!(self.scheduler).remove_pp_sequence(request_id) {
                 Some(s) => s,
                 None => {
-                    tracing::error!(%request_id, "Sequence not found in pipeline_sequences");
+                    tracing::error!(%request_id, "PP sequence not found in scheduler");
                     let _ = request
                         .response
                         .send(Response::InternalError(
@@ -1190,8 +1153,33 @@ impl Engine {
                         .await;
                     return;
                 }
+            };
+
+            // Handle prefill chunks vs decode steps differently
+            let is_prompt_chunk = sequence_position < initial_seq_len;
+            if is_first_stage {
+                // HEAD (Stage 0): Don't modify tokens or offset.
+                // Tokens accumulate naturally via add_token() during sampling.
+            } else {
+                // TAIL stages: receive tokens from upstream
+                seq.receive_tokens(&tokens, is_prompt_chunk);
+                if is_prompt_chunk {
+                    seq.set_token_offset(sequence_position);
+                }
             }
+            // Update responder so response goes to THIS request's channel
+            seq.set_responder(request.response.clone());
+            // Prefill chunks stay in prompt state; decode transitions to completion
+            if is_prompt_chunk {
+                seq.set_state(SequenceState::RunningPrompt);
+            } else {
+                seq.set_state(SequenceState::RunningCompletion);
+            }
+            seq
         };
+
+        // Run forward pass (scheduler lock released, sequence is owned)
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
 
         // Phase 2: Check first forward status (brief lock)
         let is_first_forward = {
@@ -1356,11 +1344,8 @@ impl Engine {
             }
         }
 
-        // Phase 5: Re-insert sequence for future use on success
-        self.pipeline_sequences
-            .lock()
-            .unwrap()
-            .insert(request_id, seq);
+        // Re-insert sequence into scheduler for future activations
+        get_mut_arcmutex!(self.scheduler).add_pp_sequence(seq);
     }
 
     /// Handle cleanup signal for a pipeline request.
@@ -1369,12 +1354,12 @@ impl Engine {
     async fn handle_pipeline_cleanup(&self, request_id: uuid::Uuid) {
         tracing::debug!(%request_id, "Pipeline cleanup requested");
 
-        // Remove from pipeline_sequences and free associated PagedAttention blocks
-        if let Ok(mut seqs) = self.pipeline_sequences.lock() {
-            if let Some(seq) = seqs.remove(&request_id) {
-                tracing::debug!(%request_id, seq_id = *seq.id(), "Removed sequence from pipeline_sequences");
+        // Remove PP sequence from scheduler and free associated PagedAttention blocks
+        {
+            let mut scheduler = get_mut_arcmutex!(self.scheduler);
+            if let Some(seq) = scheduler.remove_pp_sequence(request_id) {
+                tracing::debug!(%request_id, seq_id = *seq.id(), "Removed PP sequence from scheduler");
                 // Free PagedAttention blocks allocated for this sequence
-                let scheduler = get_mut_arcmutex!(self.scheduler);
                 if let Some(block_engine) = scheduler.block_engine() {
                     get_mut_arcmutex!(block_engine).free_sequence(*seq.id());
                     tracing::debug!(%request_id, seq_id = *seq.id(), "Freed PagedAttention blocks");
