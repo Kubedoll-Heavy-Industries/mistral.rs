@@ -1471,8 +1471,15 @@ impl Sequence {
     /// This resets the logical token blocks before appending, ensuring the block
     /// count matches the token count. Without this, subsequent calls would accumulate
     /// blocks incorrectly, causing slot mapping mismatches and CUDA memory errors.
+    ///
+    /// Also clears prefill state so that `get_toks()` returns these tokens, not any
+    /// stale `prefill_prompt_toks` from the original sequence creation.
     pub fn set_tokens_for_pp(&mut self, tokens: &[u32]) {
         self.tokens = tokens.to_vec();
+        // Clear prefill state so get_toks() returns self.tokens
+        self.prefill_prompt_toks = None;
+        self.prefill_chunk_offset = 0;
+        self.prefill_chunk_size = None;
         // Reset blocks before appending to avoid accumulation across activations
         self.custom_metadata.reset_blocks();
         self.custom_metadata
