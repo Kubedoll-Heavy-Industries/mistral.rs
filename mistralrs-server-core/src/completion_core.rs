@@ -4,7 +4,7 @@ use std::error::Error;
 
 use anyhow::Result;
 use axum::response::Sse;
-use mistralrs_core::{DrySamplingParams, MistralRs, StopTokens as InternalStopTokens};
+use mistralrs_core::{DryTokenSamplingParams, MistralRs, StopTokens as InternalStopTokens};
 
 use crate::{openai::StopTokens, types::SharedMistralRsState, util::sanitize_error_message};
 
@@ -54,10 +54,10 @@ pub(crate) fn get_dry_sampling_params(
     dry_sequence_breakers: Option<Vec<String>>,
     dry_base: Option<f32>,
     dry_allowed_length: Option<usize>,
-) -> Result<Option<DrySamplingParams>> {
+) -> Result<Option<DryTokenSamplingParams>> {
     match dry_multiplier {
         Some(multiplier) => {
-            let params = DrySamplingParams::new_with_defaults(
+            let params = DryTokenSamplingParams::new_with_defaults(
                 multiplier,
                 dry_sequence_breakers,
                 dry_base,

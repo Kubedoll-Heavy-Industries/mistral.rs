@@ -74,16 +74,10 @@ impl SingleCache {
 
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
-        // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
-        // self.all_data.get_or_insert_with.
-        if self.all_data.is_none() {
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.capacity_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            self.all_data = Some(ad);
-        };
 
-        // Expand kv cache
+        // Expand capacity FIRST - must happen before initial allocation to ensure
+        // capacity_seq_len > 0. This handles both fresh caches (capacity=0) and
+        // existing caches that need to grow.
         if self.current_seq_len + seq_len > self.capacity_seq_len {
             let diff = self.current_seq_len + seq_len - self.capacity_seq_len;
             let n_blocks_needed = diff.div_ceil(NormalCache::CACHE_GROW_SIZE);
@@ -95,10 +89,24 @@ impl SingleCache {
                     self.max_seq_len
                 )
             }
+
+            // Allocate new tensor with expanded capacity
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.capacity_seq_len;
             let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            ad.slice_set(self.all_data.as_ref().unwrap(), self.dim, 0)?;
+
+            // Copy existing data if any (grow case, not fresh allocation)
+            if let Some(old_data) = self.all_data.as_ref() {
+                ad.slice_set(old_data, self.dim, 0)?;
+            }
+            self.all_data = Some(ad);
+        }
+
+        // Allocate if not yet allocated (handles edge case where capacity > 0 but all_data is None)
+        if self.all_data.is_none() {
+            let mut shape = src.dims().to_vec();
+            shape[self.dim] = self.capacity_seq_len;
+            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
             self.all_data = Some(ad);
         }
 

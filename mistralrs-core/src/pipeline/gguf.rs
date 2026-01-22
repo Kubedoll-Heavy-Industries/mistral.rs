@@ -8,6 +8,8 @@ use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
     MetadataMixin, ModelCategory, PreProcessingMixin,
 };
+use crate::models::{PagedAttentionContext, TransformContext, TransformerModel};
+use crate::pipeline::hooks::ActivationResult;
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
 use crate::gguf::{
@@ -910,21 +912,8 @@ impl Pipeline for GGUFPipeline {
 
             use crate::pipeline::text_models_inputs_processor::InferenceStep;
             if let InferenceStep::Prefill { total_prompt_tokens, .. } = inference_step {
-                tracing::info!(
-                    %request_id,
-                    total_prompt_tokens,
-                    "GGUF forward_inputs: Calling init_pipeline_request on hook (Prefill)"
-                );
                 hook.call_init_pipeline_request(request_id, total_prompt_tokens);
-            } else {
-                tracing::debug!(
-                    %request_id,
-                    ?inference_step,
-                    "GGUF forward_inputs: Skipping init (not Prefill)"
-                );
             }
-        } else {
-            tracing::debug!(%request_id, "GGUF forward_inputs: No hook attached");
         }
 
         let metadata = self.get_metadata();
@@ -963,15 +952,26 @@ impl Pipeline for GGUFPipeline {
             )?,
             Model::Phi3(ref model) => {
                 // Pipeline parallelism: receive activation from previous stage if not first stage
-                let input_activation = if let Some(hook) = model.get_hook() {
-                    hook.receive_stage_input()?
+                let received = if let Some(hook) = model.get_hook() {
+                    hook.receive_stage_input(request_id)?
                 } else {
                     None
                 };
 
+                // For TAIL stages, use received activation
+                // Position derived from cache (stream cursor model)
+                // Cache lifecycle (reset vs continue) is handled by the engine via CacheInstruction.
+                let input_activation: Option<&Tensor> = match &received {
+                    Some(ActivationResult::Data { tensor }) => Some(tensor),
+                    Some(ActivationResult::Completed { reason }) => {
+                        return Ok(ForwardInputsResult::PipelineCompleted { reason: *reason });
+                    }
+                    None => None,
+                };
+
                 let output = model.forward(
                     &input_ids,
-                    input_activation.as_ref(),
+                    input_activation,
                     input_ids_full.as_ref(),
                     &seqlen_offsets,
                     paged_attn_meta,
@@ -1021,38 +1021,106 @@ impl Pipeline for GGUFPipeline {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen3(ref model) => {
-                // Pipeline parallelism: receive activation from previous stage if not first stage
-                let input_activation = if let Some(hook) = model.get_hook() {
-                    hook.receive_stage_input()?
+                // ====================================================================
+                // Pipeline Parallelism using TransformerModel trait
+                // ====================================================================
+                //
+                // Clean abstraction: embed → transform → lm_head
+                // - HEAD: embed(tokens) → transform(hidden) → send to TAIL
+                // - TAIL: receive → transform(hidden) → lm_head(hidden) → return logits
+                //
+                // No more "input_activation" hack - each stage calls the methods it needs.
+
+                // Step 1: Receive activation from previous stage (if TAIL)
+                let received = if let Some(hook) = model.get_hook() {
+                    hook.receive_stage_input(request_id)?
                 } else {
                     None
                 };
 
-                let output = model.forward(
-                    &input_ids,
-                    input_activation.as_ref(),
-                    &seqlen_offsets,
-                    context_lens.clone(),
-                    paged_attn_meta,
-                )?;
+                // Handle completion signal from HEAD
+                if let Some(ActivationResult::Completed { reason }) = &received {
+                    return Ok(ForwardInputsResult::PipelineCompleted { reason: *reason });
+                }
 
-                // Pipeline parallelism flow:
-                // - First stage (non-last): send hidden states → wait for logits → return
-                // - Middle stage: send hidden states → done (shouldn't happen in 2-stage PP)
-                // - Last stage: return logits (worker sends them back to first stage)
-                // - Single stage: no hook, just return logits
+                // Step 2: Determine hidden states and position
+                // Position comes from cache (stream cursor model) - no metadata needed.
+                // Cache lifecycle (reset vs continue) is handled by the engine via CacheInstruction.
+                // Track activation info for PP TAIL state machine.
+                let (hidden, position_offset, effective_context_lens, tail_activation_info) = match &received {
+                    Some(ActivationResult::Data { tensor }) => {
+                        // TAIL stage: use received activation
+                        // Position from stream cursor: cache.current_seq_len() is where we are.
+                        let cache = model.cache.normal();
+                        let cache_position = cache.0.first().map(|kv| kv.current_seq_len()).unwrap_or(0);
+                        drop(cache);
+
+                        let seq_len = tensor.dims()[1];
+                        let ctx_lens = vec![(0, seq_len)];
+
+                        tracing::debug!(
+                            ?request_id,
+                            seq_len,
+                            cache_position,
+                            "PP TAIL: Using received activation"
+                        );
+
+                        // Capture activation info for InferenceStep computation
+                        (tensor.clone(), cache_position, ctx_lens, Some((seq_len, cache_position)))
+                    }
+                    _ => {
+                        // HEAD stage or no PP: compute embeddings locally
+                        let hidden = model.embed(&input_ids)?;
+                        let position_offset = seqlen_offsets.first().copied().unwrap_or(0);
+
+                        tracing::debug!(
+                            ?request_id,
+                            position_offset,
+                            hidden_shape = ?hidden.shape(),
+                            "PP HEAD: Computed embeddings"
+                        );
+
+                        (hidden, position_offset, context_lens.clone(), None)
+                    }
+                };
+
+                // Step 3: Build transform context
+                let paged_attn_ctx = paged_attn_meta.map(|(kv_cache, metadata)| {
+                    PagedAttentionContext { kv_cache, metadata }
+                });
+                let ctx = TransformContext {
+                    seq_len: hidden.dims()[1],
+                    position_offset,
+                    paged_attn: paged_attn_ctx.as_ref(),
+                };
+
+                // Step 4: Transform through layers
+                let hidden = model.transform(hidden, &ctx)?;
+
+                tracing::debug!(
+                    ?request_id,
+                    hidden_shape = ?hidden.shape(),
+                    "PP: After transform"
+                );
+
+                // Step 5: Route based on pipeline stage
                 if let Some(hook) = model.get_hook() {
-                    if !hook.is_last_stage() {
-                        // Non-last stage: send hidden states to next stage
+                    if !model.has_lm_head() {
+                        // HEAD stage: send hidden to TAIL, wait for logits
                         let tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
                         let sequence_position = seqlen_offsets.first().copied().unwrap_or(0);
-                        hook.send_stage_output(&output, &tokens, request_id, sequence_position)?;
 
-                        // First stage needs to wait for logits from last stage
+                        tracing::debug!(
+                            ?request_id,
+                            hidden_shape = ?hidden.shape(),
+                            num_tokens = tokens.len(),
+                            "PP HEAD: Sending to next stage"
+                        );
+
+                        hook.send_stage_output(&hidden, &tokens, request_id, sequence_position)?;
+
                         if hook.needs_external_logits() {
                             let logits = hook.receive_response_logits()?;
-                            // receive_response_logits returns [batch, vocab_size] (already extracted last position)
-                            // Sampling expects [batch, seq_len, vocab_size], so unsqueeze to [batch, 1, vocab]
                             let logits_3d = logits.unsqueeze(1)?;
                             if return_raw_logits {
                                 return Ok(ForwardInputsResult::RawLogits { logits: logits_3d });
@@ -1061,18 +1129,41 @@ impl Pipeline for GGUFPipeline {
                             }
                         }
 
-                        // Middle stages (if any) just return - they don't produce logits
-                        // This shouldn't happen in 2-stage PP
                         return Err(candle_core::Error::Msg(
-                            "Middle stage in PP should not reach here".to_string()
+                            "HEAD stage without external logits should not reach here".to_string()
                         ));
                     }
-                    // Last stage: fall through and return logits normally
-                    // Worker will extract from Response::Raw and send to first stage
                 }
 
-                // Last stage or no PP: output is logits
-                output
+                // TAIL stage or no PP: apply lm_head
+                let logits = model.lm_head(hidden)?;
+                let logits = crate::pipeline::extract_logits(&logits, effective_context_lens)?;
+
+                // For PP TAIL: return PipelineLogits with InferenceStep computed from activation shape
+                if let Some((activation_seq_len, cache_position)) = tail_activation_info {
+                    use crate::pipeline::text_models_inputs_processor::InferenceStep;
+                    // Get total_prompt_tokens from the inference_step we received
+                    let total_prompt_tokens = match &inference_step {
+                        InferenceStep::Prefill { total_prompt_tokens, .. } => *total_prompt_tokens,
+                        InferenceStep::Decode { position, .. } => *position, // fallback
+                    };
+                    let corrected_step = InferenceStep::from_activation_shape(
+                        activation_seq_len,
+                        cache_position,
+                        total_prompt_tokens,
+                    );
+                    tracing::debug!(
+                        ?request_id,
+                        ?corrected_step,
+                        "PP TAIL: Returning PipelineLogits with InferenceStep"
+                    );
+                    return Ok(ForwardInputsResult::PipelineLogits {
+                        logits,
+                        inference_step: corrected_step,
+                    });
+                }
+
+                logits
             }
             Model::Qwen3MoE(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta, request_id)?

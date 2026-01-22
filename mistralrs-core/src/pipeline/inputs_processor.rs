@@ -166,8 +166,20 @@ pub mod text_models_inputs_processor {
         for (seq_id, ctxt) in seq_ids.iter().zip(toks) {
             let prompt_len = ctxt.len();
             let offset = last_n_context_len.unwrap_or_default();
-            seqlen_offsets.push(offset.1 + chunk_offset_toks);
+            let seqlen_offset = offset.1 + chunk_offset_toks;
 
+            // Investigation tracing for PP RoPE position
+            if return_raw_logits {
+                tracing::info!(
+                    seq_id,
+                    chunk_offset_toks,
+                    prompt_len,
+                    seqlen_offset,
+                    "make_prompt_chunk: PP sequence RoPE position"
+                );
+            }
+
+            seqlen_offsets.push(seqlen_offset);
             position_ids.push(ctxt.len() + chunk_offset_toks);
             let mut ctxt = ctxt.to_vec();
             ctxt.extend(std::iter::repeat_n(
@@ -401,6 +413,19 @@ pub mod text_models_inputs_processor {
             let start_pos = std::cmp::max(seq.token_offset(), seq.len().saturating_sub(1));
             let ctxt_offset = ctxt.len().saturating_sub(1);
             let ctxt = ctxt[ctxt_offset..].to_vec();
+
+            // Investigation tracing for PP RoPE position
+            if seq.return_raw_logits {
+                tracing::info!(
+                    request_id = %seq.request_id(),
+                    token_offset = seq.token_offset(),
+                    seq_len = seq.len(),
+                    start_pos,
+                    prompt_tokens = seq.prompt_tokens(),
+                    "make_completion_chunk: PP sequence RoPE position"
+                );
+            }
+
             seqlen_offsets.push(start_pos);
             context_lens.push((0, 1));
             position_ids.push(seq.len());
@@ -721,6 +746,36 @@ pub mod text_models_inputs_processor {
                 }
             }
         }
+
+        /// Construct InferenceStep from activation shape for PP TAIL stages.
+        ///
+        /// For TAIL stages receiving hidden states (not tokens), the activation tensor's
+        /// sequence dimension IS the state machine:
+        /// - seq_len > 1: Prefill (processing chunk of prompt)
+        /// - seq_len == 1: Decode (generating single token)
+        ///
+        /// Position comes from cache (stream cursor model).
+        pub fn from_activation_shape(
+            activation_seq_len: usize,
+            kv_cache_position: usize,
+            total_prompt_tokens: usize,
+        ) -> Self {
+            // Decode: single position AND past prompt boundary
+            let is_decode = activation_seq_len == 1 && kv_cache_position >= total_prompt_tokens;
+
+            if is_decode {
+                InferenceStep::Decode {
+                    token: 0, // TAIL doesn't have token, just position
+                    position: kv_cache_position,
+                }
+            } else {
+                InferenceStep::Prefill {
+                    chunk_tokens: vec![], // TAIL doesn't have tokens
+                    chunk_start_position: kv_cache_position,
+                    total_prompt_tokens,
+                }
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -884,11 +939,25 @@ pub mod text_models_inputs_processor {
                     seq_indices,
                 })
             } else if is_prompt {
+                // For PP continuation sequences (TAIL stages), tokens are empty but we need
+                // placeholder tensors. The model's forward function will receive actual
+                // activations via receive_stage_input() and ignore these placeholders.
+                let toks: Vec<Vec<u32>> = input_seqs
+                    .iter()
+                    .map(|seq| {
+                        if seq.is_pp_continuation() {
+                            // PP continuation: create placeholder tokens of logical length
+                            // These are ignored by the model - activations come from the stream
+                            vec![0u32; seq.prompt_len()]
+                        } else {
+                            seq.get_toks().to_vec()
+                        }
+                    })
+                    .collect();
+                let toks_refs: Vec<&[u32]> = toks.iter().map(|v| v.as_slice()).collect();
+
                 let metadata = get_prompt_input(
-                    input_seqs
-                        .iter()
-                        .map(|seq| seq.get_toks())
-                        .collect::<Vec<_>>(),
+                    toks_refs,
                     input_seqs,
                     device,
                     last_n_context_len,

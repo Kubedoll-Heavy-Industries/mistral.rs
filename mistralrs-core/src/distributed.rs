@@ -167,14 +167,6 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
                             }
                             continue;
                         }
-                        Request::PipelineCleanup { request_id } => {
-                            // Forward cleanup request - no response expected
-                            let req = Request::PipelineCleanup { request_id };
-                            if request_sender.send(req).await.is_err() {
-                                tracing::error!("Daemon channel closed for PipelineCleanup request");
-                            }
-                            continue;
-                        }
                     };
 
                     if request_sender.send(req).await.is_err() {
@@ -247,12 +239,6 @@ pub fn ring_daemon_replicator(request_sender: Sender<Request>) {
                             request_sender.send(req).await.unwrap();
                             let resp = receiver.recv().await.unwrap();
                             resp.as_result().unwrap();
-                            continue;
-                        }
-                        Request::PipelineCleanup { request_id } => {
-                            // Forward cleanup request - no response expected
-                            let req = Request::PipelineCleanup { request_id };
-                            request_sender.send(req).await.unwrap();
                             continue;
                         }
                     };

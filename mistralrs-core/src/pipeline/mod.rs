@@ -40,6 +40,7 @@ pub use gguf_embedding::{
 };
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
+pub use inputs_processor::text_models_inputs_processor::InferenceStep;
 pub(crate) use isq::IsqModelLoader;
 pub use isq::{parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER};
 use llguidance::toktrie::TokEnv;
@@ -76,7 +77,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 pub use vision::{VisionLoader, VisionLoaderBuilder, VisionSpecificConfig};
-pub use hooks::{HookContainer, LayerActivation, PipelineHook};
+pub use hooks::{ActivationResult, HookContainer, LayerActivation, PipelineHook};
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, Var};
@@ -414,6 +415,21 @@ pub enum ForwardInputsResult {
         rates: Vec<usize>,
         channels: Vec<usize>,
     },
+    /// Pipeline parallelism: request completed by another stage.
+    /// TAIL received stop signal from HEAD - no logits to return.
+    /// Engine should transition sequence to Done state.
+    PipelineCompleted {
+        reason: crate::StopReason,
+    },
+    /// Pipeline parallelism: logits from TAIL stage with InferenceStep.
+    /// For PP TAIL, InferenceStep is computed from activation shape (the state machine).
+    /// handle_result uses this for proper sequence state transition.
+    PipelineLogits {
+        logits: Tensor,
+        /// InferenceStep computed from activation shape.
+        /// Prefill = stay in RunningPrompt, Decode = transition to RunningCompletion.
+        inference_step: InferenceStep,
+    },
 }
 
 impl ForwardInputsResult {
@@ -449,6 +465,11 @@ impl ForwardInputsResult {
                 rates: vec![rates[bs_idx]],
                 channels: vec![channels[bs_idx]],
             }),
+            Self::PipelineCompleted { reason } => Ok(Self::PipelineCompleted { reason: *reason }),
+            Self::PipelineLogits { logits, inference_step } => Ok(Self::PipelineLogits {
+                logits: logits.i(bs_idx)?,
+                inference_step: inference_step.clone(),
+            }),
         }
     }
 
@@ -474,6 +495,11 @@ impl ForwardInputsResult {
             }),
             Self::Image { .. } => Ok(self.clone()),
             Self::Speech { .. } => Ok(self.clone()),
+            Self::PipelineCompleted { reason } => Ok(Self::PipelineCompleted { reason: *reason }),
+            Self::PipelineLogits { logits, inference_step } => Ok(Self::PipelineLogits {
+                logits: logits.to_device(device)?,
+                inference_step: inference_step.clone(),
+            }),
         }
     }
 }
@@ -730,7 +756,20 @@ pub trait Pipeline:
                     .into_iter()
                     .map(|idx| vec![logits.i(idx).unwrap().to_device(&Device::Cpu).unwrap()])
                     .collect();
-                response::send_raw_responses(input_seqs, raw_logits).await?;
+                // PP sequences need to stay alive for subsequent activations.
+                // Only mark as done if no sequence has return_raw_logits set.
+                let mark_done = !input_seqs.iter().any(|seq| seq.return_raw_logits);
+                response::send_raw_responses(input_seqs, raw_logits, mark_done).await?;
+
+                // For PP decode steps, increment token_offset after forward completes.
+                // This is analogous to how add_token() increments seq.len() for HEAD stages.
+                for seq in input_seqs.iter_mut() {
+                    if seq.return_raw_logits
+                        && matches!(seq.getstate(), crate::sequence::SequenceState::RunningCompletion)
+                    {
+                        seq.increment_token_offset();
+                    }
+                }
             }
             ForwardInputsResult::Embeddings { embeddings } => {
                 let emb_list: Vec<Vec<f32>> = seq_indices
@@ -770,6 +809,45 @@ pub trait Pipeline:
             ForwardInputsResult::Rerank { .. } => {
                 candle_core::bail!("Rerank not supported in step()")
             }
+            ForwardInputsResult::PipelineCompleted { reason } => {
+                // Pipeline parallelism: TAIL stage received completion from HEAD.
+                // Transition all sequences to Done state with the provided reason.
+                for seq in input_seqs.iter_mut() {
+                    seq.set_state(crate::sequence::SequenceState::Done(reason));
+                }
+            }
+            ForwardInputsResult::PipelineLogits { logits, inference_step } => {
+                // Pipeline parallelism: TAIL stage logits with InferenceStep state machine.
+                // The InferenceStep (computed from activation shape) drives state transition.
+                let raw_logits: Vec<Vec<Tensor>> = seq_indices
+                    .into_iter()
+                    .map(|idx| vec![logits.i(idx).unwrap().to_device(&Device::Cpu).unwrap()])
+                    .collect();
+                // PP sequences stay alive for subsequent activations.
+                response::send_raw_responses(input_seqs, raw_logits, false).await?;
+
+                // State transition driven by InferenceStep (the state machine).
+                use crate::sequence::SequenceState;
+                for seq in input_seqs.iter_mut() {
+                    if !seq.return_raw_logits {
+                        continue; // Not a PP sequence
+                    }
+                    match &inference_step {
+                        InferenceStep::Prefill { .. } => {
+                            // Stay in RunningPrompt - still building KV cache
+                        }
+                        InferenceStep::Decode { .. } => {
+                            // Transition to RunningCompletion if not already
+                            if matches!(seq.getstate(), SequenceState::RunningPrompt) {
+                                seq.set_token_offset(seq.prompt_tokens());
+                                seq.set_state(SequenceState::RunningCompletion);
+                            }
+                            // Increment token_offset for decode steps
+                            seq.increment_token_offset();
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -793,6 +871,34 @@ pub trait Pipeline:
     fn supports_hooks(&self) -> bool {
         false
     }
+}
+
+/// Trait for pipelines that generate sequences autoregressively.
+///
+/// Autoregressive models generate one token at a time by:
+/// 1. Running forward pass to get logits (probability distribution over vocabulary)
+/// 2. Sampling from that distribution to select the next token
+/// 3. Feeding the sampled token back as input for the next step
+///
+/// This trait captures that pattern with an associated `SamplingParams` type for
+/// sampling configuration (temperature, top_k, top_p, penalties, etc.).
+/// Different model families may have different sampling parameters.
+pub trait AutoregressivePipeline: Pipeline {
+    /// The sampling parameters type for this pipeline.
+    type SamplingParams;
+
+    /// Sample the next token from logits.
+    fn sample(
+        &self,
+        logits: Tensor,
+        params: &Self::SamplingParams,
+        context: &[u32],
+        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+        return_logprobs: bool,
+    ) -> candle_core::Result<crate::sampler::Logprobs>;
+
+    /// Get the default sampling parameters for this pipeline.
+    fn default_params(&self) -> Self::SamplingParams;
 }
 
 pub(crate) fn extract_logits(

@@ -1,12 +1,12 @@
 use super::isq::ImatrixDataSource;
 use super::isq::UqffFullSer;
 use super::{
-    get_model_paths, get_xlora_paths, AdapterKind, AnyMoePipelineMixin, AutoVisionLoader,
-    CacheManager, CacheManagerMixin, EitherCache, ForwardInputsResult, Gemma3Loader,
-    GeneralMetadata, IsqPipelineMixin, Loader, MetadataMixin, MiniCpmOLoader, ModelCategory,
-    ModelKind, ModelPaths, MultimodalPromptPrefixer, Phi4MMLoader, PreProcessingMixin, Processor,
-    Qwen2VLLoader, Qwen3VLLoader, Qwen3VLMoELoader, TokenSource, VLlama4Loader, VLlamaLoader,
-    VisionModel, VisionModelLoader,
+    get_model_paths, get_xlora_paths, AdapterKind, AnyMoePipelineMixin, AutoregressivePipeline,
+    AutoVisionLoader, CacheManager, CacheManagerMixin, EitherCache, ForwardInputsResult,
+    Gemma3Loader, GeneralMetadata, IsqPipelineMixin, Loader, MetadataMixin, MiniCpmOLoader,
+    ModelCategory, ModelKind, ModelPaths, MultimodalPromptPrefixer, Phi4MMLoader,
+    PreProcessingMixin, Processor, Qwen2VLLoader, Qwen3VLLoader, Qwen3VLMoELoader, TokenSource,
+    VLlama4Loader, VLlamaLoader, VisionModel, VisionModelLoader,
 };
 use super::{
     Gemma3nLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader, Mistral3Loader,
@@ -33,6 +33,7 @@ use crate::utils::{
     tokens::get_token,
     varbuilder_utils::from_mmaped_safetensors,
 };
+use crate::sampler::{Logprobs, Sampler, TokenSamplingParams};
 use crate::vision_models::preprocessor_config::PreProcessorConfig;
 use crate::vision_models::processor_config::ProcessorConfig;
 use crate::vision_models::ModelInputs;
@@ -1168,5 +1169,39 @@ impl AnyMoePipelineMixin for VisionPipeline {
     }
     fn amoe_supported(&self) -> bool {
         self.model.amoe_supported()
+    }
+}
+
+impl AutoregressivePipeline for VisionPipeline {
+    type SamplingParams = TokenSamplingParams;
+
+    fn sample(
+        &self,
+        logits: Tensor,
+        params: &Self::SamplingParams,
+        context: &[u32],
+        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+        return_logprobs: bool,
+    ) -> candle_core::Result<Logprobs> {
+        let sampler = Sampler::new(
+            params.temperature,
+            params.top_n_logprobs,
+            self.tokenizer.clone().into(),
+            params.frequency_penalty,
+            params.presence_penalty,
+            params.repetition_penalty,
+            params.dry_params.clone(),
+            params.top_k.map(|k| k as i64).unwrap_or(-1),
+            params.top_p.unwrap_or(1.0),
+            params.min_p.unwrap_or(0.0),
+            vec![],
+        )
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+        sampler.sample(logits, context, return_logprobs, rng, false, false)
+    }
+
+    fn default_params(&self) -> Self::SamplingParams {
+        TokenSamplingParams::deterministic()
     }
 }

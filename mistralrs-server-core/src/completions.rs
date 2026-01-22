@@ -18,7 +18,7 @@ use axum::{
 };
 use mistralrs_core::{
     CompletionChunkResponse, CompletionResponse, Constraint, MistralRs, NormalRequest, Request,
-    Response, SamplingParams,
+    Response, TokenSamplingParams,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 use tracing::warn;
@@ -247,7 +247,7 @@ pub fn parse_request(
                     text: oairequest.prompt,
                     echo_prompt: oairequest.echo_prompt,
                     best_of: oairequest.best_of,
-                    sampling_params: SamplingParams {
+                    sampling_params: TokenSamplingParams {
                         temperature: oairequest.temperature,
                         top_k: oairequest.top_k,
                         top_p: oairequest.top_p,

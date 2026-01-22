@@ -4,10 +4,10 @@ use cli_table::{format::Justify, print_stdout, Cell, CellStruct, Style, Table};
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, initialize_logging, paged_attn_supported,
     parse_isq_value, Constraint, DefaultSchedulerMethod, DeviceLayerMapMetadata, DeviceMapMetadata,
-    DeviceMapSetting, DrySamplingParams, Loader, LoaderBuilder, MemoryGpuConfig, MistralRs,
+    DeviceMapSetting, DryTokenSamplingParams, Loader, LoaderBuilder, MemoryGpuConfig, MistralRs,
     InferenceExec, InferenceInput, InferenceOperation, ModelSelected, MistralRsBuilder,
     MistralRsConfig, MistralRsError, NormalRequest, PagedAttentionConfig, PagedCacheType, Pipeline,
-    Request, Response, SamplingParams, SchedulerConfig, TokenSource, Usage,
+    Request, Response, TokenSamplingParams, SchedulerConfig, TokenSource, Usage,
 };
 use std::fmt::Display;
 use std::sync::Arc;
@@ -54,7 +54,7 @@ async fn run_bench(
     repetitions: usize,
     test_name: TestName,
 ) -> anyhow::Result<BenchResult> {
-    let sampling_params = SamplingParams {
+    let sampling_params = TokenSamplingParams {
         temperature: Some(0.1),
         top_k: Some(32),
         top_p: Some(0.1),
@@ -67,7 +67,7 @@ async fn run_bench(
         stop_toks: None,
         logits_bias: None,
         n_choices: 1,
-        dry_params: Some(DrySamplingParams::default()),
+        dry_params: Some(DryTokenSamplingParams::default()),
     };
     let sender = mistralrs.get_sender(None).unwrap();
     let (tx, mut rx) = channel(10_000);
@@ -222,9 +222,9 @@ fn print_usage(model: &str, device: &Device, results: Vec<BenchResult>) {
 }
 
 async fn warmup_run(mistralrs: Arc<MistralRs>) {
-    let sampling_params = SamplingParams {
+    let sampling_params = TokenSamplingParams {
         max_len: Some(1),
-        ..SamplingParams::deterministic()
+        ..TokenSamplingParams::deterministic()
     };
     let sender = mistralrs.get_sender(None).unwrap();
     let (tx, mut rx) = channel(10_000);
@@ -543,9 +543,9 @@ async fn main() -> anyhow::Result<()> {
                     text: "Rust".to_string(),
                     echo_prompt: false,
                     best_of: None,
-                    sampling_params: SamplingParams {
+                    sampling_params: TokenSamplingParams {
                         max_len: Some(args.n_gen - 1),
-                        ..SamplingParams::deterministic()
+                        ..TokenSamplingParams::deterministic()
                     },
                     return_logprobs: false,
                     constraint: Constraint::None,
@@ -570,9 +570,9 @@ async fn main() -> anyhow::Result<()> {
                 mistralrs.clone(),
                 InferenceOperation::CompletionTokens {
                     tokens: tks,
-                    sampling_params: SamplingParams {
+                    sampling_params: TokenSamplingParams {
                         max_len: Some(1),
-                        ..SamplingParams::deterministic()
+                        ..TokenSamplingParams::deterministic()
                     },
                     return_logprobs: false,
                     constraint: Constraint::None,

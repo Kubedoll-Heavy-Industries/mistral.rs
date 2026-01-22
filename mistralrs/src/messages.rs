@@ -11,7 +11,7 @@ pub struct Chat {
     pub messages: Vec<IndexMap<String, MessageContent>>,
     pub attachments: ChatAttachments,
     pub controls: ChatControls,
-    pub sampling_params: SamplingParams,
+    pub sampling_params: TokenSamplingParams,
     pub constraint: Constraint,
     pub logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
     pub return_logprobs: bool,
@@ -25,7 +25,7 @@ impl Chat {
             messages: Vec::new(),
             attachments: ChatAttachments::default(),
             controls: ChatControls::default(),
-            sampling_params: SamplingParams::deterministic(),
+            sampling_params: TokenSamplingParams::deterministic(),
             constraint: Constraint::None,
             logits_processors: None,
             return_logprobs: false,
@@ -195,7 +195,7 @@ impl From<TextMessages> for Chat {
                 enable_thinking: value.enable_thinking,
                 ..ChatControls::default()
             },
-            sampling_params: SamplingParams::deterministic(),
+            sampling_params: TokenSamplingParams::deterministic(),
             constraint: Constraint::None,
             logits_processors: None,
             return_logprobs: false,
@@ -358,7 +358,7 @@ impl From<VisionMessages> for Chat {
                 enable_thinking: value.enable_thinking,
                 ..ChatControls::default()
             },
-            sampling_params: SamplingParams::deterministic(),
+            sampling_params: TokenSamplingParams::deterministic(),
             constraint: Constraint::None,
             logits_processors: None,
             return_logprobs: false,
@@ -388,7 +388,7 @@ pub struct RequestBuilder {
     constraint: Constraint,
     tools: Vec<Tool>,
     tool_choice: ToolChoice,
-    sampling_params: SamplingParams,
+    sampling_params: TokenSamplingParams,
     web_search_options: Option<WebSearchOptions>,
     enable_thinking: Option<bool>,
     truncate_sequence: bool,
@@ -412,7 +412,7 @@ impl From<TextMessages> for RequestBuilder {
             constraint: Constraint::None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
-            sampling_params: SamplingParams::deterministic(),
+            sampling_params: TokenSamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
             truncate_sequence: false,
@@ -432,7 +432,7 @@ impl From<VisionMessages> for RequestBuilder {
             constraint: Constraint::None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
-            sampling_params: SamplingParams::deterministic(),
+            sampling_params: TokenSamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
             truncate_sequence: false,
@@ -452,7 +452,7 @@ impl RequestBuilder {
             constraint: Constraint::None,
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
-            sampling_params: SamplingParams::deterministic(),
+            sampling_params: TokenSamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
             truncate_sequence: false,
@@ -648,7 +648,7 @@ impl RequestBuilder {
     }
 
     /// Set the sampling parameters as given.
-    pub fn set_sampling(mut self, params: SamplingParams) -> Self {
+    pub fn set_sampling(mut self, params: TokenSamplingParams) -> Self {
         self.sampling_params = params;
         self
     }
@@ -659,7 +659,7 @@ impl RequestBuilder {
     /// - No penalties, stop tokens, or logit bias
     /// - No maximum length
     pub fn set_deterministic_sampler(mut self) -> Self {
-        self.sampling_params = SamplingParams::deterministic();
+        self.sampling_params = TokenSamplingParams::deterministic();
         self
     }
 
@@ -718,7 +718,7 @@ impl RequestBuilder {
         self
     }
 
-    pub fn set_sampler_dry_params(mut self, dry_params: DrySamplingParams) -> Self {
+    pub fn set_sampler_dry_params(mut self, dry_params: DryTokenSamplingParams) -> Self {
         self.sampling_params.dry_params = Some(dry_params);
         self
     }

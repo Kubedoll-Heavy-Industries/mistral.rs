@@ -7,7 +7,7 @@ pub use engine::{
 };
 use hf_hub::Cache;
 pub use lora::Ordering;
-pub use pipeline::{ModelCategory, ModelCategoryKind};
+pub use pipeline::{AutoregressivePipeline, ModelCategory, ModelCategoryKind};
 pub use pipeline::Pipeline;
 #[cfg(feature = "pyo3_macros")]
 use pyo3::exceptions::PyValueError;
@@ -87,6 +87,7 @@ pub use tei_backend::{
 pub use tei_backend::{TeiBackendError, TeiEmbedding};
 
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
+pub use sequence::StopReason;
 pub use device_map::{
     DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, LayerDeviceMapper,
 };
@@ -110,7 +111,7 @@ pub use pipeline::{
     EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths,
     EmbeddingSpecificConfig, GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader,
     GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, HookContainer, Idefics2Loader,
-    IsqOrganization, LayerActivation, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader,
+    ActivationResult, IsqOrganization, LayerActivation, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader,
     LocalModelPaths, LoraAdapterPaths, MistralLoader, MixtralLoader, Modalities, ModelKind,
     ModelPaths, MultimodalPromptPrefixer, NonMappedSubModel, NormalLoader, NormalLoaderBuilder,
     NormalLoaderType, NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, PipelineHook,
@@ -127,7 +128,7 @@ pub use request::{
 };
 pub use response::*;
 pub use sampler::{
-    CustomLogitsProcessor, DrySamplingParams, SamplingParams, StopTokens, TopLogprob,
+    CustomLogitsProcessor, DryTokenSamplingParams, TokenSamplingParams, StopTokens, TopLogprob,
 };
 pub use scheduler::{DefaultSchedulerMethod, SchedulerConfig};
 pub use search::{SearchCallback, SearchCallbackFuture, SearchFunctionParameters, SearchResult};
@@ -216,6 +217,8 @@ struct EngineInstance {
     reboot_state: RebootState,
     config: MistralRsConfig,
     category: ModelCategory,
+    /// Scheduler for direct sequence cleanup (pipeline parallelism)
+    scheduler: Arc<tokio::sync::Mutex<dyn scheduler::Scheduler>>,
 }
 
 /// The MistralRs struct handles sending requests to multiple engines.
@@ -445,6 +448,10 @@ impl MistralRs {
             max_seq_len,
         };
 
+        // Create scheduler before spawning thread so we can share it with MistralRs
+        let scheduler = method.into_scheduler();
+        let scheduler_for_engine = scheduler.clone();
+
         let tx_for_engine = tx.clone();
         let engine_handler = thread::spawn(move || {
             #[cfg(feature = "metal")]
@@ -455,7 +462,7 @@ impl MistralRs {
                         tx_for_engine,
                         rx,
                         pipeline,
-                        method,
+                        scheduler_for_engine,
                         config.no_kv_cache,
                         config.no_prefix_cache,
                         config.prefix_cache_n,
@@ -479,7 +486,7 @@ impl MistralRs {
                         tx_for_engine,
                         rx,
                         pipeline,
-                        method,
+                        scheduler_for_engine,
                         config.no_kv_cache,
                         config.no_prefix_cache,
                         config.prefix_cache_n,
@@ -502,6 +509,7 @@ impl MistralRs {
             reboot_state,
             config: mistralrs_config,
             category,
+            scheduler,
         })
     }
 
@@ -656,9 +664,9 @@ impl MistralRs {
                             text: "hello".to_string(),
                             echo_prompt: false,
                             best_of: None,
-                            sampling_params: SamplingParams {
+                            sampling_params: TokenSamplingParams {
                                 max_len: Some(1),
-                                ..SamplingParams::deterministic()
+                                ..TokenSamplingParams::deterministic()
                             },
                             return_logprobs: false,
                             constraint: Constraint::None,
@@ -809,6 +817,53 @@ impl MistralRs {
 
     pub fn get_creation_time(&self) -> u64 {
         self.creation_time
+    }
+
+    /// Signal that a pipeline parallelism request has completed.
+    ///
+    /// Called by distributed inference workers (TAIL stages) when HEAD signals
+    /// request completion. Sets the sequence state to Done so the scheduler's
+    /// normal cleanup flow handles it.
+    pub async fn complete_pipeline_sequence(
+        &self,
+        request_id: uuid::Uuid,
+        stop_reason: sequence::StopReason,
+        model_id: Option<&str>,
+    ) -> Result<(), MistralRsError> {
+        let resolved_model_id = match model_id {
+            Some(id) => id.to_string(),
+            None => {
+                let default_lock = self
+                    .default_engine_id
+                    .read()
+                    .map_err(|_| MistralRsError::SenderPoisoned)?;
+                default_lock
+                    .as_ref()
+                    .ok_or(MistralRsError::EnginePoisoned)?
+                    .clone()
+            }
+        };
+
+        // Clone the scheduler Arc before dropping the engines lock to avoid
+        // holding RwLockReadGuard across an await point (which would make
+        // the future !Send).
+        let scheduler = {
+            let engines = self
+                .engines
+                .read()
+                .map_err(|_| MistralRsError::SenderPoisoned)?;
+            engines
+                .get(&resolved_model_id)
+                .map(|e| e.scheduler.clone())
+                .ok_or(MistralRsError::EnginePoisoned)?
+        };
+
+        let mut scheduler = scheduler.lock().await;
+        if let Some(seq) = scheduler.get_sequence_mut(request_id) {
+            seq.set_state(sequence::SequenceState::Done(stop_reason));
+            tracing::debug!(%request_id, seq_id = *seq.id(), ?stop_reason, "Pipeline sequence marked complete");
+        }
+        Ok(())
     }
 
     /// Get model category for a specific model. If model_id is None, uses default engine.

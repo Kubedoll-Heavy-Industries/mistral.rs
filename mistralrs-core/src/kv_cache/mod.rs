@@ -306,6 +306,9 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             &*seqs[0].normal_cache()
         };
 
+        // Get the pipeline's max_seq_len for layers without existing cache data
+        let pipeline_max_seq_len = pipeline.get_metadata().max_seq_len;
+
         let mut caches = Vec::new();
         for (layer_idx, (k_cache, v_cache)) in new_k_cache.into_iter().zip(new_v_cache).enumerate()
         {
@@ -313,19 +316,20 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             let Some(cache_ref) = seq0_cache[layer_idx].as_ref() else {
                 // This is hit in gemma3n for the shared kv cache - create dummy cache
                 // These layers don't have their own cache because they share another layer's cache
+                // Use pipeline's max_seq_len to ensure valid cache bounds
                 caches.push(KvCache::Normal {
                     k: SingleCache {
                         all_data: None,
-                        dim: 0,
+                        dim: 2,
                         current_seq_len: 0,
-                        max_seq_len: 0,
+                        max_seq_len: pipeline_max_seq_len,
                         capacity_seq_len: 0,
                     },
                     v: SingleCache {
                         all_data: None,
-                        dim: 0,
+                        dim: 2,
                         current_seq_len: 0,
-                        max_seq_len: 0,
+                        max_seq_len: pipeline_max_seq_len,
                         capacity_seq_len: 0,
                     },
                 });
@@ -474,10 +478,26 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         _modify_draft_cache: bool,
         load_preallocated_cache: bool,
     ) {
+        // For sequences without preallocated cache (e.g., PP TAIL stages),
+        // reset the model-level cache directly. The engine sends CacheInstruction::Reset
+        // for new requests and CacheInstruction::In for continuations, so we respect that.
         if seqs.iter().any(|seq| seq.preallocated_cache().is_none()) {
+            let cache_len_before = pipeline.cache().normal().0.first().map(|kv| kv.current_seq_len()).unwrap_or(0);
+
+            tracing::info!(
+                cache_len_before,
+                num_seqs = seqs.len(),
+                load_preallocated_cache,
+                "NormalCacheManager::set_none_cache - RESETTING model cache"
+            );
             for layer in pipeline.cache().normal().0.iter_mut() {
                 layer.reset();
             }
+            let cache_len_after = pipeline.cache().normal().0.first().map(|kv| kv.current_seq_len()).unwrap_or(0);
+            tracing::info!(
+                cache_len_after,
+                "NormalCacheManager::set_none_cache - AFTER reset"
+            );
             return;
         }
 

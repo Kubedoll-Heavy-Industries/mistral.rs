@@ -5,7 +5,7 @@ use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use crate::{
-    pipeline::DiffusionGenerationParams, response::Response, sampler::SamplingParams,
+    pipeline::DiffusionGenerationParams, response::Response, sampler::TokenSamplingParams,
     tools::ToolChoice, CustomLogitsProcessor, Tool,
 };
 use std::{fmt::Debug, sync::Arc};
@@ -94,7 +94,7 @@ pub enum InferenceOperation {
         messages: Vec<IndexMap<String, MessageContent>>,
         attachments: Vec<ChatAttachment>,
         thinking: Option<ThinkingMode>,
-        sampling_params: SamplingParams,
+        sampling_params: TokenSamplingParams,
         return_logprobs: bool,
         constraint: Constraint,
         tools: Option<Vec<Tool>>,
@@ -108,7 +108,7 @@ pub enum InferenceOperation {
         text: String,
         echo_prompt: bool,
         best_of: Option<usize>,
-        sampling_params: SamplingParams,
+        sampling_params: TokenSamplingParams,
         return_logprobs: bool,
         constraint: Constraint,
         suffix: Option<String>,
@@ -120,7 +120,7 @@ pub enum InferenceOperation {
     },
     CompletionTokens {
         tokens: Vec<u32>,
-        sampling_params: SamplingParams,
+        sampling_params: TokenSamplingParams,
         return_logprobs: bool,
         constraint: Constraint,
         suffix: Option<String>,
@@ -168,20 +168,15 @@ impl InferenceOperation {
 
 /// Input for pipeline continuation requests (already tokenized).
 ///
-/// For pipeline parallelism, position tracking is critical:
-/// - `sequence_position`: Absolute position where this chunk starts (for RoPE)
-/// - `initial_seq_len`: Total prompt tokens (for prefill/decode boundary)
+/// Tokens accumulate in the sequence naturally (like single-node inference).
+/// Position comes from seq.len(), not explicit tracking.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PipelineContinueInput {
     pub tokens: Vec<u32>,
-    pub sampling_params: SamplingParams,
+    pub sampling_params: TokenSamplingParams,
     /// Initial sequence length (total prompt tokens).
-    /// Prefill/decode boundary: kv_len >= this value.
+    /// Prefill/decode boundary: seq.len() >= this value.
     pub initial_seq_len: usize,
-    /// Absolute position where this chunk starts (for RoPE encoding).
-    /// During prefill: position of first token in this chunk.
-    /// During decode: total tokens processed so far.
-    pub sequence_position: usize,
 }
 
 /// Input for tokenization requests.
@@ -339,8 +334,6 @@ pub enum Request {
     Detokenize(DetokenizeRequest),
     /// Pipeline continuation (distributed inference)
     PipelineContinue(PipelineRequest),
-    /// Cleanup a pipeline request (called when stream closes)
-    PipelineCleanup { request_id: uuid::Uuid },
     /// Terminate the engine
     Terminate,
     /// Terminate all sequences on next step
@@ -370,9 +363,6 @@ impl Debug for Request {
             }
             Request::PipelineContinue(req) => {
                 write!(f, "Pipeline Continue Request id={}", req.id)
-            }
-            Request::PipelineCleanup { request_id } => {
-                write!(f, "Pipeline Cleanup Request id={}", request_id)
             }
             Request::Terminate => write!(f, "Termination Request"),
             Request::TerminateAllSeqsNextStep => write!(f, "Terminate All Seqs Next Step"),

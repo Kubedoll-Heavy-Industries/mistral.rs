@@ -5,7 +5,7 @@ use clap::Parser;
 use either::Either;
 use mistralrs::{
     cross_entropy_loss, parse_isq_value, Constraint, DType, Device, MistralRs, NormalRequest,
-    InferenceExec, InferenceInput, InferenceOperation, Request, ResponseOk, SamplingParams, Tensor,
+    InferenceExec, InferenceInput, InferenceOperation, Request, ResponseOk, TokenSamplingParams, Tensor,
     TextModelBuilder,
 };
 use tokio::sync::mpsc::channel;
@@ -41,9 +41,9 @@ async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(T
         input: InferenceInput {
             op: InferenceOperation::CompletionTokens {
                 tokens: chunk,
-                sampling_params: SamplingParams {
+                sampling_params: TokenSamplingParams {
                     max_len: Some(0),
-                    ..SamplingParams::deterministic()
+                    ..TokenSamplingParams::deterministic()
                 },
                 return_logprobs: false,
                 constraint: Constraint::None,

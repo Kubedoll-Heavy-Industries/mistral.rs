@@ -10,7 +10,7 @@ use crate::{
     scheduler::{Scheduler, SchedulerOutput},
     search::{self, rag::SearchPipeline},
     sequence::{SeqStepType, StopReason},
-    tools, CompletionResponse, SchedulerConfig, DEBUG,
+    tools, CompletionResponse, DEBUG,
 };
 use interprocess::local_socket::{traits::Listener, ListenerOptions};
 use llguidance::ParserFactory;
@@ -170,34 +170,6 @@ pub struct Engine {
     logger: IntervalLogger,
     handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
     pending_notify: Arc<Notify>,
-    /// Track pipeline parallelism (op_id, chunk_id) tuples that have completed their first forward pass.
-    /// Used to preserve KV cache for subsequent decode steps and chunked prefill on non-first pipeline stages.
-    pipeline_first_forward_done: Arc<std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, usize)>>>,
-    /// Cache of KV cache state for pipeline continuation requests, keyed by op_id.
-    /// KV cache is extracted after forward pass and injected into new sequences to preserve state across decode.
-    /// Entry is created on first continuation request and cleaned up when generation is done.
-    pipeline_kv_cache: Arc<std::sync::Mutex<HashMap<uuid::Uuid, Vec<Option<crate::pipeline::KvCache>>>>>,
-
-    /// Metadata for pipeline continuation requests keyed by request_id.
-    /// Stores initial_seq_len for prefill/decode boundary detection.
-    pipeline_continue_meta: Arc<std::sync::Mutex<HashMap<uuid::Uuid, PipelineContinueMeta>>>,
-
-    /// Persistent sequences for pipeline parallelism, keyed by request_id.
-    /// Unlike normal sequences that are created per-request, pipeline sequences
-    /// persist across multiple forward passes (one per activation).
-    /// KV cache lives on the Sequence and is naturally preserved.
-    /// Entry created on first activation, removed on cleanup signal.
-    pipeline_sequences: Arc<std::sync::Mutex<HashMap<uuid::Uuid, crate::sequence::Sequence>>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(super) struct PipelineContinueMeta {
-    /// Initial sequence length (total prompt tokens).
-    /// Prefill/decode boundary: kv_len >= this value.
-    pub(super) initial_seq_len: usize,
-    /// Absolute position where this chunk starts (for RoPE encoding).
-    /// Used to set token_offset on the Sequence for correct position calculation.
-    pub(super) sequence_position: usize,
 }
 
 impl Drop for Engine {
@@ -214,7 +186,7 @@ impl Engine {
         tx: Sender<Request>,
         rx: Receiver<Request>,
         pipeline: Arc<Mutex<dyn Pipeline>>,
-        config: SchedulerConfig,
+        scheduler: Arc<Mutex<dyn Scheduler>>,
         mut no_kv_cache: bool,
         mut no_prefix_cache: bool,
         prefix_cache_n: usize,
@@ -248,8 +220,6 @@ impl Engine {
             None => None,
         };
 
-        let scheduler = config.into_scheduler();
-
         // Configure prefix caching on the scheduler based on the global no_prefix_cache flag
         // This ensures PagedAttention prefix caching respects the same setting
         get_mut_arcmutex!(scheduler).set_prefix_caching_enabled(!no_prefix_cache);
@@ -278,10 +248,6 @@ impl Engine {
             logger: IntervalLogger::new(Duration::from_secs(5)),
             handles: Arc::new(Mutex::new(Vec::new())),
             pending_notify: Arc::new(Notify::new()),
-            pipeline_first_forward_done: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            pipeline_kv_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            pipeline_continue_meta: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            pipeline_sequences: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -409,8 +375,13 @@ impl Engine {
                             scheduled.completion.iter().map(|seq| *seq.id()).collect();
                         let res = {
                             let mut pipeline = get_mut_arcmutex!(self.pipeline);
+                            // Only use CacheInstruction::In if the sequence actually has cache data.
+                            // Pipeline continuation sequences may not have cache data if this is
+                            // their first completion step after building cache during prompt.
+                            let has_cache_data = scheduled.completion[0].has_normal_cache_data();
                             let pre_op = if !self.no_kv_cache
                                 && last_completion_ids != current_completion_ids
+                                && has_cache_data
                             {
                                 CacheInstruction::In
                             } else {
@@ -458,26 +429,6 @@ impl Engine {
 
                         self.logger.add_tokens_processed(scheduled.completion.len());
 
-                        // For pipeline continuation decode steps, cache KV for next decode
-                        for seq in scheduled.completion.iter_mut() {
-                            if seq.prefill_chunk_size().is_some() {
-                                let op_id = seq.request_id();
-                                if let Ok(mut cache_map) = self.pipeline_kv_cache.lock() {
-                                    let kv_snapshot = seq.normal_cache().clone();
-                                    let cache_layers = kv_snapshot.iter().filter(|kv| kv.is_some()).count();
-
-                                    cache_map.insert(op_id, kv_snapshot);
-
-                                    tracing::debug!(
-                                        %op_id,
-                                        cache_layers,
-                                        seq_len = seq.len(),
-                                        "Cached KV for pipeline decode step"
-                                    );
-                                }
-                            }
-                        }
-
                         last_completion_ids = current_completion_ids;
                     }
 
@@ -509,19 +460,50 @@ impl Engine {
                             //
                             // For chunked prefill (including pipeline parallelism): if chunk_offset > 0,
                             // this is a continuation chunk and we need to preserve the KV cache.
-                            let pre_op = if scheduled.prompt[0].token_offset() != 0 {
+                            //
+                            // Cache instruction logic - unified for all sequences.
+                            //
+                            // The key insight: cache data presence indicates continuation.
+                            // - If sequence has cache data from prior forward → In (continue)
+                            // - If sequence has no cache data → Reset (new request)
+                            //
+                            // For normal sequences: token_offset > 0 indicates continuation
+                            // For PP TAIL sequences: no tokens, but has_cache_data after prefill
+                            // For chunked prefill: chunk_offset > 0 indicates continuation
+                            let has_cache_data = scheduled.prompt[0].has_normal_cache_data();
+                            let token_offset = scheduled.prompt[0].token_offset();
+                            let chunk_offset = scheduled.prompt[0].prefill_chunk_offset();
+                            let is_pp_tail = scheduled.prompt[0].preallocated_cache().is_none()
+                                && scheduled.prompt[0].return_raw_logits;
+                            let pre_op = if token_offset != 0 && has_cache_data {
+                                // Normal continuation (prefix cache hit or decode)
                                 CacheInstruction::In
-                            } else if scheduled.prompt[0].prefill_chunk_offset() > 0 {
-                                // Chunked prefill continuation: ensure any existing KV cache is loaded.
-                                // For pipeline continuation we create a fresh Sequence per chunk/step and inject
-                                // cached KV into seq.normal_cache, so we must load it into the backend here.
+                            } else if chunk_offset > 0 && has_cache_data {
+                                // Chunked prefill continuation
+                                CacheInstruction::In
+                            } else if is_pp_tail && has_cache_data {
+                                // PP TAIL continuation - cache built during prefill, no tokens
                                 CacheInstruction::In
                             } else {
+                                // New request - reset cache
                                 CacheInstruction::Reset {
                                     load_preallocated_cache: true,
                                     reset_non_granular: false,
                                 }
                             };
+                            let pre_op_name = match &pre_op {
+                                CacheInstruction::In => "In",
+                                CacheInstruction::Reset { .. } => "Reset",
+                                _ => "Other",
+                            };
+                            tracing::info!(
+                                has_cache_data,
+                                token_offset,
+                                chunk_offset,
+                                is_pp_tail,
+                                pre_op_name,
+                                "Engine: prompt cache instruction"
+                            );
 
                             pipeline
                                 .step(
@@ -553,37 +535,24 @@ impl Engine {
                         self.logger.add_tokens_processed(total_processed_tokens);
 
                         for seq in scheduled.prompt.iter_mut() {
-                            // For pipeline continuation sequences (chunked prefill + decode), cache KV
-                            // Use request_id as the cache key
-                            if seq.prefill_chunk_size().is_some() {
-                                let op_id = seq.request_id();
-                                if let Ok(mut cache_map) = self.pipeline_kv_cache.lock() {
-                                    let kv_snapshot = seq.normal_cache().clone();
-                                    let cache_layers = kv_snapshot.iter().filter(|kv| kv.is_some()).count();
-
-                                    cache_map.insert(op_id, kv_snapshot);
-
-                                    tracing::debug!(
-                                        %op_id,
-                                        cache_layers,
-                                        seq_len = seq.len(),
-                                        has_remaining = seq.has_remaining_prefill(),
-                                        "Cached KV for pipeline continuation (prefill chunk or decode step)"
-                                    );
-                                }
-                            }
-
                             // Skip sequences already marked Done (e.g., by send_raw_responses
                             // when return_raw_logits is true for pipeline parallelism)
                             if seq.is_finished_paged_attn() {
                                 continue;
                             }
-                            match seq.sequence_stepping_type() {
-                                SeqStepType::OneShot => {
-                                    seq.set_state(SequenceState::Done(StopReason::GeneratedImage))
-                                }
-                                SeqStepType::PromptAndDecode => {
-                                    seq.set_state(SequenceState::RunningCompletion)
+                            // Don't auto-transition if:
+                            // 1. PP sequences (return_raw_logits=true) - wait for activation to arrive
+                            //    via PipelineContinue before transitioning
+                            // 2. Chunked prefill with remaining chunks - need to complete all chunks first
+                            let should_transition = !seq.return_raw_logits && !seq.has_remaining_prefill();
+                            if should_transition {
+                                match seq.sequence_stepping_type() {
+                                    SeqStepType::OneShot => {
+                                        seq.set_state(SequenceState::Done(StopReason::GeneratedImage))
+                                    }
+                                    SeqStepType::PromptAndDecode => {
+                                        seq.set_state(SequenceState::RunningCompletion)
+                                    }
                                 }
                             }
                             let now = SystemTime::now()
@@ -737,6 +706,21 @@ impl Engine {
                             // Advance prefill chunk offsets after processing prefill tokens.
                             // This allows chunked prefill to continue with the next chunk.
                             scheduler.advance_prefill_chunk_offsets();
+                        }
+                    }
+                }
+            }
+
+            // Signal pipeline completion for finished sequences (before freeing)
+            {
+                let finished = scheduler.get_finished_sequences();
+                if !finished.is_empty() {
+                    let pipeline = get_mut_arcmutex!(self.pipeline);
+                    if let Some(hook) = pipeline.get_hook() {
+                        for (request_id, reason) in finished {
+                            // Fire-and-forget: spawn the async completion signal
+                            let fut = hook.stop_request(request_id, reason);
+                            tokio::spawn(fut);
                         }
                     }
                 }

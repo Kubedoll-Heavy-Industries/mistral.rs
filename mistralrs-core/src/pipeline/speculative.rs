@@ -398,9 +398,11 @@ impl Pipeline for SpeculativePipeline {
                         );
                     };
 
+                    let tokenizer = get_mut_arcmutex!(self.target).tokenizer();
                     let sample = sample_sequence(
                         logits.clone(),
                         seq,
+                        tokenizer,
                         seq.return_logprobs(),
                         rng.clone(),
                         false, // todo tune
@@ -478,9 +480,11 @@ impl Pipeline for SpeculativePipeline {
                 // ======================= Rejection sampling. ============================
                 // Map from each target sample to corresponding in draft sample
                 // this will first rollback LLG state if any, and then advance for the accepted tokens only
+                let tokenizer = get_mut_arcmutex!(self.target).tokenizer();
                 let samples = sample_target_sequence_speculative(
                     logits.clone(),
                     seq,
+                    tokenizer,
                     seq.return_logprobs(),
                     rng.clone(),
                     &draft_samples,

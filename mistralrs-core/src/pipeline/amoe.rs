@@ -22,7 +22,7 @@ use crate::{
     device_map::DeviceMapper,
     get_mut_arcmutex,
     prefix_cacher::PrefixCacheManagerV2,
-    sampler::Sampler,
+    sampler::TokenSamplingParams,
     sequence::{SeqStepType, Sequence, SequenceGroup, SequenceRecognizer},
     utils::progress::{new_multi_progress, NiceProgressBar, ProgressScopeGuard},
     DeviceMapSetting, Loader, ModelCategory, ModelKind, ModelPaths, PagedAttentionConfig, Pipeline,
@@ -364,22 +364,9 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
         let mut rng = rng();
         let mut samples = inputs.into_inner();
 
-        // Create several dummy objects for the sequences. No custom logits processors.
+        // Create several dummy objects for the sequences.
         let (dummy_sender, _) = tokio::sync::mpsc::channel(10000);
-        let dummy_sampler = Sampler::new(
-            None,
-            0,
-            tokenizer.clone(),
-            None,
-            None,
-            None,
-            None,
-            -1,
-            0.0,
-            0.0,
-            vec![],
-        )
-        .map_err(candle_core::Error::msg)?;
+        let sampling_params = TokenSamplingParams::deterministic();
 
         let dummy_group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
             1, false, false, None,
@@ -450,7 +437,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
                     seqs.push(new_dummy_seq(
                         tokens,
                         dummy_sender.clone(),
-                        dummy_sampler.clone(),
+                        sampling_params.clone(),
                         dummy_group.clone(),
                         images,
                         target.get_metadata().eos_tok.clone(),
@@ -557,7 +544,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
 fn new_dummy_seq(
     (tokens, prompt): (Vec<u32>, String),
     dummy_sender: tokio::sync::mpsc::Sender<Response>,
-    dummy_sampler: Sampler,
+    sampling_params: TokenSamplingParams,
     dummy_group: Arc<tokio::sync::Mutex<SequenceGroup>>,
     images: Option<Vec<DynamicImage>>,
     eos_toks: Vec<u32>,
@@ -570,28 +557,30 @@ fn new_dummy_seq(
         uuid::Uuid::now_v7(), // Dummy request_id for testing
         1,
         dummy_sender,
-        dummy_sampler,
-        vec![],
-        vec![],
-        None,
-        false,
-        false,
+        sampling_params,
+        vec![], // logits_processors
+        vec![], // stop_tokens
+        vec![], // stop_strings
+        None,   // max_len
+        false,  // return_logprobs
+        false,  // is_xlora
         dummy_group,
         0,
         0,
         SequenceRecognizer::None,
-        None,
-        None,
+        None, // suffix
+        None, // prefix
         images,
-        None,
-        None, // TODO incorrect for PagedAttention
-        None,
-        None,
+        None, // input_audios
+        None, // block_size - TODO incorrect for PagedAttention
+        None, // tools
+        None, // image_gen_response_format
         SeqStepType::PromptAndDecode,
-        None,
-        None,
-        false,
+        None, // diffusion_params
+        None, // seq_preallocated_cache
+        false, // return_raw_logits
         eos_toks,
         None, // pipeline_continue_op_id
+        None, // logical_seq_len - dummy sequences use tokens.len()
     )
 }

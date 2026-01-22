@@ -2,10 +2,10 @@ use directories::ProjectDirs;
 use either::Either;
 use indexmap::IndexMap;
 use mistralrs_core::{
-    speech_utils, ChatAttachment, Constraint, DiffusionGenerationParams, DrySamplingParams,
+    speech_utils, ChatAttachment, Constraint, DiffusionGenerationParams, DryTokenSamplingParams,
     ImageGenerationResponseFormat, InferenceExec, InferenceInput, InferenceOperation,
     MessageContent, MistralRs, ModelCategory, NormalRequest, Request, Response, ResponseOk,
-    SamplingParams, ThinkingMode, WebSearchOptions, TERMINATE_ALL_NEXT_STEP,
+    TokenSamplingParams, ThinkingMode, WebSearchOptions, TERMINATE_ALL_NEXT_STEP,
 };
 use regex::Regex;
 use rustyline::{error::ReadlineError, history::History, DefaultEditor, Editor, Helper};
@@ -154,8 +154,8 @@ const TOPP_CMD: &str = "\\topp";
 const IMAGE_REGEX: &str = r#"((?:https?://|file://)?\S+?\.(?:png|jpe?g|bmp|gif|webp)(?:\?\S+?)?)"#;
 const AUDIO_REGEX: &str = r#"((?:https?://|file://)?\S+?\.(?:wav|mp3|flac|ogg)(?:\?\S+?)?)"#;
 
-fn interactive_sample_parameters() -> SamplingParams {
-    SamplingParams {
+fn interactive_sample_parameters() -> TokenSamplingParams {
+    TokenSamplingParams {
         temperature: Some(0.1),
         top_k: Some(32),
         top_p: Some(0.1),
@@ -168,13 +168,13 @@ fn interactive_sample_parameters() -> SamplingParams {
         stop_toks: None,
         logits_bias: None,
         n_choices: 1,
-        dry_params: Some(DrySamplingParams::default()),
+        dry_params: Some(DryTokenSamplingParams::default()),
     }
 }
 
 /// Handles sampling commands (\temperature, \topk, \topp) and updates the sampling_params accordingly.
 /// Returns true if the prompt was a handled sampling command, otherwise false.
-fn handle_sampling_command(prompt: &str, sampling_params: &mut SamplingParams) -> bool {
+fn handle_sampling_command(prompt: &str, sampling_params: &mut TokenSamplingParams) -> bool {
     let trimmed = prompt.trim();
     if trimmed.starts_with(TEMPERATURE_CMD) {
         let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();

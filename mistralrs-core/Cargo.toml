@@ -16,6 +16,7 @@ homepage.workspace = true
 anyhow.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
+rkyv = { version = "0.8", features = ["bytecheck"] }
 serde.workspace = true
 serde_json.workspace = true
 candle-flash-attn = { workspace = true, optional = true }

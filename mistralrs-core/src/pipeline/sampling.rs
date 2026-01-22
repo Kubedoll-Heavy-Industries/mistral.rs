@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use candle_core::{DType, Result, Tensor};
 use rand_isaac::Isaac64Rng;
+use tokenizers::Tokenizer;
 
 use crate::{
     prefix_cacher::PrefixCacheManagerV2,
-    sampler::Logprobs,
+    sampler::{Logprobs, Sampler},
     sequence::{Sequence, SequenceRecognizer, SequenceState, StopReason},
     tools::{parse_text_tools, ToolCallResponse, ToolCallType},
 };
@@ -421,12 +422,15 @@ pub async fn sample_and_add_toks(
 
     let use_async_pool = seqs_len > 1;
 
+    let tokenizer = this.tokenizer();
     let sampling_futures: Vec<_> = std::iter::zip(logits_seq, seqs.iter_mut())
         .map(|(logits_per_seq, seq)| {
             let return_logprobs = seq.return_logprobs();
+            let tokenizer = tokenizer.clone();
             sample_sequence(
                 logits_per_seq,
                 seq,
+                tokenizer,
                 return_logprobs,
                 rng.clone(),
                 use_async_pool,
@@ -482,6 +486,7 @@ pub async fn sample_and_add_toks(
 pub async fn sample_sequence(
     logits: Tensor,
     seq: &mut Sequence,
+    tokenizer: Option<Arc<Tokenizer>>,
     return_logprobs: bool,
     rng: Arc<std::sync::Mutex<Isaac64Rng>>,
     use_async_pool: bool,
@@ -525,7 +530,22 @@ pub async fn sample_sequence(
         );
     }
 
-    let sampler = seq.sampler();
+    let params = seq.sampling_params();
+    let sampler = Sampler::new(
+        params.temperature,
+        params.top_n_logprobs,
+        tokenizer.clone(),
+        params.frequency_penalty,
+        params.presence_penalty,
+        params.repetition_penalty,
+        params.dry_params.clone(),
+        params.top_k.map(|k| k as i64).unwrap_or(-1),
+        params.top_p.unwrap_or(1.0),
+        params.min_p.unwrap_or(0.0),
+        seq.logits_processors().to_vec(),
+    )
+    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
     let ctx_clone = seq.get_toks().to_vec();
     let rng_clone = rng.clone();
     let logits_clone = logits.clone();
@@ -586,7 +606,22 @@ pub async fn sample_sequence(
 
             let ctx_clone = seq.get_toks().to_vec();
             let rng_clone = rng.clone();
-            let sampler = seq.sampler();
+            let params = seq.sampling_params();
+            let sampler = Sampler::new(
+                params.temperature,
+                params.top_n_logprobs,
+                tokenizer.clone(),
+                params.frequency_penalty,
+                params.presence_penalty,
+                params.repetition_penalty,
+                params.dry_params.clone(),
+                params.top_k.map(|k| k as i64).unwrap_or(-1),
+                params.top_p.unwrap_or(1.0),
+                params.min_p.unwrap_or(0.0),
+                seq.logits_processors().to_vec(),
+            )
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
             if use_async_pool {
                 tokio_rayon::spawn(move || {
                     sampler.sample(
@@ -645,6 +680,7 @@ pub struct SpeculativeSample {
 pub async fn sample_target_sequence_speculative(
     logits: Tensor,
     seq: &mut Sequence,
+    tokenizer: Option<Arc<Tokenizer>>,
     return_logprobs: bool,
     rng: Arc<std::sync::Mutex<Isaac64Rng>>,
     draft_samples: &[SpeculativeSample],
@@ -668,6 +704,7 @@ pub async fn sample_target_sequence_speculative(
         let sample = sample_sequence(
             chunk,
             seq,
+            tokenizer.clone(),
             return_logprobs,
             rng.clone(),
             true, // TODO(EricLBuehler): does this hurt perf?

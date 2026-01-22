@@ -1,19 +1,16 @@
 use crate::{
-    pipeline::{CacheBackendMetadata, CacheInstruction, ForwardInputsResult, NormalCache, RerankInputs, text_models_inputs_processor::PagedAttentionMeta},
+    pipeline::{ForwardInputsResult, NormalCache, RerankInputs},
     prefix_cacher::MatchingCache,
     request::{
         DetokenizeRequest, InferenceOperation, NormalRequest, PipelineContinueRequest, TokenizeRequest,
     },
     sequence::{SeqStepType, SequenceRecognizer, SequenceState},
     tools::{ToolCallingMatcher, ToolChoice},
-    Constraint, ModelCategory, Response, SamplingParams,
+    Constraint, ModelCategory, Response, TokenSamplingParams,
 };
 use candle_core::Tensor;
 use either::Either;
-use rand::SeedableRng;
-use rand_isaac::Isaac64Rng;
 use std::{
-    collections::HashMap,
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     time::{SystemTime, UNIX_EPOCH},
@@ -22,9 +19,8 @@ use tracing::warn;
 
 use crate::{
     get_mut_arcmutex, handle_seq_error,
-    paged_attention::BlockEngineSequence,
     request::Request,
-    sampler::Sampler,
+    sampler::CustomLogitsProcessor,
     sequence::{Sequence, SequenceGroup},
     StopTokens,
 };
@@ -90,9 +86,6 @@ impl Engine {
             Request::Tokenize(req) => self.tokenize_text(req).await,
             Request::Detokenize(req) => self.detokenize_text(req).await,
             Request::PipelineContinue(req) => self.handle_pipeline_continue(req).await,
-            Request::PipelineCleanup { request_id } => {
-                self.handle_pipeline_cleanup(request_id).await
-            }
             Request::Terminate => (),
             Request::TerminateAllSeqsNextStep => {
                 TERMINATE_ALL_NEXT_STEP.store(true, Ordering::SeqCst)
@@ -357,7 +350,7 @@ impl Engine {
             InferenceOperation::Chat { sampling_params, .. }
             | InferenceOperation::Completion { sampling_params, .. }
             | InferenceOperation::CompletionTokens { sampling_params, .. } => sampling_params,
-            _ => &SamplingParams::deterministic(),
+            _ => &TokenSamplingParams::deterministic(),
         };
 
         let constraint = match &request.input.op {
@@ -386,9 +379,6 @@ impl Engine {
             _ => false,
         };
 
-        let topk = sampling_params.top_k.map(|x| x as i64).unwrap_or(-1);
-        let topp = sampling_params.top_p.unwrap_or(1.0);
-        let minp = sampling_params.min_p.unwrap_or(0.0);
         let num_hidden_layers = get_mut_arcmutex!(self.pipeline)
             .get_metadata()
             .num_hidden_layers;
@@ -461,33 +451,18 @@ impl Engine {
             best_of,
         )));
 
-        let tokenizer = get_mut_arcmutex!(self.pipeline).tokenizer();
-
-        let sampler = Sampler::new(
-            Some(sampling_params.temperature.unwrap_or(1.0)),
-            sampling_params.top_n_logprobs,
-            tokenizer,
-            sampling_params.frequency_penalty,
-            sampling_params.presence_penalty,
-            sampling_params.repetition_penalty,
-            sampling_params.dry_params.clone(),
-            topk,
-            topp,
-            minp,
-            match &request.input.op {
-                InferenceOperation::Chat {
-                    logits_processors, ..
-                }
-                | InferenceOperation::Completion {
-                    logits_processors, ..
-                }
-                | InferenceOperation::CompletionTokens {
-                    logits_processors, ..
-                } => logits_processors.clone().unwrap_or_default(),
-                _ => vec![],
-            },
-        );
-        let sampler = handle_seq_error!(sampler, request.response);
+        let logits_processors: Vec<Arc<dyn CustomLogitsProcessor>> = match &request.input.op {
+            InferenceOperation::Chat {
+                logits_processors, ..
+            }
+            | InferenceOperation::Completion {
+                logits_processors, ..
+            }
+            | InferenceOperation::CompletionTokens {
+                logits_processors, ..
+            } => logits_processors.clone().unwrap_or_default(),
+            _ => vec![],
+        };
 
         if sampling_params.n_choices == 0 {
             send_error!(request.response, Response::ValidationError(
@@ -593,7 +568,8 @@ impl Engine {
                 request.id, // UUID request_id for pipeline parallelism
                 num_hidden_layers,
                 request.response.clone(),
-                sampler.clone(),
+                sampling_params.clone(),
+                logits_processors.clone(),
                 stop_toks.clone(),
                 stop_strings.clone(),
                 sampling_params.max_len,
@@ -627,34 +603,8 @@ impl Engine {
                 return_raw_logits,
                 eos_toks,
                 None, // pipeline_continue_op_id
+                None, // logical_seq_len - normal requests use tokens.len()
             );
-
-            // Pipeline continuation: configure the Sequence for PP non-first stages.
-            // Use sequence_position to set token_offset for correct RoPE position calculation.
-            if let Ok(mut meta) = self.pipeline_continue_meta.lock() {
-                if let Some(pipeline_meta) = meta.remove(&request.id) {
-                    // Set the total prompt length for prefill/decode boundary detection
-                    seq.set_prompt_len(pipeline_meta.initial_seq_len);
-                    // Set token_offset for correct position calculation in RoPE
-                    // During decode, sequence_position equals total tokens processed,
-                    // so token_offset ensures RoPE uses the correct position.
-                    seq.set_token_offset(pipeline_meta.sequence_position);
-
-                    // CRITICAL: Set prefill_chunk_size to enable KV cache preservation.
-                    // The engine uses prefill_chunk_size.is_some() to identify sequences
-                    // that need their KV cache cached/injected across decode steps.
-                    // Value doesn't affect chunking behavior here - just enables the flag.
-                    seq.set_prefill_chunk_size(Some(prompt_tokens.len()));
-
-                    tracing::debug!(
-                        %request.id,
-                        initial_seq_len = pipeline_meta.initial_seq_len,
-                        sequence_position = pipeline_meta.sequence_position,
-                        token_count = prompt_tokens.len(),
-                        "Configured Sequence for pipeline continuation"
-                    );
-                }
-            }
 
             // Only "track" a new sequence if it is a traditional one
             if matches!(seq_step_type, SeqStepType::PromptAndDecode) {
@@ -765,52 +715,6 @@ impl Engine {
                         token_count = prompt_tokens.len(),
                         "Tokens set on hook for pipeline parallelism"
                     );
-                }
-            }
-
-            // For continuation requests, inject cached KV if available.
-            // This preserves KV cache across decode steps in pipeline parallelism.
-            // Presence in pipeline_kv_cache indicates this is a continuation request.
-            {
-                let op_id = request.id;
-                if let Ok(cache_map) = self.pipeline_kv_cache.lock() {
-                    if let Some(cached_kv) = cache_map.get(&op_id) {
-                        tracing::debug!(
-                            %op_id,
-                            "Checking for cached KV to inject"
-                        );
-                        // Calculate cached length first
-                        let cached_len = cached_kv.get(0)
-                            .and_then(|kv| kv.as_ref())
-                            .and_then(|kv| kv.k().ok().flatten())
-                            .map(|k| k.dims()[2])
-                            .unwrap_or(0);
-
-                        // Inject cached KV into new sequence before adding to scheduler
-                        let injected_cache_len = {
-                            let new_kv = seq.normal_cache();
-                            for (i, kv) in cached_kv.iter().enumerate() {
-                                if i < new_kv.len() {
-                                    new_kv[i] = kv.clone();
-                                }
-                            }
-
-                            new_kv.get(0)
-                                .and_then(|kv| kv.as_ref())
-                                .and_then(|kv| kv.k().ok().flatten())
-                                .map(|k| k.dims()[2])
-                                .unwrap_or(0)
-                        };
-
-                        tracing::debug!(
-                            %op_id,
-                            cache_layers = cached_kv.iter().filter(|kv| kv.is_some()).count(),
-                            seq_tokens = seq.get_toks().len(),
-                            cached_len,
-                            injected_cache_len,
-                            "Cache injected for continuation"
-                        );
-                    }
                 }
             }
 
@@ -1010,18 +914,15 @@ impl Engine {
 
     /// Handle pipeline continuation request for non-first pipeline stages.
     ///
-    /// This method directly manages persistent sequences for pipeline parallelism,
-    /// bypassing the scheduler. Sequences are stored in `pipeline_sequences` and
-    /// reused across multiple forward passes (one per activation).
+    /// Sequences live in the scheduler for the entire request duration. This function:
+    /// 1. First activation: Creates sequence and adds to scheduler
+    /// 2. Subsequent activations: Updates existing sequence with new tokens
     ///
-    /// Flow:
-    /// 1. First activation: Create sequence, store in `pipeline_sequences`, run forward
-    /// 2. Subsequent activations: Reuse sequence from `pipeline_sequences`, update tokens, run forward
-    /// 3. Cleanup signal: Remove from `pipeline_sequences`
+    /// The actual forward pass is done by Engine::run() - the hook blocks until
+    /// activation data is available, which we set here.
     async fn handle_pipeline_continue(&self, request: PipelineContinueRequest) {
         let request_id = request.id;
         let tokens = request.input.tokens.clone();
-        let sequence_position = request.input.sequence_position;
         let initial_seq_len = request.input.initial_seq_len;
 
         // Set pending tokens on hook for activation injection
@@ -1034,15 +935,13 @@ impl Engine {
             }
         }
 
-        // Check if we have an existing sequence for this request
+        // Check if we have an existing sequence for this request in the scheduler
         let is_first_activation = {
-            let seqs = self.pipeline_sequences.lock().unwrap();
-            !seqs.contains_key(&request_id)
+            let scheduler = get_mut_arcmutex!(self.scheduler);
+            !scheduler.has_sequence(request_id)
         };
 
         // Check if this is first stage (HEAD) - needs external logits from downstream.
-        // First stage runs sampling locally, so tokens accumulate via add_token().
-        // Non-first stages receive tokens from upstream and must track them explicitly.
         let is_first_stage = {
             let pipeline = get_mut_arcmutex!(self.pipeline);
             pipeline
@@ -1050,39 +949,29 @@ impl Engine {
                 .is_some_and(|h| h.needs_external_logits())
         };
 
+        tracing::info!(
+            %request_id,
+            is_first_activation,
+            is_first_stage,
+            token_count = tokens.len(),
+            initial_seq_len,
+            "PP activation: tokens accumulate naturally"
+        );
+
         if is_first_activation {
-            // First activation: Create new sequence with full setup
-            let num_hidden_layers = get_mut_arcmutex!(self.pipeline)
-                .get_metadata()
-                .num_hidden_layers;
+            // First activation: Create new sequence and add to scheduler
+            let metadata = get_mut_arcmutex!(self.pipeline).get_metadata().clone();
+            let num_hidden_layers = metadata.num_hidden_layers;
+            let eos_toks = metadata.eos_tok.clone();
 
-            let eos_toks = get_mut_arcmutex!(self.pipeline)
-                .get_metadata()
-                .eos_tok
-                .clone();
+            // Get max_len from sampling params, falling back to model's max_seq_len
+            let max_len = request
+                .input
+                .sampling_params
+                .max_len
+                .or(Some(metadata.max_seq_len));
 
-            let tokenizer = get_mut_arcmutex!(self.pipeline).tokenizer();
-            let sampler = Sampler::new(
-                Some(request.input.sampling_params.temperature.unwrap_or(1.0)),
-                request.input.sampling_params.top_n_logprobs,
-                tokenizer,
-                request.input.sampling_params.frequency_penalty,
-                request.input.sampling_params.presence_penalty,
-                request.input.sampling_params.repetition_penalty,
-                request.input.sampling_params.dry_params.clone(),
-                request.input.sampling_params.top_k.map(|x| x as i64).unwrap_or(-1),
-                request.input.sampling_params.top_p.unwrap_or(1.0),
-                request.input.sampling_params.min_p.unwrap_or(0.0),
-                vec![],
-            );
-
-            let sampler = match sampler {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = request.response.send(Response::InternalError(e.into())).await;
-                    return;
-                }
-            };
+            let sampling_params = request.input.sampling_params.clone();
 
             let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(1, false, false, None)));
 
@@ -1103,33 +992,37 @@ impl Engine {
                 request_id,
                 num_hidden_layers,
                 request.response.clone(),
-                sampler,
-                vec![],
-                vec![],
-                None,
-                false,
-                false,
+                sampling_params,
+                vec![], // logits_processors
+                vec![], // stop_tokens
+                vec![], // stop_strings
+                max_len,
+                false, // return_logprobs
+                false, // is_xlora
                 group,
                 0,
                 now.as_secs(),
                 SequenceRecognizer::None,
-                None,
-                None,
-                None,
-                None,
+                None, // suffix
+                None, // prefix
+                None, // input_images
+                None, // input_audios
                 block_size,
-                None,
-                None,
+                None, // tools
+                None, // image_gen_response_format
                 SeqStepType::PromptAndDecode,
-                None,
-                None,
-                true,
+                None, // diffusion_params
+                None, // seq_preallocated_cache
+                true, // return_raw_logits
                 eos_toks,
                 None, // pipeline_continue_op_id
+                Some(initial_seq_len), // logical_seq_len - PP continuation uses initial_seq_len
             );
 
-            seq.set_prompt_len(initial_seq_len);
-            seq.set_token_offset(sequence_position);
+            // token_offset starts at 0 for prefill. After prefill completes, the engine's
+            // state transition logic will update it (see mod.rs lines 513-532).
+            // Note: PP sequences (return_raw_logits=true) skip auto state transition,
+            // so we rely on subsequent PipelineContinue to transition to RunningCompletion.
             seq.set_state(SequenceState::RunningPrompt);
 
             if block_size.is_some() {
@@ -1141,266 +1034,60 @@ impl Engine {
 
             *get_mut_arcmutex!(self.id) += 1;
 
-            {
-                let mut seqs = self.pipeline_sequences.lock().unwrap();
-                seqs.insert(request_id, seq);
-            }
+            // Add sequence to scheduler - Engine::run() will process it
+            get_mut_arcmutex!(self.scheduler).add_seq(seq);
+
+            // Wake up engine to process the new sequence
+            self.pending_notify.notify_one();
         } else {
-            // Subsequent activation: Handle prefill chunks vs decode steps differently.
-            let is_prompt_chunk = sequence_position < initial_seq_len;
-            let mut seqs = self.pipeline_sequences.lock().unwrap();
-            if let Some(seq) = seqs.get_mut(&request_id) {
-                if is_first_stage {
-                    // HEAD (Stage 0): Don't modify tokens or offset.
-                    // Tokens accumulate naturally via add_token() during sampling.
-                } else {
-                    // TAIL stages: receive tokens from upstream
-                    seq.receive_tokens(&tokens, is_prompt_chunk);
-                    if is_prompt_chunk {
-                        seq.set_token_offset(sequence_position);
+            // Subsequent activation: Append tokens to existing sequence
+            let mut scheduler = get_mut_arcmutex!(self.scheduler);
+            let block_engine = scheduler.block_engine();
+
+            if let Some(seq) = scheduler.get_sequence_mut(request_id) {
+                if !is_first_stage {
+                    // TAIL stages: append tokens (like single-node inference)
+                    seq.append_tokens(&tokens);
+
+                    // Allocate blocks for new tokens
+                    if let Some(block_engine) = &block_engine {
+                        let mut engine = get_mut_arcmutex!(block_engine);
+                        engine.allocate(seq);
                     }
                 }
-                // Update responder so response goes to THIS request's channel
+
+                // Update responder for response routing
                 seq.set_responder(request.response.clone());
-                // Prefill chunks stay in prompt state; decode transitions to completion
-                if is_prompt_chunk {
-                    seq.set_state(SequenceState::RunningPrompt);
-                } else {
-                    seq.set_state(SequenceState::RunningCompletion);
-                }
-            }
-        }
 
-        // Run forward pass directly, bypassing scheduler
-        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(0)));
-
-        // Phase 1: Extract sequence from map to release lock during await
-        // This prevents deadlock when multiple pipeline requests run concurrently
-        let mut seq = {
-            let mut seqs = self.pipeline_sequences.lock().unwrap();
-            match seqs.remove(&request_id) {
-                Some(s) => s,
-                None => {
-                    tracing::error!(%request_id, "Sequence not found in pipeline_sequences");
-                    let _ = request
-                        .response
-                        .send(Response::InternalError(
-                            "Pipeline sequence not found".to_string().into(),
-                        ))
-                        .await;
-                    return;
-                }
-            }
-        };
-
-        // Phase 2: Check first forward status (brief lock)
-        let is_first_forward = {
-            let done = self.pipeline_first_forward_done.lock().unwrap();
-            !done.contains(&(request_id, 0))
-        };
-
-        // Determine prompt vs decode based on absolute sequence position.
-        // For pipeline continuation, later prompt chunks must still be treated as prompt
-        // (i.e., build KV) even though they are not the first forward.
-        let is_prompt_step = sequence_position < initial_seq_len;
-
-        // Construct backend_metadata based on whether PagedAttention is enabled
-        let backend_metadata = {
-            let scheduler = get_mut_arcmutex!(self.scheduler);
-            if let (Some(block_engine), Some(block_size)) = (scheduler.block_engine(), scheduler.block_size()) {
-                // PagedAttention is enabled - allocate/manage blocks and use PagedAttention metadata
-                let sliding_window = get_mut_arcmutex!(self.pipeline).get_metadata().sliding_window;
-
-                // For PagedAttention, block allocation happens during input processing
-                // The block_engine is passed via PagedAttentionMeta and handles allocation internally
-                let metadata = PagedAttentionMeta {
-                    block_size,
-                    sliding_window,
-                    block_engine: block_engine.clone(),
-                };
-
-                // Handle block allocation for TAIL stages (non-first stage).
-                // - Prefill: free + allocate (KV cache rebuilt from chunk tokens)
-                // - Decode: preserve existing blocks + grow (KV cache must be preserved)
-                if !is_first_activation && !is_first_stage {
-                    let mut engine = get_mut_arcmutex!(block_engine);
-                    if is_prompt_step {
-                        // TAIL prefill: tokens were replaced, rebuild blocks from scratch
-                        engine.free_sequence(*seq.id());
-                        engine.allocate(&mut seq);
-                    } else {
-                        // TAIL decode: preserve existing blocks, grow if needed
-                        // Take current block table and set as prefill blocks so allocate() preserves them
-                        if let Some(existing_blocks) = engine.block_tables.remove(seq.id()) {
-                            seq.set_physical_blocks_prefill(existing_blocks);
-                            engine.allocate(&mut seq);
-                        }
+                // Determine prefill vs decode from token count, not accumulated length.
+                // - Prefill chunk: tokens.len() > 1 (multiple tokens in activation)
+                // - Decode: tokens.len() == 1 (single token per step)
+                // This correctly handles TAIL's first activation (prefill) even when
+                // seq.len() == initial_seq_len, which would incorrectly trigger decode.
+                let is_decode = tokens.len() == 1 && seq.len() >= initial_seq_len;
+                if is_decode {
+                    // Transitioning to decode: set token_offset once
+                    if matches!(seq.getstate(), SequenceState::RunningPrompt) {
+                        seq.set_token_offset(initial_seq_len);
                     }
-                }
-
-                CacheBackendMetadata::PagedAttention {
-                    metadata,
-                    blocks_to_copy: HashMap::new(),
+                    seq.set_state(SequenceState::RunningCompletion);
+                } else {
+                    // Prefill chunk: token_offset stays at 0, RoPE positions from make_prompt_chunk
+                    seq.set_state(SequenceState::RunningPrompt);
                 }
             } else {
-                // DefaultScheduler - use cache instructions
-                let pre_op = if is_first_forward {
-                    CacheInstruction::Reset {
-                        load_preallocated_cache: false,
-                        reset_non_granular: false,
-                    }
-                } else {
-                    CacheInstruction::In
-                };
-                let post_op = CacheInstruction::Out;
-                CacheBackendMetadata::DefaultInstructions { pre_op, post_op }
-            }
-        };
-
-        // Phase 3: Execute pipeline operation (is_first_stage already computed above)
-        // Pipeline lock is held during operation but pipeline_sequences is free
-        let mut seq_refs: Vec<&mut Sequence> = vec![&mut seq];
-
-        if is_first_stage {
-            // Stage 0: Run full step (forward + wait for logits + sample + send response)
-            let step_result = {
-                let mut pipeline = get_mut_arcmutex!(self.pipeline);
-                let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
-                pipeline
-                    .step(
-                        &mut seq_refs,
-                        is_prompt_step,
-                        false, // Don't return raw logits - we want sampling
-                        &mut *prefix_cacher,
-                        self.disable_eos_stop,
-                        rng,
-                        backend_metadata,
-                    )
-                    .await
-            };
-
-            // Mark first forward as done
-            {
-                let mut done = self.pipeline_first_forward_done.lock().unwrap();
-                done.insert((request_id, 0));
-            }
-
-            if let Err(e) = step_result {
-                tracing::error!(%request_id, error = %e, "Pipeline step failed");
+                tracing::error!(%request_id, "Sequence not found in scheduler for update");
                 let _ = request
                     .response
                     .send(Response::InternalError(
-                        format!("Pipeline step failed: {e}").into(),
+                        "Pipeline sequence not found".to_string().into(),
                     ))
                     .await;
-                // Don't re-insert on error - cleanup will handle it
-                return;
-            }
-
-            tracing::debug!(%request_id, "Pipeline step completed");
-        } else {
-            // Intermediate/last stage: Run forward pass and send logits to worker
-            let result = {
-                let mut pipeline = get_mut_arcmutex!(self.pipeline);
-                pipeline.forward_pass(&mut seq_refs, is_prompt_step, backend_metadata)
-            };
-
-            // Mark first forward as done
-            {
-                let mut done = self.pipeline_first_forward_done.lock().unwrap();
-                done.insert((request_id, 0));
-            }
-
-            match result {
-                Ok(logits) => {
-                    // Move logits to CPU before sending through channel.
-                    // This must happen on the model thread which has the CUDA/Metal context.
-                    // The receiving tokio task won't have GPU context.
-                    let cpu_logits = match logits.to_device(&candle_core::Device::Cpu) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            tracing::error!(%request_id, error = %e, "Failed to move logits to CPU");
-                            let _ = request
-                                .response
-                                .send(Response::InternalError(
-                                    format!("Failed to move logits to CPU: {e}").into(),
-                                ))
-                                .await;
-                            return;
-                        }
-                    };
-                    // Send CPU logits tensor in Response::Raw
-                    let _ = request
-                        .response
-                        .send(Response::Raw {
-                            logits_chunks: vec![cpu_logits],
-                            tokens: vec![],
-                        })
-                        .await;
-                    tracing::debug!(
-                        %request_id,
-                        "Pipeline forward pass completed, sent logits to worker"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(%request_id, error = %e, "Pipeline forward pass failed");
-                    let _ = request
-                        .response
-                        .send(Response::InternalError(
-                            format!("Pipeline forward failed: {e}").into(),
-                        ))
-                        .await;
-                    // Don't re-insert on error - cleanup will handle it
-                    return;
-                }
             }
         }
 
-        // Phase 5: Re-insert sequence for future use on success
-        self.pipeline_sequences
-            .lock()
-            .unwrap()
-            .insert(request_id, seq);
-    }
-
-    /// Handle cleanup signal for a pipeline request.
-    /// Called when the stream closes (request completed or aborted).
-    /// Removes all cached state associated with the request.
-    async fn handle_pipeline_cleanup(&self, request_id: uuid::Uuid) {
-        tracing::debug!(%request_id, "Pipeline cleanup requested");
-
-        // Remove from pipeline_sequences and free associated PagedAttention blocks
-        if let Ok(mut seqs) = self.pipeline_sequences.lock() {
-            if let Some(seq) = seqs.remove(&request_id) {
-                tracing::debug!(%request_id, seq_id = *seq.id(), "Removed sequence from pipeline_sequences");
-                // Free PagedAttention blocks allocated for this sequence
-                let scheduler = get_mut_arcmutex!(self.scheduler);
-                if let Some(block_engine) = scheduler.block_engine() {
-                    get_mut_arcmutex!(block_engine).free_sequence(*seq.id());
-                    tracing::debug!(%request_id, seq_id = *seq.id(), "Freed PagedAttention blocks");
-                }
-            }
-        }
-
-        // Remove from pipeline_kv_cache (legacy KV cache storage)
-        if let Ok(mut cache) = self.pipeline_kv_cache.lock() {
-            if cache.remove(&request_id).is_some() {
-                tracing::debug!(%request_id, "Removed KV cache from pipeline_kv_cache");
-            }
-        }
-
-        // Remove from pipeline_continue_meta
-        if let Ok(mut meta) = self.pipeline_continue_meta.lock() {
-            if meta.remove(&request_id).is_some() {
-                tracing::debug!(%request_id, "Removed metadata from pipeline_continue_meta");
-            }
-        }
-
-        // Remove from pipeline_first_forward_done
-        if let Ok(mut done) = self.pipeline_first_forward_done.lock() {
-            // Remove all entries for this request_id (across all chunk_ids)
-            done.retain(|(op_id, _)| *op_id != request_id);
-        }
+        // Engine::run() will do the actual forward pass - the hook blocks until
+        // activation data is available (which we just set above)
     }
 
 }

@@ -102,9 +102,17 @@ pub async fn send_speech_responses(
     Ok(())
 }
 
+/// Send raw logits responses.
+///
+/// # Parameters
+/// - `input_seqs`: The sequences to send responses for
+/// - `logits_chunks`: The logits tensors to send
+/// - `mark_done`: If true, mark sequences as Done after sending. Set to false for
+///   pipeline parallelism where the sequence should stay alive for subsequent activations.
 pub async fn send_raw_responses(
     input_seqs: &mut [&mut Sequence],
     logits_chunks: Vec<Vec<Tensor>>,
+    mark_done: bool,
 ) -> candle_core::Result<()> {
     let logits_chunks = if logits_chunks.len() == 1 {
         logits_chunks[0].clone()
@@ -124,13 +132,25 @@ pub async fn send_raw_responses(
 
     seq.add_raw_choice_to_group(cpu_logits_chunks);
 
-    let group = seq.get_mut_group();
-    group
-        .maybe_send_raw_done_response(seq.responder())
-        .await
-        .map_err(candle_core::Error::msg)?;
+    let mut group = seq.get_mut_group();
 
-    seq.set_state(SequenceState::Done(StopReason::Length(0)));
+    if mark_done {
+        // Normal case: wait until n_choices are collected, then mark Done
+        group
+            .maybe_send_raw_done_response(seq.responder())
+            .await
+            .map_err(candle_core::Error::msg)?;
+        seq.set_state(SequenceState::Done(StopReason::Length(0)));
+    } else {
+        // Pipeline parallelism: send immediately for each forward pass.
+        // The sequence stays alive for subsequent activations, so we need to
+        // send each response immediately and clear raw_choices for next forward.
+        group
+            .send_raw_response_immediate(seq.responder())
+            .await
+            .map_err(candle_core::Error::msg)?;
+        group.clear_raw_choices();
+    }
 
     Ok(())
 }

@@ -10,6 +10,29 @@
 use candle_core::{Result, Tensor};
 use std::sync::Arc;
 
+/// Result of receiving from the pipeline activation channel.
+///
+/// This enum distinguishes between receiving activation data (continue processing)
+/// and receiving a completion signal (request finished normally).
+#[derive(Debug)]
+pub enum ActivationResult {
+    /// Got activation data to process - continue with forward pass.
+    /// The tensor shape encodes the phase:
+    /// - seq_len > 1: Prefill phase (accumulate in cache, no logits)
+    /// - seq_len == 1: Decode phase (process and return logits)
+    /// Position is derived from cache length (stream cursor model).
+    Data {
+        /// Activation tensor [batch, seq_len, hidden_dim].
+        tensor: Tensor,
+    },
+    /// Request completed successfully - no more activations will arrive.
+    /// The sequence should transition to Done state, not Error.
+    Completed {
+        /// Why the request finished (Length, Eos, etc.)
+        reason: crate::StopReason,
+    },
+}
+
 /// Activation data passed to pipeline hooks.
 #[derive(Debug, Clone)]
 pub struct LayerActivation<'a> {
@@ -142,6 +165,21 @@ pub trait PipelineHook: Send + Sync {
         // Default: no-op
     }
 
+    /// Signal that a pipeline request has stopped.
+    ///
+    /// Called when a sequence transitions to Done state. For pipeline parallelism,
+    /// HEAD calls this to notify TAIL that the request is complete.
+    ///
+    /// This is async because it may send an RPC to downstream stages.
+    /// Returns a `'static` future - implementations must clone/own any data they need.
+    fn stop_request(
+        &self,
+        _request_id: uuid::Uuid,
+        _reason: crate::sequence::StopReason,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        Box::pin(std::future::ready(()))
+    }
+
     /// Send activation to next pipeline stage (called by pipeline after forward).
     ///
     /// This is called by the pipeline orchestration layer after forward() completes
@@ -175,9 +213,18 @@ pub trait PipelineHook: Send + Sync {
     /// This is called by the pipeline orchestration layer before forward() begins
     /// on stages that are not the first stage. Should error on first stage.
     ///
+    /// # Arguments
+    /// * `request_id` - The request ID to receive activations for. Used to route
+    ///   to the correct per-request channel in distributed implementations.
+    ///
+    /// # Returns
+    /// - `Ok(ActivationResult::Data { tensor, tokens })` - Got activation, continue processing
+    /// - `Ok(ActivationResult::Completed { reason })` - Request finished normally
+    /// - `Err(...)` - Actual error (channel closed unexpectedly, etc.)
+    ///
     /// Default implementation returns an error. Override in distributed hooks that
     /// need to receive activations from the previous stage.
-    fn receive_activation(&self) -> Result<Tensor> {
+    fn receive_activation(&self, _request_id: uuid::Uuid) -> Result<ActivationResult> {
         Err(candle_core::Error::Msg(
             "receive_activation not supported by this hook".to_string(),
         ))
@@ -221,6 +268,21 @@ impl HookContainer {
     pub fn call_init_pipeline_request(&self, request_id: uuid::Uuid, total_prompt_tokens: usize) {
         if let Some(hook) = &self.hook {
             hook.init_pipeline_request(request_id, total_prompt_tokens);
+        }
+    }
+
+    /// Signal that a pipeline request has stopped.
+    ///
+    /// Called when a sequence transitions to Done state to notify downstream
+    /// pipeline stages. No-op future if no hook is configured.
+    pub fn stop_request(
+        &self,
+        request_id: uuid::Uuid,
+        reason: crate::sequence::StopReason,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> {
+        match &self.hook {
+            Some(hook) => hook.stop_request(request_id, reason),
+            None => Box::pin(std::future::ready(())),
         }
     }
 
@@ -270,15 +332,23 @@ impl HookContainer {
     /// Called BEFORE forward_pass() on non-first stages.
     /// Blocks until activation arrives from the transport layer.
     ///
-    /// Returns None if no hook configured or this is the first stage.
-    pub fn receive_stage_input(&self) -> Result<Option<Tensor>> {
+    /// # Arguments
+    /// * `request_id` - The request ID to receive activations for. Used to route
+    ///   to the correct per-request channel in distributed implementations.
+    ///
+    /// # Returns
+    /// - `Ok(None)` - No hook configured or this is the first stage
+    /// - `Ok(Some(ActivationResult::Data { tensor, tokens }))` - Got activation, continue
+    /// - `Ok(Some(ActivationResult::Completed { reason }))` - Request finished normally
+    /// - `Err(...)` - Actual error (channel closed unexpectedly, etc.)
+    pub fn receive_stage_input(&self, request_id: uuid::Uuid) -> Result<Option<ActivationResult>> {
         match &self.hook {
             Some(hook) => {
                 // If layer_range starts at 0, this is first stage - no input to receive
                 if hook.layer_range().start == 0 {
                     return Ok(None);
                 }
-                Ok(Some(hook.receive_activation()?))
+                Ok(Some(hook.receive_activation(request_id)?))
             }
             None => Ok(None),
         }

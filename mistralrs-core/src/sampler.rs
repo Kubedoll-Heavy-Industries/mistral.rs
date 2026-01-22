@@ -28,7 +28,7 @@ pub enum StopTokens {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Sampling params are used to control sampling.
-pub struct SamplingParams {
+pub struct TokenSamplingParams {
     pub temperature: Option<f64>,
     pub top_k: Option<usize>,
     pub top_p: Option<f64>,
@@ -41,10 +41,10 @@ pub struct SamplingParams {
     pub max_len: Option<usize>,
     pub logits_bias: Option<HashMap<u32, f32>>,
     pub n_choices: usize,
-    pub dry_params: Option<DrySamplingParams>,
+    pub dry_params: Option<DryTokenSamplingParams>,
 }
 
-impl SamplingParams {
+impl TokenSamplingParams {
     /// This sets up the parameters so that there is:
     /// - No temperature, topk, topp, minp
     /// - No penalties, stop tokens, or logit bias
@@ -69,14 +69,14 @@ impl SamplingParams {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DrySamplingParams {
+pub struct DryTokenSamplingParams {
     pub sequence_breakers: Vec<String>,
     pub multiplier: f32,
     pub base: f32,
     pub allowed_length: usize,
 }
 
-impl DrySamplingParams {
+impl DryTokenSamplingParams {
     pub fn new_with_defaults(
         multiplier: f32,
         sequence_breakers: Option<Vec<String>>,
@@ -92,7 +92,7 @@ impl DrySamplingParams {
     }
 }
 
-impl Default for DrySamplingParams {
+impl Default for DryTokenSamplingParams {
     fn default() -> Self {
         Self {
             multiplier: 0.0,
@@ -104,15 +104,15 @@ impl Default for DrySamplingParams {
 }
 
 #[derive(Clone, Debug)]
-struct DrySamplingParamsInner {
+struct DryTokenSamplingParamsInner {
     pub sequence_breakers: HashSet<u32>,
     pub multiplier: f32,
     pub base: f32,
     pub allowed_length: usize,
 }
 
-impl DrySamplingParamsInner {
-    pub fn from(other: DrySamplingParams, tokenizer: &Tokenizer) -> anyhow::Result<Self> {
+impl DryTokenSamplingParamsInner {
+    pub fn from(other: DryTokenSamplingParams, tokenizer: &Tokenizer) -> anyhow::Result<Self> {
         Ok(Self {
             base: other.base,
             allowed_length: other.allowed_length,
@@ -187,7 +187,7 @@ pub struct Sampler {
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
     repetition_penalty: Option<f32>,
-    dry_params: Option<DrySamplingParamsInner>,
+    dry_params: Option<DryTokenSamplingParamsInner>,
     top_k: i64,
     top_p: f64,
     min_p: f64,
@@ -279,7 +279,7 @@ impl Sampler {
         frequency_penalty: Option<f32>,
         presence_penalty: Option<f32>,
         repetition_penalty: Option<f32>,
-        dry_params: Option<DrySamplingParams>,
+        dry_params: Option<DryTokenSamplingParams>,
         top_k: i64,
         top_p: f64,
         min_p: f64,
@@ -291,7 +291,7 @@ impl Sampler {
             temperature
         };
         let dry_params = if let Some(ref tokenizer) = tokenizer {
-            dry_params.map(|params| DrySamplingParamsInner::from(params, tokenizer))
+            dry_params.map(|params| DryTokenSamplingParamsInner::from(params, tokenizer))
         } else {
             None
         };
@@ -958,6 +958,62 @@ impl Sampler {
         };
         Ok(next_token)
     }
+}
+
+// =============================================================================
+// Stateless sampling API
+// =============================================================================
+
+/// Sample from logits using the given parameters.
+///
+/// This is the stateless sampling API for use by Pipeline implementations.
+/// No `Sampler` struct needed - just pass config and get a token.
+///
+/// # Arguments
+/// * `logits` - Raw logits tensor from the model
+/// * `params` - Sampling parameters (temperature, top_k, top_p, penalties, etc.)
+/// * `context` - Token context for penalty calculations
+/// * `tokenizer` - Optional tokenizer for DRY sampling and logprob byte display
+/// * `logits_processors` - Custom logits processors to apply
+/// * `rng` - Random number generator for stochastic sampling
+/// * `return_logprobs` - Whether to compute and return top logprobs
+/// * `sample_speculative` - Whether to use speculative sampling mode
+#[allow(clippy::too_many_arguments)]
+pub fn sample(
+    logits: Tensor,
+    params: &TokenSamplingParams,
+    context: &[u32],
+    tokenizer: Option<Arc<Tokenizer>>,
+    logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
+    rng: Arc<Mutex<Isaac64Rng>>,
+    return_logprobs: bool,
+    sample_speculative: bool,
+) -> Result<Logprobs> {
+    // Create temporary sampler context from params (no persistent state)
+    let sampler = Sampler::new(
+        params.temperature,
+        params.top_n_logprobs,
+        tokenizer,
+        params.frequency_penalty,
+        params.presence_penalty,
+        params.repetition_penalty,
+        params.dry_params.clone(),
+        params.top_k.map(|k| k as i64).unwrap_or(-1),
+        params.top_p.unwrap_or(1.0),
+        params.min_p.unwrap_or(0.0),
+        logits_processors,
+    )
+    .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+    // Delegate to existing implementation (sampler is temporary, discarded after)
+    sampler.sample(
+        logits,
+        context,
+        return_logprobs,
+        rng,
+        sample_speculative,
+        false, // multiple_sequences
+    )
 }
 
 mod tests {

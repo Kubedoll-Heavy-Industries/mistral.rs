@@ -16,7 +16,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use mistralrs_core::{
     ChatCompletionChunkResponse, ChatCompletionResponse, Constraint, MistralRs, NormalRequest,
-    ReasoningEffort, Request, Response, SamplingParams,
+    ReasoningEffort, Request, Response, TokenSamplingParams,
 };
 use serde_json::Value;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -566,7 +566,7 @@ pub async fn parse_request(
                         messages,
                         attachments,
                         thinking,
-                        sampling_params: SamplingParams {
+                        sampling_params: TokenSamplingParams {
                             temperature: oairequest.temperature,
                             top_k: oairequest.top_k,
                             top_p: oairequest.top_p,

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub use default_scheduler::{DefaultScheduler, DefaultSchedulerMethod, DefaultSchedulerOutput};
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::{
     engine::IntervalLogger,
@@ -68,6 +69,11 @@ pub trait Scheduler: Send + Sync {
     /// Called before free_finished_sequence_groups to allow cleanup of hybrid cache slots.
     fn get_finished_mamba_indices(&self) -> Vec<usize>;
 
+    /// Get metadata for finished sequences (for pipeline completion signaling).
+    /// Returns (request_id, stop_reason) pairs for sequences that will be freed
+    /// by the next call to free_finished_sequence_groups.
+    fn get_finished_sequences(&self) -> Vec<(uuid::Uuid, crate::sequence::StopReason)>;
+
     // PagedAttention metadata
     fn block_tables(&self) -> Option<BlockTables>;
     fn block_size(&self) -> Option<usize>;
@@ -81,4 +87,19 @@ pub trait Scheduler: Send + Sync {
     /// Called by the engine after processing a batch of prefill chunks.
     /// Default implementation does nothing (for schedulers that don't support chunked prefill).
     fn advance_prefill_chunk_offsets(&mut self) {}
+
+    /// Check if a sequence with the given request_id exists in the scheduler.
+    fn has_sequence(&self, request_id: Uuid) -> bool;
+
+    /// Get a mutable reference to a sequence by its request_id.
+    /// Searches both waiting and running queues.
+    fn get_sequence_mut(&mut self, request_id: Uuid) -> Option<&mut Sequence>;
+
+    /// Remove and return a sequence by its request_id.
+    /// Searches both waiting and running queues.
+    fn remove_sequence(&mut self, request_id: Uuid) -> Option<Sequence>;
+
+    /// Get all request_ids for pipeline sequences (return_raw_logits=true).
+    /// Used to clean up stale PP sequences when a new request starts.
+    fn pipeline_sequence_ids(&self) -> Vec<Uuid>;
 }

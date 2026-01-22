@@ -23,13 +23,13 @@ use mistralrs_core::{
     initialize_logging, paged_attn_supported, parse_isq_value, AnyMoeLoader, AutoDeviceMapParams,
     ChatCompletionResponse, CompletionResponse, Constraint, DefaultSchedulerMethod,
     DetokenizationRequest, DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting,
-    DiffusionGenerationParams, DiffusionLoaderBuilder, DrySamplingParams, EmbeddingLoaderBuilder,
+    DiffusionGenerationParams, DiffusionLoaderBuilder, DryTokenSamplingParams, EmbeddingLoaderBuilder,
     EmbeddingSpecificConfig, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
     GGUFSpecificConfig, ImageGenerationResponse, ImageGenerationResponseFormat, LlguidanceGrammar,
     Loader, MemoryGpuConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest,
     NormalSpecificConfig, PagedAttentionConfig, PagedCacheType, ReasoningEffort,
     InferenceExec, InferenceInput, InferenceOperation, Request as _Request, Response, ResponseOk,
-    SamplingParams, SchedulerConfig,
+    TokenSamplingParams, SchedulerConfig,
     SearchEmbeddingModel, SpeculativeConfig, SpeculativeLoader, SpeechLoader, StopTokens,
     DetokenizeInput, TokenSource, TokenizationRequest, TokenizeInput, Tool, Topology,
     VisionLoaderBuilder, VisionSpecificConfig,
@@ -63,13 +63,13 @@ fn parse_reasoning_effort(effort: &Option<String>) -> Option<ReasoningEffort> {
         })
 }
 
-/// Build SamplingParams from a ChatCompletionRequest.
+/// Build TokenSamplingParams from a ChatCompletionRequest.
 fn build_sampling_params(
     request: &ChatCompletionRequest,
     stop_toks: Option<StopTokens>,
-    dry_params: Option<DrySamplingParams>,
-) -> SamplingParams {
-    SamplingParams {
+    dry_params: Option<DryTokenSamplingParams>,
+) -> TokenSamplingParams {
+    TokenSamplingParams {
         temperature: request.temperature,
         top_k: request.top_k,
         top_p: request.top_p,
@@ -996,7 +996,7 @@ impl Runner {
                 .as_ref()
                 .map(|x| StopTokens::Seqs(x.to_vec()));
             let dry_params = if let Some(dry_multiplier) = request.dry_multiplier {
-                Some(DrySamplingParams::new_with_defaults(
+                Some(DryTokenSamplingParams::new_with_defaults(
                     dry_multiplier,
                     request.dry_sequence_breakers.clone(),
                     request.dry_base,
@@ -1480,7 +1480,7 @@ impl Runner {
             };
 
             let dry_params = if let Some(dry_multiplier) = request.dry_multiplier {
-                Some(DrySamplingParams::new_with_defaults(
+                Some(DryTokenSamplingParams::new_with_defaults(
                     dry_multiplier,
                     request.dry_sequence_breakers.clone(),
                     request.dry_base,
@@ -1497,7 +1497,7 @@ impl Runner {
                         text: request.prompt.clone(),
                         echo_prompt: request.echo_prompt,
                         best_of: request.best_of,
-                        sampling_params: SamplingParams {
+                        sampling_params: TokenSamplingParams {
                             temperature: request.temperature,
                             top_k: request.top_k,
                             top_p: request.top_p,
@@ -1770,7 +1770,7 @@ impl Runner {
                 .map(|x| StopTokens::Seqs(x.to_vec()));
 
             let dry_params = if let Some(dry_multiplier) = request.dry_multiplier {
-                Some(DrySamplingParams::new_with_defaults(
+                Some(DryTokenSamplingParams::new_with_defaults(
                     dry_multiplier,
                     request.dry_sequence_breakers.clone(),
                     request.dry_base,
@@ -2124,7 +2124,7 @@ impl Runner {
             };
 
             let dry_params = if let Some(dry_multiplier) = request.dry_multiplier {
-                Some(DrySamplingParams::new_with_defaults(
+                Some(DryTokenSamplingParams::new_with_defaults(
                     dry_multiplier,
                     request.dry_sequence_breakers.clone(),
                     request.dry_base,
@@ -2141,7 +2141,7 @@ impl Runner {
                         text: request.prompt.clone(),
                         echo_prompt: request.echo_prompt,
                         best_of: request.best_of,
-                        sampling_params: SamplingParams {
+                        sampling_params: TokenSamplingParams {
                             temperature: request.temperature,
                             top_k: request.top_k,
                             top_p: request.top_p,

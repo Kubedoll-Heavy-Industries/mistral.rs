@@ -548,6 +548,20 @@ impl Scheduler for PagedAttentionScheduler {
             .filter_map(|seq| get_mut_arcmutex!(seq).mamba_state_idx())
             .collect()
     }
+    fn get_finished_sequences(&self) -> Vec<(uuid::Uuid, crate::sequence::StopReason)> {
+        self.running
+            .iter()
+            .filter(|seq| get_mut_arcmutex!(seq).is_finished_paged_attn())
+            .filter_map(|seq| {
+                let seq = get_mut_arcmutex!(seq);
+                if let crate::sequence::SequenceState::Done(reason) = seq.getstate() {
+                    Some((seq.request_id(), reason))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
     fn block_engine(&self) -> Option<Arc<tokio::sync::Mutex<BlockEngine>>> {
         Some(self.block_engine.clone())
     }
@@ -556,5 +570,42 @@ impl Scheduler for PagedAttentionScheduler {
     }
     fn advance_prefill_chunk_offsets(&mut self) {
         self.advance_prefill_chunk_offsets()
+    }
+
+    fn has_sequence(&self, request_id: uuid::Uuid) -> bool {
+        self.running.iter().any(|s| get_mut_arcmutex!(s).request_id() == request_id)
+            || self.waiting.iter().any(|s| get_mut_arcmutex!(s).request_id() == request_id)
+    }
+
+    fn get_sequence_mut(&mut self, request_id: uuid::Uuid) -> Option<&mut Sequence> {
+        // PagedAttentionScheduler stores sequences in Arc<Mutex<>>, so we can't return &mut directly.
+        // This method is not supported for PagedAttentionScheduler.
+        // Use remove_sequence() + add_seq() pattern instead.
+        let _ = request_id;
+        None
+    }
+
+    fn remove_sequence(&mut self, request_id: uuid::Uuid) -> Option<Sequence> {
+        // Check running first
+        if let Some(pos) = self.running.iter().position(|s| get_mut_arcmutex!(s).request_id() == request_id) {
+            let arc = self.running.remove(pos)?;
+            // Extract the inner Sequence from Arc<Mutex<>>
+            return Some(Arc::try_unwrap(arc).ok()?.into_inner().unwrap());
+        }
+        // Then check waiting
+        if let Some(pos) = self.waiting.iter().position(|s| get_mut_arcmutex!(s).request_id() == request_id) {
+            let arc = self.waiting.remove(pos)?;
+            return Some(Arc::try_unwrap(arc).ok()?.into_inner().unwrap());
+        }
+        None
+    }
+
+    fn pipeline_sequence_ids(&self) -> Vec<uuid::Uuid> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .filter(|s| get_mut_arcmutex!(s).return_raw_logits)
+            .map(|s| get_mut_arcmutex!(s).request_id())
+            .collect()
     }
 }

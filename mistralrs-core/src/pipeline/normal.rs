@@ -6,9 +6,11 @@ use super::{
     TokenSource,
 };
 use super::{
-    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, HookContainer,
-    IsqOrganization, IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
+    AnyMoePipelineMixin, AutoregressivePipeline, CacheManagerMixin, EitherCache,
+    ForwardInputsResult, HookContainer, IsqOrganization, IsqPipelineMixin, MetadataMixin,
+    ModelCategory, PreProcessingMixin,
 };
+use crate::pipeline::hooks::ActivationResult;
 use super::{
     AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, GLM4Loader, Gemma2Loader, GemmaLoader,
     GptOssLoader, GraniteMoeHybridLoader, LlamaLoader, MistralLoader, MixtralLoader,
@@ -42,6 +44,7 @@ use crate::utils::{
     tokens::get_token,
     varbuilder_utils::from_mmaped_safetensors,
 };
+use crate::sampler::{Logprobs, Sampler, TokenSamplingParams};
 use crate::xlora_models::NonGranularState;
 use crate::{
     api_dir_list, api_get_file, get_mut_arcmutex, get_paths, get_uqff_paths, lora_model_loader,
@@ -1228,15 +1231,26 @@ impl Pipeline for NormalPipeline {
                     // === PIPELINE PARALLELISM: Stage-level orchestration ===
 
                     // 1. Get initial activation (embeddings OR received from previous stage)
-                    let activation = if hook.is_first_stage() {
-                        // First stage: compute embeddings from tokens
-                        self.model.get_input_embeddings(&input_ids)?
+                    let (activation, seqlen_offsets) = if hook.is_first_stage() {
+                        // First stage: compute embeddings from tokens, use pre-built offsets
+                        (self.model.get_input_embeddings(&input_ids)?, seqlen_offsets)
                     } else {
                         // Middle/last stage: receive activation from previous stage (BLOCKING)
-                        match hook.receive_stage_input()? {
-                            Some(received) => {
-                                tracing::info!("Received activation from previous pipeline stage");
-                                received
+                        // Position comes from stream cursor model: cache length tells us where we are.
+                        // Cache lifecycle (reset vs continue) is handled by the engine via CacheInstruction.
+                        match hook.receive_stage_input(request_id)? {
+                            Some(ActivationResult::Data { tensor }) => {
+                                // Position from cache (stream cursor model)
+                                let cache_position = self.cache().normal().0
+                                    .first()
+                                    .map(|kv| kv.current_seq_len())
+                                    .unwrap_or(0);
+                                let offsets = vec![cache_position];
+                                (tensor, offsets)
+                            }
+                            Some(ActivationResult::Completed { reason }) => {
+                                // Request completed by HEAD stage - propagate completion signal
+                                return Ok(ForwardInputsResult::PipelineCompleted { reason });
                             }
                             None => {
                                 // Middle/last stage MUST receive activation from previous stage
@@ -1492,5 +1506,39 @@ impl AnyMoePipelineMixin for NormalPipeline {
     }
     fn amoe_supported(&self) -> bool {
         self.model.amoe_supported()
+    }
+}
+
+impl AutoregressivePipeline for NormalPipeline {
+    type SamplingParams = TokenSamplingParams;
+
+    fn sample(
+        &self,
+        logits: Tensor,
+        params: &Self::SamplingParams,
+        context: &[u32],
+        rng: Arc<std::sync::Mutex<Isaac64Rng>>,
+        return_logprobs: bool,
+    ) -> candle_core::Result<Logprobs> {
+        let sampler = Sampler::new(
+            params.temperature,
+            params.top_n_logprobs,
+            self.tokenizer.clone().into(),
+            params.frequency_penalty,
+            params.presence_penalty,
+            params.repetition_penalty,
+            params.dry_params.clone(),
+            params.top_k.map(|k| k as i64).unwrap_or(-1),
+            params.top_p.unwrap_or(1.0),
+            params.min_p.unwrap_or(0.0),
+            vec![],
+        )
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+        sampler.sample(logits, context, return_logprobs, rng, false, false)
+    }
+
+    fn default_params(&self) -> Self::SamplingParams {
+        TokenSamplingParams::deterministic()
     }
 }

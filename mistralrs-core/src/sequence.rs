@@ -4,7 +4,7 @@ use crate::{
     paged_attention::BlockRef,
     pipeline::{text_models_inputs_processor::PagedAttentionMeta, LayerCaches},
     response::{ChatCompletionChunkResponse, Choice, ChunkChoice, Response, SYSTEM_FINGERPRINT},
-    sampler::{Logprobs, Sampler},
+    sampler::{CustomLogitsProcessor, Logprobs, TokenSamplingParams},
     think_tags::ThinkTagContext,
     AudioInput, ChatCompletionResponse, Usage,
 };
@@ -28,7 +28,8 @@ use tokio::sync::{
     Mutex, MutexGuard,
 };
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(derive(Debug))]
 pub enum StopReason {
     Eos,
     StopTok(u32),
@@ -408,7 +409,8 @@ pub struct Sequence {
     timestamp: u128,
     /// UUID7 request ID for distributed tracing and pipeline parallelism correlation
     request_id: uuid::Uuid,
-    sampler: Arc<Sampler>,
+    sampling_params: TokenSamplingParams,
+    logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
     stop_tokens: Vec<u32>,
     stop_strings: Vec<String>,
     return_logprobs: bool,
@@ -573,7 +575,8 @@ impl Sequence {
         request_id: uuid::Uuid,
         layers: usize,
         responder: Sender<Response>,
-        sampler: Sampler,
+        sampling_params: TokenSamplingParams,
+        logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
         stop_tokens: Vec<u32>,
         stop_strings: Vec<String>,
         max_len: Option<usize>,
@@ -601,8 +604,13 @@ impl Sequence {
         eos_tokens: Vec<u32>,
         // Pipeline parallelism
         pipeline_continue_op_id: Option<uuid::Uuid>,
+        // Logical sequence length for PP continuation stages (can differ from tokens.len()).
+        // When set, this is used for prompt_len and paged attention allocation instead of tokens.len().
+        // Non-first PP stages receive hidden states, not tokens, so tokens can be empty.
+        logical_seq_len: Option<usize>,
     ) -> Self {
-        let prompt_len = tokens.len();
+        // For PP continuation stages, logical_seq_len overrides tokens.len()
+        let prompt_len = logical_seq_len.unwrap_or(tokens.len());
         let mut custom_metadata = if let Some(block_size) = block_size {
             SequenceCustomMetadata::PagedAttention {
                 logical_token_blocks: Vec::new(),
@@ -612,8 +620,14 @@ impl Sequence {
         } else {
             SequenceCustomMetadata::None
         };
-        custom_metadata
-            .append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+        // For paged attention, allocate blocks based on logical length (not token buffer size)
+        if let Some(seq_len) = logical_seq_len {
+            // PP continuation: allocate blocks for logical sequence length using placeholder token IDs
+            custom_metadata.append_tokens_to_blocks(vec![0usize; seq_len]);
+        } else {
+            // Normal path: allocate blocks based on actual tokens
+            custom_metadata.append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+        }
         Self {
             tokens,
             prompt,
@@ -635,7 +649,8 @@ impl Sequence {
             mamba_state_idx: None,
             seq_preallocated_cache,
             responder,
-            sampler: sampler.into(),
+            sampling_params,
+            logits_processors,
             stop_tokens,
             stop_strings,
             max_len,
@@ -845,6 +860,15 @@ impl Sequence {
         self.token_offset = offset;
     }
 
+    /// Increment token_offset by 1.
+    ///
+    /// Used for pipeline parallelism on non-sampling stages where tokens aren't
+    /// added via `add_token()` but position still needs to advance after each
+    /// decode step.
+    pub fn increment_token_offset(&mut self) {
+        self.token_offset += 1;
+    }
+
     /// Get the number of prefix tokens that are cached (KV already computed).
     /// These tokens should be skipped during prefill.
     pub fn prefix_cache_len(&self) -> usize {
@@ -958,6 +982,12 @@ impl Sequence {
         &mut self.normal_draft_cache
     }
 
+    /// Check if this sequence has any actual KV cache data populated.
+    /// Returns false if normal_cache is all None or empty.
+    pub fn has_normal_cache_data(&self) -> bool {
+        self.normal_cache.iter().any(|c| c.is_some())
+    }
+
     pub fn cache(&mut self) -> &mut Vec<Option<(Tensor, Tensor)>> {
         &mut self.cache
     }
@@ -986,8 +1016,12 @@ impl Sequence {
         self.xlora_cache.is_some()
     }
 
-    pub fn sampler(&mut self) -> Arc<Sampler> {
-        self.sampler.clone()
+    pub fn sampling_params(&self) -> &TokenSamplingParams {
+        &self.sampling_params
+    }
+
+    pub fn logits_processors(&self) -> &[Arc<dyn CustomLogitsProcessor>] {
+        &self.logits_processors
     }
 
     /// Add a some prefill tokens. Only meant for internal speculative decoding usage.
@@ -1463,6 +1497,14 @@ impl Sequence {
 
     // === Pipeline Parallelism Support ===
 
+    /// Get the prompt length for this sequence.
+    ///
+    /// For PP continuation sequences, this is the logical sequence length
+    /// (set via `logical_seq_len` parameter) which may differ from `tokens.len()`.
+    pub fn prompt_len(&self) -> usize {
+        self.prompt_len
+    }
+
     /// Set the prompt length for this sequence.
     /// Used when a downstream worker receives a sequence continuation.
     pub fn set_prompt_len(&mut self, len: usize) {
@@ -1475,36 +1517,24 @@ impl Sequence {
         self.responder = responder;
     }
 
-    /// Receive tokens from an upstream pipeline stage.
+    /// Append tokens to this sequence.
     ///
-    /// This is the unified API for handling tokens that arrive via activation,
-    /// whether during prefill or decode. The sequence doesn't need to know it's
-    /// part of pipeline parallelism - it just receives tokens.
+    /// Tokens accumulate naturally (like single-node inference).
+    /// Works identically for prefill chunks and decode tokens.
+    pub fn append_tokens(&mut self, tokens: &[u32]) {
+        self.tokens.extend_from_slice(tokens);
+        self.custom_metadata
+            .append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+    }
+
+    /// Check if this is a PP continuation sequence (TAIL stage).
     ///
-    /// - `is_prompt`: true for prefill chunks (replace tokens), false for decode (append)
-    ///
-    /// For prefill: replaces tokens with just this chunk, clears stale prefill state,
-    /// and resets blocks. This ensures `get_toks()` returns exactly these tokens.
-    ///
-    /// For decode: appends tokens to the existing sequence and grows blocks.
-    pub fn receive_tokens(&mut self, tokens: &[u32], is_prompt: bool) {
-        if is_prompt {
-            // Prefill chunk: replace tokens with just this chunk
-            self.tokens = tokens.to_vec();
-            // Clear prefill state so get_toks() returns self.tokens
-            self.prefill_prompt_toks = None;
-            self.prefill_chunk_offset = 0;
-            self.prefill_chunk_size = None;
-            // Reset blocks to match new token count
-            self.custom_metadata.reset_blocks();
-            self.custom_metadata
-                .append_tokens_to_blocks(self.tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
-        } else {
-            // Decode step: append tokens
-            self.tokens.extend_from_slice(tokens);
-            self.custom_metadata
-                .append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
-        }
+    /// PP continuation sequences receive hidden states from HEAD, not tokens.
+    /// They have a logical prompt_len but empty token buffer initially.
+    /// Input processing should create placeholder tensors for these sequences.
+    pub fn is_pp_continuation(&self) -> bool {
+        // PP continuation: return_raw_logits is true AND tokens are empty AND prompt_len > 0
+        self.return_raw_logits && self.tokens.is_empty() && self.prompt_len > 0
     }
 
     /// Check if this is the final prefill chunk.
@@ -1652,6 +1682,29 @@ impl SequenceGroup {
         }
 
         Ok(())
+    }
+
+    /// Send the most recent raw choice immediately without checking n_choices.
+    /// Used for pipeline parallelism where each forward pass needs a response.
+    pub async fn send_raw_response_immediate(
+        &self,
+        sender: Sender<Response>,
+    ) -> Result<(), SendError<Response>> {
+        if let Some((logits_chunks, tokens)) = self.raw_choices.last().cloned() {
+            sender
+                .send(Response::Raw {
+                    logits_chunks,
+                    tokens,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Clear accumulated raw choices. Used for pipeline parallelism to reset
+    /// after each forward pass so subsequent forwards can accumulate fresh choices.
+    pub fn clear_raw_choices(&mut self) {
+        self.raw_choices.clear();
     }
 
     pub async fn maybe_send_embedding_done_response(

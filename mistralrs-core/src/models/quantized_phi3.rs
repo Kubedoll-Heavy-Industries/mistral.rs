@@ -6,6 +6,7 @@ use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{CausalMasker, MatMul, RmsNorm, Sdpa};
+use crate::models::{TransformContext, TransformerModel};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -526,89 +527,86 @@ impl ModelWeights {
     }
 }
 
-/// State needed for Phi3 forward passes.
-/// Contains position information and optional paged attention metadata.
-pub struct Phi3State {
-    /// Position offsets for RoPE (one per batch element)
-    pub seqlen_offsets: Vec<usize>,
-    /// Optional paged attention metadata (owned for simplicity)
-    pub paged_attn_meta: Option<(Vec<(Tensor, Tensor)>, PagedAttentionInputMetadata)>,
-}
+// ============================================================================
+// TransformerModel Implementation
+// ============================================================================
 
-// Implement LanguageModel trait (Phase 2 of pipeline refactoring)
-impl crate::models::LanguageModel for ModelWeights {
-    type State = Phi3State;
-
-    fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.tok_embeddings.forward(input_ids)
+impl TransformerModel for ModelWeights {
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(tokens)
     }
 
-    fn forward(&self, hidden: Tensor, input_ids: &Tensor, state: &Self::State) -> Result<Tensor> {
-        // Use the provided input_ids tensor (already has correct shape and metadata)
-        let mut xs = hidden;
-
-        // Convert owned paged_attn_meta to borrowed form
-        let metadata = state.paged_attn_meta.as_ref().map(|(kv, meta)| (kv.clone(), meta as &PagedAttentionInputMetadata));
-
+    fn transform(&self, mut hidden: Tensor, ctx: &TransformContext) -> Result<Tensor> {
         let cache = &mut self.cache.normal().0;
-        let seqlen_offsets_slice = state.seqlen_offsets.as_slice();
+
+        // Derive mask shape from hidden states: [batch, seq_len, hidden] → [batch, seq_len]
+        let mask_shape = hidden.i((.., .., 0usize))?;
+        let start_offsets: Vec<usize> = vec![ctx.position_offset];
+        let start_offsets_slice = start_offsets.as_slice();
+
         let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
-            &input_ids,
-            metadata
+            &mask_shape,
+            ctx.paged_attn
                 .as_ref()
-                .map(|(_, _)| &seqlen_offsets_slice as &dyn PastKvLenCache)
+                .map(|_| &start_offsets_slice as &dyn PastKvLenCache)
                 .unwrap_or(cache as &dyn PastKvLenCache),
             Some(self.max_seq_len),
             self.dtype,
             self.layers[0].n_head,
         )?;
+
         let mask = mask.filter(|_| {
-            metadata
+            ctx.paged_attn
                 .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
                 .unwrap_or(true)
         });
 
-        // Forward through transformer layers
         for (i, layer) in self.layers.iter().enumerate() {
-            // Device mapping for multi-device setups
             if let Some(ref mapper) = self.mapper {
-                xs = mapper.map(xs, i)?;
+                hidden = mapper.map(hidden, i)?;
             }
 
-            // Transformer layer: attention + MLP with residual connections
-            let residual = &xs;
-            let ys = xs.apply(&layer.attn_norm)?;
+            let residual = &hidden;
+            let ys = hidden.apply(&layer.attn_norm)?;
             let ys = layer.forward_attn(
                 &ys,
                 mask.as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .map(|m| m.to_device(hidden.device()).unwrap())
                     .as_ref(),
-                &state.seqlen_offsets,
+                &start_offsets,
                 &mut cache[i],
-                metadata
+                ctx.paged_attn
                     .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                    .map(|pa| (pa.kv_cache[i].clone(), pa.metadata)),
             )?;
             let ys = (ys + residual)?;
             let residual = &ys;
             let ys = ys.apply(&layer.ffn_norm)?;
             let ys = layer.mlp.forward(&ys)?;
-            xs = (ys + residual)?;
+            hidden = (ys + residual)?;
         }
 
-        Ok(xs)
+        Ok(hidden)
     }
 
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         self.apply_lm_head(hidden)
     }
 
-    fn has_layer_0(&self) -> bool {
+    fn has_embed(&self) -> bool {
         self.is_first_stage()
     }
 
-    fn has_final_layer(&self) -> bool {
+    fn has_lm_head(&self) -> bool {
         self.is_last_stage()
+    }
+
+    fn attention_impl(&self) -> AttentionImplementation {
+        if self.layers.first().map(|l| l.paged_attn.is_some()).unwrap_or(false) {
+            AttentionImplementation::PagedAttention
+        } else {
+            AttentionImplementation::Eager
+        }
     }
 }

@@ -16,8 +16,11 @@ pub trait FcfsBacker: Default {
     fn new() -> Self;
     fn add(&mut self, item: Sequence);
     fn into_iter(self) -> impl Iterator<Item = Sequence>;
+    fn iter(&self) -> impl Iterator<Item = &Sequence>;
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Sequence>;
     fn len(&self) -> usize;
     fn sort_ascending_ids(&mut self);
+    fn remove(&mut self, index: usize) -> Option<Sequence>;
 }
 
 impl FcfsBacker for VecDeque<Sequence> {
@@ -30,12 +33,21 @@ impl FcfsBacker for VecDeque<Sequence> {
     fn into_iter(self) -> impl Iterator<Item = Sequence> {
         <Self as IntoIterator>::into_iter(self)
     }
+    fn iter(&self) -> impl Iterator<Item = &Sequence> {
+        <VecDeque<Sequence>>::iter(self)
+    }
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut Sequence> {
+        <VecDeque<Sequence>>::iter_mut(self)
+    }
     fn sort_ascending_ids(&mut self) {
         let slice = self.make_contiguous();
         slice.sort_by_key(|seq| *seq.id());
     }
     fn len(&self) -> usize {
         VecDeque::len(self)
+    }
+    fn remove(&mut self, index: usize) -> Option<Sequence> {
+        VecDeque::remove(self, index)
     }
 }
 
@@ -242,9 +254,21 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
                 }
                 logger.set_num_running(self.running.len());
                 logger.set_num_waiting(self.waiting.len());
+                // Bucket by actual sequence state, not just queue membership.
+                // This is critical for pipeline parallelism where sequences are
+                // explicitly set to RunningPrompt or RunningCompletion state.
+                let mut completion = Vec::new();
+                let mut prompt = Vec::new();
+                for seq in &mut self.running {
+                    if seq.is_completion() {
+                        completion.push(seq);
+                    } else {
+                        prompt.push(seq);
+                    }
+                }
                 return DefaultSchedulerOutput {
-                    prompt: vec![].into(),
-                    completion: self.running.iter_mut().collect::<Vec<_>>().into(),
+                    prompt: prompt.into(),
+                    completion: completion.into(),
                 };
             }
             _ => {}
@@ -339,10 +363,58 @@ impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
             .filter_map(|seq| seq.mamba_state_idx())
             .collect()
     }
+    fn get_finished_sequences(&self) -> Vec<(uuid::Uuid, crate::sequence::StopReason)> {
+        self.running
+            .iter()
+            .filter(|seq| seq.is_finished_paged_attn())
+            .filter_map(|seq| {
+                if let crate::sequence::SequenceState::Done(reason) = seq.getstate() {
+                    Some((seq.request_id(), reason))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
     fn block_engine(&self) -> Option<Arc<tokio::sync::Mutex<BlockEngine>>> {
         None
     }
     fn set_prefix_caching_enabled(&mut self, _enabled: bool) {
         // DefaultScheduler doesn't use PagedAttention prefix caching
+    }
+
+    fn has_sequence(&self, request_id: uuid::Uuid) -> bool {
+        self.running.iter().any(|s| s.request_id() == request_id)
+            || self.waiting.iter().any(|s| s.request_id() == request_id)
+    }
+
+    fn get_sequence_mut(&mut self, request_id: uuid::Uuid) -> Option<&mut Sequence> {
+        // Check running first (more likely for active sequences)
+        if let Some(seq) = self.running.iter_mut().find(|s| s.request_id() == request_id) {
+            return Some(seq);
+        }
+        // Then check waiting
+        self.waiting.iter_mut().find(|s| s.request_id() == request_id)
+    }
+
+    fn remove_sequence(&mut self, request_id: uuid::Uuid) -> Option<Sequence> {
+        // Check running first
+        if let Some(pos) = self.running.iter().position(|s| s.request_id() == request_id) {
+            return Some(self.running.remove(pos));
+        }
+        // Then check waiting
+        if let Some(pos) = self.waiting.iter().position(|s| s.request_id() == request_id) {
+            return self.waiting.remove(pos);
+        }
+        None
+    }
+
+    fn pipeline_sequence_ids(&self) -> Vec<uuid::Uuid> {
+        self.running
+            .iter()
+            .chain(self.waiting.iter())
+            .filter(|s| s.return_raw_logits)
+            .map(|s| s.request_id())
+            .collect()
     }
 }
