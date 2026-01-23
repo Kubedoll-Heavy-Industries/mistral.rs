@@ -839,7 +839,10 @@ pub trait Pipeline:
                         InferenceStep::Decode { .. } => {
                             // Transition to RunningCompletion if not already
                             if matches!(seq.getstate(), SequenceState::RunningPrompt) {
-                                seq.set_token_offset(seq.prompt_tokens());
+                                // token_offset was set at sequence creation and hasn't changed during prefill.
+                                // For PP: it's the starting position from HEAD. For normal: it's prefix cache offset.
+                                // After prefill, update it to point past all prefilled tokens.
+                                seq.set_token_offset(seq.token_offset() + seq.prompt_tokens());
                                 seq.set_state(SequenceState::RunningCompletion);
                             }
                             // Increment token_offset for decode steps

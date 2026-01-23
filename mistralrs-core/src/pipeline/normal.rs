@@ -1,9 +1,10 @@
 use super::isq::ImatrixDataSource;
 use super::llg::build_llg_factory;
 use super::{
-    get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
-    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, NormalModel, NormalModelLoader,
-    TokenSource,
+    get_model_paths, get_xlora_paths,
+    text_models_inputs_processor::{InferenceStep, ModelInputs},
+    AdapterKind, CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, NormalModel,
+    NormalModelLoader, TokenSource,
 };
 use super::{
     AnyMoePipelineMixin, AutoregressivePipeline, CacheManagerMixin, EitherCache,
@@ -1190,7 +1191,7 @@ impl Pipeline for NormalPipeline {
             flash_meta,
             flash_meta_full,
             request_id,  // Capture request_id for hook orchestration
-            ..  // Ignore inference_step for now (not used in normal pipeline yet)
+            inference_step,  // Used for prefill/decode detection in pipeline
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
@@ -1283,10 +1284,11 @@ impl Pipeline for NormalPipeline {
                         tracing::info!("Waiting for logits from last pipeline stage");
                         hook.receive_response_logits()?
                     } else {
-                        // Last stage: check if this is decode (single token) or prefill (multiple tokens)
-                        // Decode (seq_len == 1): produce logits for sampling
-                        // Prefill (seq_len > 1): just building KV cache, no logits needed
-                        let is_decode = tokens.len() == 1;
+                        // Last stage: check if this is decode or prefill
+                        // Position-based detection via InferenceStep - no token counting!
+                        // Decode: produce logits for sampling
+                        // Prefill: just building KV cache, no logits needed
+                        let is_decode = matches!(inference_step, InferenceStep::Decode { .. });
 
                         if is_decode {
                             // Decode step: apply lm_head to get logits for next token
@@ -1294,7 +1296,7 @@ impl Pipeline for NormalPipeline {
                             self.model.apply_lm_head(activation, context_lens.clone())?
                         } else {
                             // Prefill step: building KV cache, return dummy logits
-                            tracing::info!(%request_id, seq_len = tokens.len(), "Prefill step: skipping lm_head");
+                            tracing::info!(%request_id, "Prefill step: skipping lm_head");
                             Tensor::zeros((1, 1, 1), candle_core::DType::F32, activation.device())?
                         }
                     }

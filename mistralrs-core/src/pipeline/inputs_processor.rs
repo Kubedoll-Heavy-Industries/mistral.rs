@@ -727,11 +727,9 @@ pub mod text_models_inputs_processor {
         ) -> Self {
             let total_prompt_tokens = seq.prompt_tokens();
 
-            // Decode only if:
-            // 1. KV cache position is AT OR PAST the prompt (already processed all prompt tokens)
-            // 2. Processing exactly 1 token at a time
-            // Otherwise, it's prefill (including when we're completing the last chunk)
-            let is_decode = kv_cache_position >= total_prompt_tokens && input_tokens.len() == 1;
+            // Decode when KV cache position is AT OR PAST the prompt.
+            // Token count is irrelevant - after embedding, we're working with hidden states.
+            let is_decode = kv_cache_position >= total_prompt_tokens;
 
             if is_decode {
                 InferenceStep::Decode {
@@ -749,19 +747,17 @@ pub mod text_models_inputs_processor {
 
         /// Construct InferenceStep from activation shape for PP TAIL stages.
         ///
-        /// For TAIL stages receiving hidden states (not tokens), the activation tensor's
-        /// sequence dimension IS the state machine:
-        /// - seq_len > 1: Prefill (processing chunk of prompt)
-        /// - seq_len == 1: Decode (generating single token)
-        ///
-        /// Position comes from cache (stream cursor model).
+        /// Position determines prefill vs decode - same as from_sequence().
+        /// The activation tensor shape should match the position (seq_len=1 for decode),
+        /// but position is authoritative.
         pub fn from_activation_shape(
-            activation_seq_len: usize,
+            _activation_seq_len: usize,
             kv_cache_position: usize,
             total_prompt_tokens: usize,
         ) -> Self {
-            // Decode: single position AND past prompt boundary
-            let is_decode = activation_seq_len == 1 && kv_cache_position >= total_prompt_tokens;
+            // Decode when KV cache position is AT OR PAST the prompt.
+            // Consistent with from_sequence() - position is authoritative.
+            let is_decode = kv_cache_position >= total_prompt_tokens;
 
             if is_decode {
                 InferenceStep::Decode {

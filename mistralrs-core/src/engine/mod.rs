@@ -455,52 +455,27 @@ impl Engine {
                                 "All sequences must either return raw logits, or not."
                             );
 
-                            // This comes from prefix caching
-                            // The invariant where all token offsets are the same is handled by the scheduler
+                            // Cache instruction logic: cache data presence indicates continuation.
                             //
-                            // For chunked prefill (including pipeline parallelism): if chunk_offset > 0,
-                            // this is a continuation chunk and we need to preserve the KV cache.
+                            // If sequence has cache data from prior forward → continue (In)
+                            // If sequence has no cache data → new request (Reset)
                             //
-                            // Cache instruction logic - unified for all sequences.
-                            //
-                            // The key insight: cache data presence indicates continuation.
-                            // - If sequence has cache data from prior forward → In (continue)
-                            // - If sequence has no cache data → Reset (new request)
-                            //
-                            // For normal sequences: token_offset > 0 indicates continuation
-                            // For PP TAIL sequences: no tokens, but has_cache_data after prefill
-                            // For chunked prefill: chunk_offset > 0 indicates continuation
+                            // This covers all continuation scenarios:
+                            // - Prefix cache hit (token_offset > 0)
+                            // - Chunked prefill continuation (chunk_offset > 0)
+                            // - PP TAIL continuation (cache built during prefill)
                             let has_cache_data = scheduled.prompt[0].has_normal_cache_data();
-                            let token_offset = scheduled.prompt[0].token_offset();
-                            let chunk_offset = scheduled.prompt[0].prefill_chunk_offset();
-                            let is_pp_tail = scheduled.prompt[0].preallocated_cache().is_none()
-                                && scheduled.prompt[0].return_raw_logits;
-                            let pre_op = if token_offset != 0 && has_cache_data {
-                                // Normal continuation (prefix cache hit or decode)
-                                CacheInstruction::In
-                            } else if chunk_offset > 0 && has_cache_data {
-                                // Chunked prefill continuation
-                                CacheInstruction::In
-                            } else if is_pp_tail && has_cache_data {
-                                // PP TAIL continuation - cache built during prefill, no tokens
+                            let pre_op = if has_cache_data {
                                 CacheInstruction::In
                             } else {
-                                // New request - reset cache
                                 CacheInstruction::Reset {
                                     load_preallocated_cache: true,
                                     reset_non_granular: false,
                                 }
                             };
-                            let pre_op_name = match &pre_op {
-                                CacheInstruction::In => "In",
-                                CacheInstruction::Reset { .. } => "Reset",
-                                _ => "Other",
-                            };
-                            tracing::info!(
+                            let pre_op_name = if has_cache_data { "In" } else { "Reset" };
+                            tracing::debug!(
                                 has_cache_data,
-                                token_offset,
-                                chunk_offset,
-                                is_pp_tail,
                                 pre_op_name,
                                 "Engine: prompt cache instruction"
                             );

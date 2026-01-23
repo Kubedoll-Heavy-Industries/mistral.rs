@@ -169,7 +169,7 @@ impl InferenceOperation {
 /// Input for pipeline continuation requests (already tokenized).
 ///
 /// Tokens accumulate in the sequence naturally (like single-node inference).
-/// Position comes from seq.len(), not explicit tracking.
+/// Starting position is provided by HEAD to account for prefix cache offset.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PipelineContinueInput {
     pub tokens: Vec<u32>,
@@ -177,6 +177,9 @@ pub struct PipelineContinueInput {
     /// Initial sequence length (total prompt tokens).
     /// Prefill/decode boundary: seq.len() >= this value.
     pub initial_seq_len: usize,
+    /// Starting RoPE position (prefix cache offset from HEAD).
+    /// TAIL uses this as base for position counting.
+    pub starting_position: usize,
 }
 
 /// Input for tokenization requests.

@@ -930,6 +930,48 @@ impl MistralRs {
         uuid::Uuid::now_v7()
     }
 
+    /// Get the hidden size for a model's architecture.
+    ///
+    /// Returns the hidden dimension from the model's config metadata.
+    /// This is needed for pipeline parallelism to reconstruct tensor shapes.
+    pub async fn hidden_size(
+        &self,
+        model_id: Option<&str>,
+    ) -> Result<Option<usize>, MistralRsError> {
+        let resolved_model_id = match model_id {
+            Some(id) => id.to_string(),
+            None => {
+                let default_lock = self
+                    .default_engine_id
+                    .read()
+                    .map_err(|_| MistralRsError::SenderPoisoned)?;
+                default_lock
+                    .as_ref()
+                    .ok_or(MistralRsError::EnginePoisoned)?
+                    .clone()
+            }
+        };
+
+        // Get the pipeline Arc while holding the read lock, then drop the lock before await
+        let pipeline = {
+            let engines = self
+                .engines
+                .read()
+                .map_err(|_| MistralRsError::SenderPoisoned)?;
+            engines
+                .get(&resolved_model_id)
+                .map(|e| e.reboot_state.pipeline.clone())
+        };
+
+        if let Some(pipeline) = pipeline {
+            let pipeline_guard = pipeline.lock().await;
+            let metadata = pipeline_guard.get_metadata();
+            Ok(metadata.model_metadata.as_ref().map(|m| m.hidden_size()))
+        } else {
+            Err(MistralRsError::EnginePoisoned)
+        }
+    }
+
     /// Add a new model engine to the MistralRs instance
     pub async fn add_model(
         &self,

@@ -924,6 +924,7 @@ impl Engine {
         let request_id = request.id;
         let tokens = request.input.tokens.clone();
         let initial_seq_len = request.input.initial_seq_len;
+        let starting_position = request.input.starting_position;
 
         // Set pending tokens on hook for activation injection
         {
@@ -955,6 +956,7 @@ impl Engine {
             is_first_stage,
             token_count = tokens.len(),
             initial_seq_len,
+            starting_position,
             "PP activation: tokens accumulate naturally"
         );
 
@@ -1019,10 +1021,10 @@ impl Engine {
                 Some(initial_seq_len), // logical_seq_len - PP continuation uses initial_seq_len
             );
 
-            // token_offset starts at 0 for prefill. After prefill completes, the engine's
-            // state transition logic will update it (see mod.rs lines 513-532).
-            // Note: PP sequences (return_raw_logits=true) skip auto state transition,
-            // so we rely on subsequent PipelineContinue to transition to RunningCompletion.
+            // Set token_offset for RoPE alignment with HEAD's prefix cache offset.
+            // This is critical: if HEAD has 3 cached tokens, TAIL must start at position 3.
+            // Without this, TAIL computes RoPE from 0, causing position mismatch.
+            seq.set_token_offset(starting_position);
             seq.set_state(SequenceState::RunningPrompt);
 
             if block_size.is_some() {
@@ -1059,22 +1061,14 @@ impl Engine {
                 // Update responder for response routing
                 seq.set_responder(request.response.clone());
 
-                // Determine prefill vs decode from token count, not accumulated length.
-                // - Prefill chunk: tokens.len() > 1 (multiple tokens in activation)
-                // - Decode: tokens.len() == 1 (single token per step)
-                // This correctly handles TAIL's first activation (prefill) even when
-                // seq.len() == initial_seq_len, which would incorrectly trigger decode.
-                let is_decode = tokens.len() == 1 && seq.len() >= initial_seq_len;
-                if is_decode {
-                    // Transitioning to decode: set token_offset once
-                    if matches!(seq.getstate(), SequenceState::RunningPrompt) {
-                        seq.set_token_offset(initial_seq_len);
-                    }
-                    seq.set_state(SequenceState::RunningCompletion);
-                } else {
-                    // Prefill chunk: token_offset stays at 0, RoPE positions from make_prompt_chunk
-                    seq.set_state(SequenceState::RunningPrompt);
-                }
+                // State transitions (prefill → decode) are handled by the pipeline code
+                // in mod.rs based on InferenceStep, which is computed from:
+                // - For HEAD: token count and position
+                // - For TAIL: activation tensor shape (not token count!)
+                //
+                // We don't manage state here because tokens.len() is meaningless after
+                // the embedding step - TAIL receives hidden states, not tokens.
+                // The pipeline's InferenceStep correctly detects decode from activation shape.
             } else {
                 tracing::error!(%request_id, "Sequence not found in scheduler for update");
                 let _ = request
