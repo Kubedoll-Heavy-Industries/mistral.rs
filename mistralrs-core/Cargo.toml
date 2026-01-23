@@ -158,3 +158,18 @@ profiling-cuda = ["cuda", "dep:nvtx"]
 
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "attention"
+harness = false
+
+[[bench]]
+name = "layers"
+harness = false
+
+[[bench]]
+name = "sampling"
+harness = false
