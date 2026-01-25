@@ -47,6 +47,7 @@ use crate::utils::{
 };
 use crate::sampler::{Logprobs, Sampler, TokenSamplingParams};
 use crate::xlora_models::NonGranularState;
+use crate::models::{PagedAttentionContext, TransformContext};
 use crate::{
     api_dir_list, api_get_file, get_mut_arcmutex, get_paths, get_uqff_paths, lora_model_loader,
     normal_model_loader, normal_model_loader_sharded, xlora_model_loader, DeviceMapSetting,
@@ -73,7 +74,7 @@ use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-pub struct NormalPipeline {
+pub struct SafetensorsPipeline {
     model: Box<dyn NormalModel + Send + Sync>,
     tokenizer: Arc<Tokenizer>,
     no_kv_cache: bool,
@@ -94,10 +95,10 @@ pub struct NormalPipeline {
 }
 
 /// A loader for a "normal" (non-quantized) model.
-pub struct NormalLoader {
+pub struct SafetensorsLoader {
     inner: Box<dyn NormalModelLoader>,
     model_id: String,
-    config: NormalSpecificConfig,
+    config: SafetensorsConfig,
     xlora_model_id: Option<String>,
     lora_adapter_ids: Option<Vec<String>>,
     kind: ModelKind,
@@ -115,9 +116,9 @@ pub struct NormalLoader {
 
 #[derive(Default)]
 /// A builder for a loader for a "normal" (non-quantized) model.
-pub struct NormalLoaderBuilder {
+pub struct SafetensorsLoaderBuilder {
     model_id: Option<String>,
-    config: NormalSpecificConfig,
+    config: SafetensorsConfig,
     xlora_model_id: Option<String>,
     lora_adapter_ids: Option<Vec<String>>,
     kind: ModelKind,
@@ -132,7 +133,7 @@ pub struct NormalLoaderBuilder {
 
 #[derive(Clone, Default)]
 /// Config specific to loading a normal model.
-pub struct NormalSpecificConfig {
+pub struct SafetensorsConfig {
     pub topology: Option<Topology>,
     pub organization: IsqOrganization,
     pub write_uqff: Option<PathBuf>,
@@ -147,9 +148,9 @@ pub struct NormalSpecificConfig {
     pub layer_range: Option<std::ops::Range<usize>>,
 }
 
-impl NormalLoaderBuilder {
+impl SafetensorsLoaderBuilder {
     pub fn new(
-        config: NormalSpecificConfig,
+        config: SafetensorsConfig,
         chat_template: Option<String>,
         tokenizer_json: Option<String>,
         model_id: Option<String>,
@@ -246,7 +247,7 @@ impl NormalLoaderBuilder {
             Some(NormalLoaderType::GptOss) => Box::new(GptOssLoader),
             None => Box::new(AutoNormalLoader),
         };
-        Ok(Box::new(NormalLoader {
+        Ok(Box::new(SafetensorsLoader {
             inner: loader,
             model_id: self.model_id.unwrap(),
             config: self.config,
@@ -267,7 +268,7 @@ impl NormalLoaderBuilder {
     }
 }
 
-impl Loader for NormalLoader {
+impl Loader for SafetensorsLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn load_model_from_hf(
         &self,
@@ -1007,7 +1008,7 @@ impl Loader for NormalLoader {
         let sliding_window = model.config().sliding_window;
         let model_metadata = Arc::new(model.config().clone());
 
-        Ok(Arc::new(Mutex::new(NormalPipeline {
+        Ok(Arc::new(Mutex::new(SafetensorsPipeline {
             model,
             tokenizer: tokenizer.into(),
             no_kv_cache: self.no_kv_cache,
@@ -1059,7 +1060,7 @@ impl Loader for NormalLoader {
     }
 }
 
-impl PreProcessingMixin for NormalPipeline {
+impl PreProcessingMixin for SafetensorsPipeline {
     fn get_chat_template(&self) -> Option<Arc<ChatTemplate>> {
         Some(self.chat_template.clone())
     }
@@ -1068,7 +1069,7 @@ impl PreProcessingMixin for NormalPipeline {
     }
 }
 
-impl IsqPipelineMixin for NormalPipeline {
+impl IsqPipelineMixin for SafetensorsPipeline {
     fn re_isq_model(&mut self, dtype: IsqType) -> Result<()> {
         let device = self.device().clone();
         let multi_progress = Arc::new(new_multi_progress());
@@ -1097,7 +1098,7 @@ impl IsqPipelineMixin for NormalPipeline {
     }
 }
 
-impl CacheManagerMixin for NormalPipeline {
+impl CacheManagerMixin for SafetensorsPipeline {
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
         match self.model.cache() {
             EitherCache::Full(_) => FullCacheManager.clone_in_cache(self, seqs, false),
@@ -1145,7 +1146,7 @@ impl CacheManagerMixin for NormalPipeline {
     }
 }
 
-impl MetadataMixin for NormalPipeline {
+impl MetadataMixin for SafetensorsPipeline {
     fn device(&self) -> Device {
         self.model.device().clone()
     }
@@ -1170,7 +1171,7 @@ impl MetadataMixin for NormalPipeline {
 }
 
 #[async_trait::async_trait]
-impl Pipeline for NormalPipeline {
+impl Pipeline for SafetensorsPipeline {
     fn get_hook(&self) -> Option<&crate::pipeline::HookContainer> {
         self.hook.as_ref()
     }
@@ -1234,7 +1235,7 @@ impl Pipeline for NormalPipeline {
                     // 1. Get initial activation (embeddings OR received from previous stage)
                     let (activation, seqlen_offsets) = if hook.is_first_stage() {
                         // First stage: compute embeddings from tokens, use pre-built offsets
-                        (self.model.get_input_embeddings(&input_ids)?, seqlen_offsets)
+                        (self.model.embed(&input_ids)?, seqlen_offsets)
                     } else {
                         // Middle/last stage: receive activation from previous stage (BLOCKING)
                         // Position comes from stream cursor model: cache length tells us where we are.
@@ -1263,18 +1264,24 @@ impl Pipeline for NormalPipeline {
                     };
 
                     // 2. Run transformer layers (all stages)
-                    let activation = self.model.forward_layers(
-                        &input_ids,
-                        activation,
-                        &seqlen_offsets,
-                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
-                        &flash_meta,
-                    )?;
+                    let seq_len = activation.dim(1)?;
+                    let position_offset = seqlen_offsets.first().copied().unwrap_or(0);
+                    let paged_attn_ctx = paged_attn_meta.as_ref().map(|(kv_cache, metadata)| {
+                        PagedAttentionContext {
+                            kv_cache: kv_cache.clone(),
+                            metadata,
+                        }
+                    });
+                    let transform_ctx = TransformContext {
+                        seq_len,
+                        position_offset,
+                        paged_attn: paged_attn_ctx.as_ref(),
+                    };
+                    let activation = self.model.transform(activation, &transform_ctx)?;
 
                     // 3. Send activation to next stage (if not last stage)
                     if !hook.is_last_stage() {
-                        let sequence_position = seqlen_offsets.first().copied().unwrap_or(0);
-                        hook.send_stage_output(&activation, &tokens, request_id, sequence_position)?;
+                        hook.send_stage_output(&activation, &tokens, request_id, position_offset)?;
                         tracing::info!("Sent activation to next pipeline stage");
                     }
 
@@ -1293,7 +1300,8 @@ impl Pipeline for NormalPipeline {
                         if is_decode {
                             // Decode step: apply lm_head to get logits for next token
                             tracing::info!(%request_id, "Decode step: applying lm_head");
-                            self.model.apply_lm_head(activation, context_lens.clone())?
+                            let logits = self.model.lm_head(activation)?;
+                            crate::pipeline::extract_logits(&logits, context_lens.clone())?
                         } else {
                             // Prefill step: building KV cache, return dummy logits
                             tracing::info!(%request_id, "Prefill step: skipping lm_head");
@@ -1353,7 +1361,7 @@ impl Pipeline for NormalPipeline {
     }
 }
 
-impl AnyMoePipelineMixin for NormalPipeline {
+impl AnyMoePipelineMixin for SafetensorsPipeline {
     fn amoe_finish_training(&mut self, gate_model_id: Option<String>) -> candle_core::Result<()> {
         self.model.finish_training(gate_model_id)
     }
@@ -1511,7 +1519,7 @@ impl AnyMoePipelineMixin for NormalPipeline {
     }
 }
 
-impl AutoregressivePipeline for NormalPipeline {
+impl AutoregressivePipeline for SafetensorsPipeline {
     type SamplingParams = TokenSamplingParams;
 
     fn sample(
@@ -1544,3 +1552,19 @@ impl AutoregressivePipeline for NormalPipeline {
         TokenSamplingParams::deterministic()
     }
 }
+
+// =============================================================================
+// Backwards Compatibility Aliases (deprecated)
+// =============================================================================
+
+/// Deprecated: Use `SafetensorsLoader` instead.
+#[deprecated(since = "0.8.0", note = "Renamed to SafetensorsLoader for clarity")]
+pub type NormalLoader = SafetensorsLoader;
+
+/// Deprecated: Use `SafetensorsLoaderBuilder` instead.
+#[deprecated(since = "0.8.0", note = "Renamed to SafetensorsLoaderBuilder for clarity")]
+pub type NormalLoaderBuilder = SafetensorsLoaderBuilder;
+
+/// Deprecated: Use `SafetensorsConfig` instead.
+#[deprecated(since = "0.8.0", note = "Renamed to SafetensorsConfig for clarity")]
+pub type NormalSpecificConfig = SafetensorsConfig;

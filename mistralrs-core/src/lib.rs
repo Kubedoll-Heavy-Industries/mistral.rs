@@ -113,12 +113,16 @@ pub use pipeline::{
     GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, HookContainer, Idefics2Loader,
     ActivationResult, IsqOrganization, LayerActivation, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader,
     LocalModelPaths, LoraAdapterPaths, MistralLoader, MixtralLoader, Modalities, ModelKind,
-    ModelPaths, MultimodalPromptPrefixer, NonMappedSubModel, NormalLoader, NormalLoaderBuilder,
-    NormalLoaderType, NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, PipelineHook,
+    ModelPaths, MultimodalPromptPrefixer, NonMappedSubModel, NormalLoaderType,
+    Phi2Loader, Phi3Loader, Phi3VLoader, PipelineHook,
+    SafetensorsLoader, SafetensorsLoaderBuilder, SafetensorsConfig,
     Qwen2Loader, SpeculativeConfig, SpeculativeLoader, SpeculativePipeline, SpeechLoader,
     SpeechPipeline, Starcoder2Loader, SupportedModality, TokenSource, VisionLoader,
     VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
 };
+// Backwards compatibility re-exports (deprecated)
+#[allow(deprecated)]
+pub use pipeline::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
     DetokenizeInput, InferenceExec, InferenceInput, InferenceOperation, LlguidanceGrammar,

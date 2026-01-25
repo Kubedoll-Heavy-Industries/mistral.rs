@@ -414,18 +414,6 @@ pub mod text_models_inputs_processor {
             let ctxt_offset = ctxt.len().saturating_sub(1);
             let ctxt = ctxt[ctxt_offset..].to_vec();
 
-            // Investigation tracing for PP RoPE position
-            if seq.return_raw_logits {
-                tracing::info!(
-                    request_id = %seq.request_id(),
-                    token_offset = seq.token_offset(),
-                    seq_len = seq.len(),
-                    start_pos,
-                    prompt_tokens = seq.prompt_tokens(),
-                    "make_completion_chunk: PP sequence RoPE position"
-                );
-            }
-
             seqlen_offsets.push(start_pos);
             context_lens.push((0, 1));
             position_ids.push(seq.len());
@@ -665,7 +653,6 @@ pub mod text_models_inputs_processor {
         })
     }
 
-
     /// State machine for inference: prefill (with chunking) or decode.
     /// Carries structured metadata instead of booleans and guessing from tensor shapes.
     #[derive(Clone, Debug)]
@@ -710,7 +697,10 @@ pub mod text_models_inputs_processor {
         /// Get the current KV cache position (cumulative tokens processed).
         pub fn current_position(&self) -> usize {
             match self {
-                InferenceStep::Prefill { chunk_start_position, .. } => *chunk_start_position,
+                InferenceStep::Prefill {
+                    chunk_start_position,
+                    ..
+                } => *chunk_start_position,
                 InferenceStep::Decode { position, .. } => *position,
             }
         }
@@ -859,11 +849,8 @@ pub mod text_models_inputs_processor {
                 // Compute InferenceStep from current tokens and KV cache position
                 let input_tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
                 let kv_position = seqlen_offsets.first().copied().unwrap_or(0);
-                let inference_step = InferenceStep::from_sequence(
-                    input_tokens,
-                    kv_position,
-                    input_seqs[0],
-                );
+                let inference_step =
+                    InferenceStep::from_sequence(input_tokens, kv_position, input_seqs[0]);
 
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids,
@@ -911,11 +898,8 @@ pub mod text_models_inputs_processor {
                 // Compute InferenceStep from current tokens and KV cache position
                 let input_tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
                 let kv_position = seqlen_offsets.first().copied().unwrap_or(0);
-                let inference_step = InferenceStep::from_sequence(
-                    input_tokens,
-                    kv_position,
-                    input_seqs[0],
-                );
+                let inference_step =
+                    InferenceStep::from_sequence(input_tokens, kv_position, input_seqs[0]);
 
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids: input_ids.clone(),
@@ -992,11 +976,8 @@ pub mod text_models_inputs_processor {
                 // Compute InferenceStep from current tokens and KV cache position
                 let input_tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
                 let kv_position = seqlen_offsets.first().copied().unwrap_or(0);
-                let inference_step = InferenceStep::from_sequence(
-                    input_tokens,
-                    kv_position,
-                    input_seqs[0],
-                );
+                let inference_step =
+                    InferenceStep::from_sequence(input_tokens, kv_position, input_seqs[0]);
 
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids,
@@ -1045,11 +1026,8 @@ pub mod text_models_inputs_processor {
                 // Compute InferenceStep from current tokens and KV cache position
                 let input_tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
                 let kv_position = seqlen_offsets.first().copied().unwrap_or(0);
-                let inference_step = InferenceStep::from_sequence(
-                    input_tokens,
-                    kv_position,
-                    input_seqs[0],
-                );
+                let inference_step =
+                    InferenceStep::from_sequence(input_tokens, kv_position, input_seqs[0]);
 
                 let inputs: Box<dyn Any> = Box::new(ModelInputs {
                     input_ids,

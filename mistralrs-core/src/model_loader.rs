@@ -11,7 +11,7 @@ use crate::{
     pipeline::{
         AutoLoaderBuilder, DiffusionLoaderBuilder, GGMLLoaderBuilder, GGMLSpecificConfig,
         GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig, GGUFLoaderBuilder,
-        GGUFSpecificConfig, NormalLoaderBuilder, NormalSpecificConfig, RerankLoader,
+        GGUFSpecificConfig, SafetensorsLoaderBuilder, SafetensorsConfig, RerankLoader,
         VisionLoaderBuilder, VisionSpecificConfig,
     },
     toml_selector::get_toml_selected_model_device_map_params,
@@ -274,8 +274,8 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             hf_cache_path,
             matformer_config_path,
             matformer_slice_name,
-        } => NormalLoaderBuilder::new(
-            NormalSpecificConfig {
+        } => SafetensorsLoaderBuilder::new(
+            SafetensorsConfig {
                 topology: Topology::from_option_path(topology)?,
                 organization: organization.unwrap_or_default(),
                 write_uqff,
@@ -319,7 +319,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             matformer_slice_name,
         } => {
             let builder = AutoLoaderBuilder::new(
-                NormalSpecificConfig {
+                SafetensorsConfig {
                     topology: Topology::from_option_path(topology.clone())?,
                     organization: organization.unwrap_or_default(),
                     write_uqff: write_uqff.clone(),
@@ -447,8 +447,8 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             max_seq_len: _,
             max_batch_size: _,
             hf_cache_path,
-        } => NormalLoaderBuilder::new(
-            NormalSpecificConfig {
+        } => SafetensorsLoaderBuilder::new(
+            SafetensorsConfig {
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -493,8 +493,8 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             max_seq_len: _,
             max_batch_size: _,
             hf_cache_path,
-        } => NormalLoaderBuilder::new(
-            NormalSpecificConfig {
+        } => SafetensorsLoaderBuilder::new(
+            SafetensorsConfig {
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,

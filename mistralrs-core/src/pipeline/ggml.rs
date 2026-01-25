@@ -9,8 +9,9 @@ use super::{
 };
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::DeviceMapper;
-use crate::kv_cache::FullCacheManager;
+use crate::kv_cache::{FullCacheManager, NormalCache};
 use crate::lora::Ordering;
+use crate::models::{TransformContext, TransformerModel};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
@@ -58,6 +59,8 @@ pub struct GGMLPipeline {
     model_id: String,
     non_granular_state: Option<NonGranularState>,
     metadata: Arc<GeneralMetadata>,
+    /// KV cache owned by the pipeline (models are stateless)
+    cache: EitherCache,
 }
 
 /// A loader for a GGML model.
@@ -364,9 +367,13 @@ impl Loader for GGMLLoader {
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
-            Model::Llama(ref model) => model.cache.normal().0.len(),
+            Model::Llama(ref model) => model.num_layers(),
             Model::XLoraLlama(ref model) => model.cache.full().lock().len(),
         };
+
+        // Create cache for pipeline (models are stateless, pipeline owns the cache)
+        let cache = EitherCache::Normal(NormalCache::new(num_hidden_layers, max_seq_len));
+
         let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
         Ok(Arc::new(Mutex::new(GGMLPipeline {
             model,
@@ -399,6 +406,7 @@ impl Loader for GGMLLoader {
                     output: vec![SupportedModality::Text],
                 },
             }),
+            cache,
         })))
     }
 
@@ -486,10 +494,7 @@ impl CacheManagerMixin for GGMLPipeline {
         }
     }
     fn cache(&self) -> &EitherCache {
-        match self.model {
-            Model::Llama(ref model) => &model.cache,
-            Model::XLoraLlama(ref model) => &model.cache,
-        }
+        &self.cache
     }
 }
 
@@ -540,11 +545,32 @@ impl Pipeline for GGMLPipeline {
             request_id: _,
             ..
         } = *inputs.downcast().expect("Downcast failed.");
-        let logits = match self.model {
-            Model::Llama(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, None)?
-            }
-            Model::XLoraLlama(ref model) => model.forward(
+        // Check model type first to allow split borrowing of self.model and self.cache
+        let is_llama = matches!(self.model, Model::Llama(_));
+
+        let logits = if is_llama {
+            // Use unified TransformerModel forward path
+            let Model::Llama(ref model) = self.model else {
+                unreachable!()
+            };
+            let cache = &mut self.cache.normal().0;
+            let position_offset = seqlen_offsets.first().copied().unwrap_or(0);
+            let ctx = TransformContext {
+                seq_len: input_ids.dims()[1],
+                position_offset,
+                paged_attn: None, // GGML doesn't support paged attention
+            };
+
+            let hidden = model.embed(&input_ids)?;
+            let hidden = model.transform(hidden, &ctx, cache)?;
+            let logits = model.lm_head(hidden)?;
+            crate::pipeline::extract_logits(&logits, context_lens)?
+        } else {
+            // XLoraLlama uses legacy forward path with its own cache
+            let Model::XLoraLlama(ref model) = self.model else {
+                unreachable!()
+            };
+            model.forward(
                 &input_ids,
                 input_ids_full.as_ref().unwrap_or(&input_ids),
                 &seqlen_offsets,
@@ -554,7 +580,7 @@ impl Pipeline for GGMLPipeline {
                 context_lens,
                 &flash_meta,
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
-            )?,
+            )?
         };
         if return_raw_logits {
             Ok(ForwardInputsResult::RawLogits { logits })

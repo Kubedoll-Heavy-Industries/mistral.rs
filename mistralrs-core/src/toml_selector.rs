@@ -8,7 +8,7 @@ use crate::{
     pipeline::{EmbeddingLoaderType, IsqOrganization},
     AnyMoeLoader, AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader,
-    ModelDType, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, SpeculativeConfig,
+    ModelDType, SafetensorsLoaderBuilder, NormalLoaderType, SafetensorsConfig, SpeculativeConfig,
     SpeculativeLoader, Topology, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
     GGUF_MULTI_FILE_DELIMITER, UQFF_MULTI_FILE_DELIMITER,
 };
@@ -639,8 +639,8 @@ fn loader_from_selected(
             max_seq_len: _,
             max_batch_size: _,
             hf_cache_path,
-        } => NormalLoaderBuilder::new(
-            NormalSpecificConfig {
+        } => SafetensorsLoaderBuilder::new(
+            SafetensorsConfig {
                 topology: Topology::from_option_path(topology)?,
                 organization: organization.unwrap_or_default(),
                 write_uqff,
@@ -677,8 +677,8 @@ fn loader_from_selected(
             max_seq_len: _,
             max_batch_size: _,
             hf_cache_path,
-        } => NormalLoaderBuilder::new(
-            NormalSpecificConfig {
+        } => SafetensorsLoaderBuilder::new(
+            SafetensorsConfig {
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -722,8 +722,8 @@ fn loader_from_selected(
             max_seq_len: _,
             max_batch_size: _,
             hf_cache_path,
-        } => NormalLoaderBuilder::new(
-            NormalSpecificConfig {
+        } => SafetensorsLoaderBuilder::new(
+            SafetensorsConfig {
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,

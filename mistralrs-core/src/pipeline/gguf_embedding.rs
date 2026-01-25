@@ -5,14 +5,15 @@
 
 use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, GeneralMetadata,
-    IsqPipelineMixin, Loader, MetadataMixin, ModelCategory, ModelKind, ModelPaths,
-    Modalities, PreProcessingMixin, Processor, SupportedModality,
+    IsqPipelineMixin, KvCache, Loader, MetadataMixin, ModelCategory, ModelKind, ModelPaths,
+    Modalities, NormalCache, PreProcessingMixin, Processor, SupportedModality,
 };
 use crate::device_map::DeviceMapper;
 use crate::embedding_models::inputs_processor::{EmbeddingProcessor, ModelInputs};
 use crate::gguf::{convert_gguf_to_hf_tokenizer, Content, GGUFArchitecture, GgufTokenizerConversion};
 use crate::models::quantized_qwen::ModelWeights as QQwen;
 use crate::models::quantized_qwen3::ModelWeights as QQwen3;
+use crate::models::TransformerModel;
 use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::loaders::QuantizationKind;
 use crate::utils::model_config as ModelConfig;
@@ -305,6 +306,11 @@ impl Loader for GGUFEmbeddingLoader {
             has_causal_attention: false, // Bidirectional attention for embeddings
         });
 
+        // Create cache for pipeline (models are stateless)
+        let num_layers = model.num_layers();
+        let max_seq_len = model.max_seq_len();
+        let cache = EitherCache::Normal(NormalCache::new(num_layers, max_seq_len));
+
         let pipeline = GGUFEmbeddingPipeline {
             model,
             tokenizer: Arc::new(tokenizer),
@@ -313,6 +319,7 @@ impl Loader for GGUFEmbeddingLoader {
             mapper: pipeline_mapper,
             processor,
             device: device.clone(),
+            cache,
         };
 
         Ok(Arc::new(Mutex::new(pipeline)))
@@ -334,17 +341,37 @@ enum GGUFEmbeddingModel {
 }
 
 impl GGUFEmbeddingModel {
+    /// Number of transformer layers in this model.
+    fn num_layers(&self) -> usize {
+        match self {
+            GGUFEmbeddingModel::Qwen(model) => model.num_layers(),
+            GGUFEmbeddingModel::Qwen3(model) => model.num_layers(),
+        }
+    }
+
+    /// Maximum sequence length supported by this model.
+    fn max_seq_len(&self) -> usize {
+        match self {
+            GGUFEmbeddingModel::Qwen(model) => model.max_seq_len,
+            GGUFEmbeddingModel::Qwen3(model) => model.max_seq_len,
+        }
+    }
+
     /// Forward pass to generate embeddings (hidden states before LM head).
-    fn forward_hidden_states(&self, input_ids: &Tensor) -> Result<Tensor, candle_core::Error> {
+    fn forward_hidden_states(
+        &self,
+        input_ids: &Tensor,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor, candle_core::Error> {
         let (batch_size, _seq_len) = input_ids.dims2()?;
         let start_offsets = vec![0usize; batch_size];
 
         match self {
             GGUFEmbeddingModel::Qwen(model) => {
-                model.forward_hidden_states(input_ids, &start_offsets)
+                model.forward_hidden_states(input_ids, &start_offsets, cache)
             }
             GGUFEmbeddingModel::Qwen3(model) => {
-                model.forward_hidden_states(input_ids, &start_offsets)
+                model.forward_hidden_states(input_ids, &start_offsets, cache)
             }
         }
     }
@@ -367,6 +394,8 @@ pub struct GGUFEmbeddingPipeline {
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     processor: Arc<dyn Processor + Send + Sync>,
     device: Device,
+    /// KV cache owned by the pipeline (models are stateless)
+    cache: EitherCache,
 }
 
 #[async_trait]
@@ -384,7 +413,8 @@ impl Pipeline for GGUFEmbeddingPipeline {
             .map_err(|_| candle_core::Error::Msg("Invalid input type for embedding pipeline".to_string()))?;
 
         // Get hidden states from model
-        let hidden_states = self.model.forward_hidden_states(&input_ids)?;
+        let cache = &mut self.cache.normal().0;
+        let hidden_states = self.model.forward_hidden_states(&input_ids, cache)?;
 
         // Apply last-token pooling (take the last token's hidden state for each sequence)
         // This is appropriate for Qwen3-Embedding models
@@ -460,7 +490,7 @@ impl CacheManagerMixin for GGUFEmbeddingPipeline {
     ) {
     }
     fn cache(&self) -> &EitherCache {
-        unimplemented!("Embedding pipeline does not use cache")
+        &self.cache
     }
 }
 

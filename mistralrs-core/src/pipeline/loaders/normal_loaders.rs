@@ -34,7 +34,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::{
-    models,
+    models::{self, TransformContext},
     xlora_models::{self, XLoraConfig},
 };
 
@@ -87,60 +87,45 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
         false
     }
 
-    // === Building blocks for pipeline-level orchestration ===
-    // These methods enable the pipeline to control which stages execute,
-    // necessary for distributed inference with hooks.
+    // === TransformerModel methods for pipeline parallelism ===
+    // These mirror the canonical TransformerModel trait from models/mod.rs.
+    // Models supporting pipeline parallelism must implement these.
 
-    /// Get input embeddings from token IDs (first stage only).
+    /// Convert token IDs to embeddings (HEAD stage only).
     ///
-    /// Returns embeddings tensor [batch, seq_len, hidden_dim].
+    /// Input: token IDs [batch, seq_len]
+    /// Output: embeddings [batch, seq_len, hidden_dim]
     ///
-    /// Default implementation returns error - models must override to support
-    /// pipeline parallelism.
-    fn get_input_embeddings(
-        &self,
-        _input_ids: &Tensor,
-    ) -> candle_core::Result<Tensor> {
+    /// Default implementation returns error - models must override to support PP.
+    fn embed(&self, _tokens: &Tensor) -> candle_core::Result<Tensor> {
         Err(candle_core::Error::Msg(
-            "Model does not support get_input_embeddings - pipeline parallelism not implemented".to_string()
+            "Model does not support embed - pipeline parallelism not implemented".to_string(),
         ))
     }
 
-    /// Run transformer layers on input activations (all stages).
+    /// Transform hidden states through transformer layers.
     ///
-    /// Takes either embeddings (first stage) or received activations (middle/last stages).
-    /// Returns hidden states tensor [batch, seq_len, hidden_dim].
+    /// Input: hidden states [batch, seq_len, hidden_dim]
+    /// Output: hidden states [batch, seq_len, hidden_dim]
     ///
-    /// Default implementation returns error - models must override to support
-    /// pipeline parallelism.
-    #[allow(clippy::too_many_arguments)]
-    fn forward_layers(
-        &self,
-        _input_ids: &Tensor,
-        _x: Tensor,
-        _seqlen_offsets: &[usize],
-        _metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        _flash_params: &FlashParams,
-    ) -> candle_core::Result<Tensor> {
+    /// Called by all pipeline stages. Each stage processes its assigned layers.
+    /// Default implementation returns error - models must override to support PP.
+    fn transform(&self, _hidden: Tensor, _ctx: &TransformContext) -> candle_core::Result<Tensor> {
         Err(candle_core::Error::Msg(
-            "Model does not support forward_layers - pipeline parallelism not implemented".to_string()
+            "Model does not support transform - pipeline parallelism not implemented".to_string(),
         ))
     }
 
-    /// Apply lm_head to convert hidden states to logits (last stage only).
+    /// Project hidden states to vocabulary logits (TAIL stage only).
     ///
-    /// Takes hidden states [batch, seq_len, hidden_dim].
-    /// Returns logits tensor [batch, vocab_size] (last position extracted).
+    /// Input: hidden states [batch, seq_len, hidden_dim]
+    /// Output: logits [batch, seq_len, vocab_size]
     ///
-    /// Default implementation returns error - models must override to support
-    /// pipeline parallelism.
-    fn apply_lm_head(
-        &self,
-        _x: Tensor,
-        _context_lens: Vec<(usize, usize)>,
-    ) -> candle_core::Result<Tensor> {
+    /// NOTE: This returns raw logits. Caller handles position extraction via extract_logits().
+    /// Default implementation returns error - models must override to support PP.
+    fn lm_head(&self, _hidden: Tensor) -> candle_core::Result<Tensor> {
         Err(candle_core::Error::Msg(
-            "Model does not support apply_lm_head - pipeline parallelism not implemented".to_string()
+            "Model does not support lm_head - pipeline parallelism not implemented".to_string(),
         ))
     }
 }

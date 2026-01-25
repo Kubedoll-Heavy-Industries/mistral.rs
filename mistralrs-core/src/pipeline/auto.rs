@@ -1,6 +1,6 @@
 use super::{
     EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingSpecificConfig, Loader, ModelKind,
-    ModelPaths, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, TokenSource,
+    ModelPaths, SafetensorsLoaderBuilder, NormalLoaderType, SafetensorsConfig, TokenSource,
     VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
 };
 use crate::api_get_file;
@@ -23,7 +23,7 @@ use tracing::{debug, info};
 /// Automatically selects between a normal or vision loader based on the `architectures` field.
 pub struct AutoLoader {
     model_id: String,
-    normal_builder: Mutex<Option<NormalLoaderBuilder>>,
+    normal_builder: Mutex<Option<SafetensorsLoaderBuilder>>,
     vision_builder: Mutex<Option<VisionLoaderBuilder>>,
     embedding_builder: Mutex<Option<EmbeddingLoaderBuilder>>,
     loader: Mutex<Option<Box<dyn Loader>>>,
@@ -31,7 +31,7 @@ pub struct AutoLoader {
 }
 
 pub struct AutoLoaderBuilder {
-    normal_cfg: NormalSpecificConfig,
+    normal_cfg: SafetensorsConfig,
     vision_cfg: VisionSpecificConfig,
     embedding_cfg: EmbeddingSpecificConfig,
     chat_template: Option<String>,
@@ -49,7 +49,7 @@ pub struct AutoLoaderBuilder {
 impl AutoLoaderBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        normal_cfg: NormalSpecificConfig,
+        normal_cfg: SafetensorsConfig,
         vision_cfg: VisionSpecificConfig,
         embedding_cfg: EmbeddingSpecificConfig,
         chat_template: Option<String>,
@@ -116,7 +116,7 @@ impl AutoLoaderBuilder {
             hf_cache_path,
         } = self;
 
-        let mut normal_builder = NormalLoaderBuilder::new(
+        let mut normal_builder = SafetensorsLoaderBuilder::new(
             normal_cfg,
             chat_template.clone(),
             tokenizer_json.clone(),

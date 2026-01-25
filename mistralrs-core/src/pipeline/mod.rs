@@ -12,7 +12,8 @@ mod isq;
 pub(crate) mod llg;
 mod loaders;
 mod macros;
-mod normal;
+pub mod model_traits;
+mod safetensors;
 mod paths;
 mod processing;
 mod rerank;
@@ -20,6 +21,7 @@ mod response;
 mod sampling;
 mod speculative;
 mod speech;
+pub mod text_generation;
 mod vision;
 
 pub use super::diffusion_models::DiffusionGenerationParams;
@@ -32,9 +34,11 @@ pub use auto::{AutoLoader, AutoLoaderBuilder};
 use chat_template::ChatTemplate;
 pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
 pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
+#[allow(unused_imports)]
 pub use rerank::{RerankInputs, RerankLoader, RerankPipeline};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
+#[allow(unused_imports)]
 pub use gguf_embedding::{
     GGUFEmbeddingLoader, GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig,
 };
@@ -61,7 +65,10 @@ pub use loaders::{
     VisionLoaderType, VisionModel, VisionModelLoader,
 };
 use mistralrs_quant::IsqType;
-pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
+pub use safetensors::{SafetensorsLoader, SafetensorsLoaderBuilder, SafetensorsConfig};
+// Backwards compatibility aliases (deprecated)
+#[allow(deprecated)]
+pub use safetensors::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths};
 pub use paths::{AdapterPaths, LoraAdapterPaths};
 pub(crate) use processing::{
@@ -752,23 +759,35 @@ pub trait Pipeline:
     ) -> Result<(), candle_core::Error> {
         match result {
             ForwardInputsResult::RawLogits { logits } => {
-                let raw_logits: Vec<Vec<Tensor>> = seq_indices
-                    .into_iter()
-                    .map(|idx| vec![logits.i(idx).unwrap().to_device(&Device::Cpu).unwrap()])
-                    .collect();
-                // PP sequences need to stay alive for subsequent activations.
-                // Only mark as done if no sequence has return_raw_logits set.
-                let mark_done = !input_seqs.iter().any(|seq| seq.return_raw_logits);
-                response::send_raw_responses(input_seqs, raw_logits, mark_done).await?;
+                // Pipeline decides based on sequence properties, not result variant.
+                // PP TAIL sequences have return_raw_logits=true → send raw to HEAD.
+                // Normal sequences have return_raw_logits=false → sample locally.
+                let any_raw = input_seqs.iter().any(|seq| seq.return_raw_logits);
 
-                // For PP decode steps, increment token_offset after forward completes.
-                // This is analogous to how add_token() increments seq.len() for HEAD stages.
-                for seq in input_seqs.iter_mut() {
-                    if seq.return_raw_logits
-                        && matches!(seq.getstate(), crate::sequence::SequenceState::RunningCompletion)
-                    {
-                        seq.increment_token_offset();
+                if any_raw {
+                    // PP path: send raw logits
+                    let raw_logits: Vec<Vec<Tensor>> = seq_indices
+                        .into_iter()
+                        .map(|idx| vec![logits.i(idx).unwrap().to_device(&Device::Cpu).unwrap()])
+                        .collect();
+                    let mark_done = !any_raw;
+                    response::send_raw_responses(input_seqs, raw_logits, mark_done).await?;
+
+                    // For PP decode steps, increment token_offset after forward completes.
+                    for seq in input_seqs.iter_mut() {
+                        if seq.return_raw_logits
+                            && matches!(seq.getstate(), crate::sequence::SequenceState::RunningCompletion)
+                        {
+                            seq.increment_token_offset();
+                        }
                     }
+                } else {
+                    // Normal path: sample locally
+                    let logits_list: Vec<Tensor> = seq_indices
+                        .into_iter()
+                        .map(|idx| logits.i(idx).unwrap())
+                        .collect();
+                    self.sample_causal_gen(input_seqs, logits_list, prefix_cacher, disable_eos_stop, rng).await?;
                 }
             }
             ForwardInputsResult::Embeddings { embeddings } => {
