@@ -23,9 +23,10 @@ use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{CausalMasker, MatMul, QRmsNorm, Sdpa};
 use crate::layers_masker::PastKvLenCache;
+use crate::models::{Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
-use crate::pipeline::{extract_logits, EitherCache, HookContainer, KvCache, NormalCache};
+use crate::pipeline::KvCache;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -394,19 +395,14 @@ impl LayerWeights {
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
-    norm: QRmsNorm,
-    output: Arc<dyn QuantMethod>,
+    /// Final norm layer (None for non-last pipeline stages)
+    norm: Option<QRmsNorm>,
+    /// Output/LM head layer (None for non-last pipeline stages)
+    output: Option<Arc<dyn QuantMethod>>,
     pub device: Device,
-    pub cache: EitherCache,
     pub max_seq_len: usize,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
-    /// Starting layer index for pipeline parallelism
-    layer_start: usize,
-    /// Total layers in the full model (for hooks)
-    total_layers: usize,
-    /// Pipeline hook for distributed inference
-    hook: Option<HookContainer>,
 }
 
 /// Mistral3 GGUF properties
@@ -540,11 +536,22 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
-        let output = if !ct.has_tensor("output.weight") {
-            ct.tensor("token_embd.weight", device)?
+
+        // PP: Only load norm and output (LM head) for last stage
+        let is_last_stage = layer_end >= total_layers;
+        let norm = if is_last_stage {
+            Some(QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
         } else {
-            ct.tensor("output.weight", device)?
+            None
+        };
+        let output = if is_last_stage {
+            Some(if !ct.has_tensor("output.weight") {
+                ct.tensor("token_embd.weight", device)?
+            } else {
+                ct.tensor("output.weight", device)?
+            })
+        } else {
+            None
         };
 
         let mut layers = Vec::with_capacity(num_loaded_layers);
@@ -694,108 +701,129 @@ impl ModelConfig::FromGGUF for ModelWeights {
             });
         }
 
-        let cache = EitherCache::Normal(NormalCache::new(num_loaded_layers, max_seq_len));
-
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
             norm,
-            output: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                q_weight: Arc::new(output),
-                b: None,
-            })?),
+            output: output.map(|q_tensor| {
+                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                    q_weight: Arc::new(q_tensor),
+                    b: None,
+                }).unwrap()) as Arc<dyn QuantMethod>
+            }),
             device: device.clone(),
-            cache,
             max_seq_len,
             mapper: Some(mapper),
             dtype,
-            layer_start,
-            total_layers,
-            hook: None,
         })
     }
 }
 
 impl ModelWeights {
-    /// Check if this is the first pipeline stage (has embedding layer).
-    pub fn is_first_stage(&self) -> bool {
-        self.layer_start == 0
-    }
-
-    /// Check if this is the last pipeline stage (has lm_head).
-    pub fn is_last_stage(&self) -> bool {
-        self.layer_start + self.layers.len() >= self.total_layers
-    }
-
-    /// Set a pipeline hook for distributed inference.
-    pub fn set_hook(&mut self, hook: HookContainer) {
-        self.hook = Some(hook);
-    }
-
-    /// Get the current pipeline hook.
-    pub fn get_hook(&self) -> Option<&HookContainer> {
-        self.hook.as_ref()
-    }
-
-    pub fn forward(
+    /// Run transformer layers on hidden states.
+    ///
+    /// This is the core layer iteration logic used by `transform()`.
+    fn run_layers(
         &self,
-        x: &Tensor,
-        start_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        mut hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        metadata: Option<(&[(Tensor, Tensor)], &PagedAttentionInputMetadata)>,
+        cache: &mut [KvCache],
     ) -> Result<Tensor> {
-        let mut layer_in = self.tok_embeddings.forward(x)?;
-        let cache = &mut self.cache.normal().0;
-
-        let mask = CausalMasker.make_causal_mask_matrix(
-            x,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            self.dtype,
-            self.layers[0].n_head,
-        )?;
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
-                layer_in = mapper.map(layer_in, i)?;
+                hidden = mapper.map(hidden, i)?;
             }
-
-            let x = layer.attention_norm.forward(&layer_in)?;
+            let residual = &hidden;
+            let x = layer.attention_norm.forward(&hidden)?;
             let attn = layer.forward_attn(
                 &x,
-                mask.as_ref()
-                    .map(|m| m.to_device(x.device()).unwrap())
+                mask.map(|m| m.to_device(x.device()).unwrap())
                     .as_ref(),
-                start_offsets,
+                position_offsets,
                 &mut cache[i],
-                metadata.as_ref().map(|(kv_cache, metadata)| {
-                    (kv_cache[i].clone(), *metadata)
-                }),
+                metadata
+                    .as_ref()
+                    .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta)),
             )?;
-            let x = (attn + layer_in)?;
-
-            // FFN
+            let x = (attn + residual)?;
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
-
-            layer_in = (x + residual)?;
+            hidden = (x + residual)?;
         }
 
-        let layer_in = layer_in.to_device(&self.device)?;
-        let x = self.norm.forward(&layer_in)?;
-        let logits = MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?;
+        Ok(hidden)
+    }
+}
 
-        extract_logits(&logits, context_lens)
+// ============================================================================
+// Model Trait Implementations
+// ============================================================================
+
+impl Model for ModelWeights {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TransformerModel for ModelWeights {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(tokens)
+    }
+
+    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+        let seq_len = hidden.dim(1)?;
+        let start_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute causal mask using position offsets
+        let mask = CausalMasker.make_causal_mask_as(
+            seq_len,
+            hidden.device(),
+            &start_offsets.as_slice() as &dyn PastKvLenCache,
+            self.dtype,
+        )?;
+        // Only apply mask on first prompt chunk (optimization for paged attention)
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Run transformer layers
+        let meta_ref = ctx
+            .paged_attn
+            .as_ref()
+            .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
+        self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
+    }
+
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        // Move to model device and apply final norm
+        let hidden = hidden.to_device(&self.device)?;
+        let x = self
+            .norm
+            .as_ref()
+            .expect("lm_head called on non-last pipeline stage")
+            .forward(&hidden)?;
+        // Project to vocabulary
+        MatMul.qmethod_matmul(
+            &x.contiguous()?,
+            &**self
+                .output
+                .as_ref()
+                .expect("lm_head called on non-last pipeline stage"),
+        )
     }
 }
 

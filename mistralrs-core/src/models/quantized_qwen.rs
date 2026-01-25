@@ -12,9 +12,10 @@ use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
+use crate::models::{Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
-use crate::pipeline::{extract_logits, EitherCache, HookContainer, KvCache, NormalCache};
+use crate::pipeline::KvCache;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -148,16 +149,9 @@ pub struct ModelWeights {
     norm: QRmsNorm,
     output: Arc<dyn QuantMethod>,
     pub device: Device,
-    pub cache: EitherCache,
     pub max_seq_len: usize,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
-    /// Starting layer index for pipeline parallelism
-    layer_start: usize,
-    /// Total layers in the full model (for hooks)
-    total_layers: usize,
-    /// Pipeline hook for distributed inference
-    hook: Option<HookContainer>,
 }
 
 // qwen2 `llm` fields:
@@ -445,91 +439,41 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 b: None,
             })?),
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(num_loaded_layers, max_seq_len)),
             max_seq_len,
             mapper: Some(mapper),
             dtype,
-            layer_start,
-            total_layers,
-            hook: None,
         })
     }
 }
 
 impl ModelWeights {
-    /// Check if this is the first pipeline stage (has embedding layer).
-    pub fn is_first_stage(&self) -> bool {
-        self.layer_start == 0
-    }
-
-    /// Check if this is the last pipeline stage (has lm_head).
-    pub fn is_last_stage(&self) -> bool {
-        self.layer_start + self.layers.len() >= self.total_layers
-    }
-
-    /// Set the pipeline hook for distributed inference.
-    pub fn set_hook(&mut self, hook: HookContainer) {
-        self.hook = Some(hook);
-    }
-
-    /// Get a reference to the pipeline hook.
-    pub fn get_hook(&self) -> Option<&HookContainer> {
-        self.hook.as_ref()
-    }
-
-    pub fn forward(
+    /// Run transformer layers on hidden states.
+    ///
+    /// This is the core layer iteration logic used by `transform()`.
+    fn run_layers(
         &self,
-        x: &Tensor,
-        start_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        mut hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        metadata: Option<(&[(Tensor, Tensor)], &PagedAttentionInputMetadata)>,
+        cache: &mut [KvCache],
     ) -> Result<Tensor> {
-        // For pipeline parallelism: non-first stages don't use tok_embeddings.
-        // Instead, the hook will inject the activation at the first local layer.
-        // Create a placeholder that will be replaced by the hook.
-        let mut layer_in = if self.is_first_stage() {
-            self.tok_embeddings.forward(x)?
-        } else {
-            // Placeholder tensor - will be replaced by hook at first local layer.
-            // Use F32 to match dequantized embedding output dtype (dequantize returns F32).
-            let (batch, seq_len) = x.dims2()?;
-            let embed_dim = self.tok_embeddings.embeddings().dim(1)?;
-            Tensor::zeros((batch, seq_len, embed_dim), DType::F32, &self.device)?
-        };
-        let cache = &mut self.cache.normal().0;
-        let mask = CausalMasker.make_causal_mask_matrix(
-            x,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            self.dtype,
-            self.layers[0].n_head,
-        )?;
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ref mapper) = self.mapper {
-                layer_in = mapper.map(layer_in, i)?;
+                hidden = mapper.map(hidden, i)?;
             }
 
-            let x = layer_in;
-            let residual = &x;
-            let x = layer.attention_norm.forward(&x)?;
+            let residual = &hidden;
+            let x = layer.attention_norm.forward(&hidden)?;
             let attn = layer.forward_attn(
                 &x,
-                mask.as_ref()
-                    .map(|m| m.to_device(x.device()).unwrap())
+                mask.map(|m| m.to_device(x.device()).unwrap())
                     .as_ref(),
-                start_offsets,
+                position_offsets,
                 &mut cache[i],
                 metadata
                     .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                    .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta)),
             )?;
             let x = (attn + residual)?;
 
@@ -537,15 +481,10 @@ impl ModelWeights {
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp.forward(&x)?;
-            layer_in = (x + residual)?;
+            hidden = (x + residual)?;
         }
 
-        // Last stage (or no PP): run final norm and lm_head
-        let x = self.norm.forward(&layer_in)?;
-        extract_logits(
-            &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,
-            context_lens,
-        )
+        Ok(hidden)
     }
 
     /// Forward pass for embeddings - returns hidden states before LM head.
@@ -554,35 +493,72 @@ impl ModelWeights {
         &self,
         x: &Tensor,
         start_offsets: &[usize],
+        cache: &mut [KvCache],
     ) -> Result<Tensor> {
-        let mut layer_in = self.tok_embeddings.forward(x)?;
-        let cache = &mut self.cache.normal().0;
-        // For embeddings, we use bidirectional attention (no causal mask)
-        // by passing None for the mask
-        for (i, layer) in self.layers.iter().enumerate() {
-            if let Some(ref mapper) = self.mapper {
-                layer_in = mapper.map(layer_in, i)?;
-            }
-            let x = layer_in;
-            let residual = &x;
-            let x = layer.attention_norm.forward(&x)?;
-            let attn = layer.forward_attn(
-                &x,
-                None, // No causal mask for bidirectional embedding
-                start_offsets,
-                &mut cache[i],
-                None, // No paged attention for embeddings
-            )?;
-            let x = (attn + residual)?;
+        let embeds = self.embed(x)?;
+        let ctx = TransformContext {
+            seq_len: embeds.dim(1)?,
+            position_offset: start_offsets.first().copied().unwrap_or(0),
+            paged_attn: None,
+        };
+        let hidden = self.transform(embeds, &ctx, cache)?;
+        // Return hidden states after final norm (before output projection)
+        self.norm.forward(&hidden)
+    }
+}
 
-            // MLP
-            let residual = &x;
-            let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.mlp.forward(&x)?;
-            let x = (x + residual)?;
-            layer_in = x;
-        }
-        // Return hidden states after final norm (before LM head)
-        self.norm.forward(&layer_in)
+// ============================================================================
+// Model Trait Implementations
+// ============================================================================
+
+impl Model for ModelWeights {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TransformerModel for ModelWeights {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(tokens)
+    }
+
+    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+        let seq_len = hidden.dim(1)?;
+        let start_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute causal mask using position offsets
+        let mask = CausalMasker.make_causal_mask_as(
+            seq_len,
+            hidden.device(),
+            &start_offsets.as_slice() as &dyn PastKvLenCache,
+            self.dtype,
+        )?;
+        // Only apply mask on first prompt chunk (optimization for paged attention)
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Run transformer layers
+        let meta_ref = ctx
+            .paged_attn
+            .as_ref()
+            .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
+        self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
+    }
+
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        let x = self.norm.forward(&hidden)?;
+        MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)
     }
 }

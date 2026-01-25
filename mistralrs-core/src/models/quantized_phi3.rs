@@ -6,11 +6,11 @@ use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{CausalMasker, MatMul, RmsNorm, Sdpa};
-use crate::models::{TransformContext, TransformerModel};
+use crate::models::{Model, TransformContext, TransformerModel};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
-use crate::pipeline::{EitherCache, HookContainer, KvCache, NormalCache};
+use crate::pipeline::KvCache;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
@@ -156,15 +156,15 @@ pub struct ModelWeights {
     output: QMatMul,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     pub device: Device,
-    pub cache: EitherCache,
     pub max_seq_len: usize,
     dtype: DType,
-    /// Starting layer index for pipeline parallelism
-    layer_start: usize,
-    /// Total layers in the full model (for hooks)
-    total_layers: usize,
-    /// Pipeline hook for distributed inference
-    hook: Option<HookContainer>,
+}
+
+impl ModelWeights {
+    /// Number of transformer layers in this model.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
 }
 
 fn precomput_freqs_cis(
@@ -374,42 +374,14 @@ impl ModelConfig::FromGGUF for ModelWeights {
             output,
             mapper: Some(mapper),
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new_sliding(
-                num_loaded_layers,
-                context_window,
-                Some(context_window),
-            )),
             max_seq_len: context_window,
             dtype,
-            layer_start,
-            total_layers,
-            hook: None,
         })
     }
 }
 
 impl ModelWeights {
-    /// Check if this is the first pipeline stage (has embedding layer).
-    pub fn is_first_stage(&self) -> bool {
-        self.layer_start == 0
-    }
-
-    /// Check if this is the last pipeline stage (has lm_head).
-    pub fn is_last_stage(&self) -> bool {
-        self.layer_start + self.layers.len() >= self.total_layers
-    }
-
-    /// Set the pipeline hook for distributed inference.
-    pub fn set_hook(&mut self, hook: HookContainer) {
-        self.hook = Some(hook);
-    }
-
-    /// Get a reference to the pipeline hook.
-    pub fn get_hook(&self) -> Option<&HookContainer> {
-        self.hook.as_ref()
-    }
-
-    /// Get input embeddings from token IDs (first stage only).
+    /// Get input embeddings from token IDs.
     /// Consumes: token IDs [batch, seq_len]
     /// Produces: embeddings [batch, seq_len, hidden_dim]
     pub fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
@@ -427,14 +399,17 @@ impl ModelWeights {
         seqlen_offsets: &[usize],
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         _request_id: uuid::Uuid,
+        cache: &mut [KvCache],
     ) -> Result<Tensor> {
-        let cache = &mut self.cache.normal().0;
+        // PastKvLenCache trait object - use reference to slice
+        let past_kv_len_cache: &dyn PastKvLenCache = if metadata.is_some() {
+            &seqlen_offsets
+        } else {
+            &cache
+        };
         let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
             input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
+            past_kv_len_cache,
             Some(self.max_seq_len),
             self.dtype,
             self.layers[0].n_head,
@@ -483,15 +458,16 @@ impl ModelWeights {
         MatMul.qmatmul(&xs, &self.output)
     }
 
-    /// Monolithic forward pass (consumes tokens, produces logits).
+    /// Forward pass (consumes tokens, produces logits).
     ///
     /// # Parameters
     /// * `input_ids` - Token IDs tensor
-    /// * `input_activation` - Activation from previous pipeline stage (None for first stage)
+    /// * `input_activation` - Activation tensor (if provided, skip embedding)
     /// * `input_ids_full` - Full input IDs for context
     /// * `seqlen_offsets` - Sequence position offsets for RoPE
     /// * `metadata` - PagedAttention metadata if enabled
     /// * `request_id` - UUID for distributed tracing
+    /// * `cache` - KV cache for attention layers
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -500,6 +476,7 @@ impl ModelWeights {
         seqlen_offsets: &[usize],
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         request_id: uuid::Uuid,
+        cache: &mut [KvCache],
     ) -> Result<Tensor> {
         // Use provided activation or compute embeddings
         let xs = match input_activation {
@@ -515,41 +492,52 @@ impl ModelWeights {
             seqlen_offsets,
             metadata,
             request_id,
+            cache,
         )?;
 
-        // Only apply lm_head on last stage (has output layer)
-        // Non-last stages return hidden states for pipeline parallelism
-        if self.is_last_stage() {
-            self.apply_lm_head(xs)
-        } else {
-            Ok(xs)
-        }
+        self.apply_lm_head(xs)
     }
 }
 
 // ============================================================================
-// TransformerModel Implementation
+// Model Trait Implementations
 // ============================================================================
 
+impl Model for ModelWeights {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
 impl TransformerModel for ModelWeights {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
         self.tok_embeddings.forward(tokens)
     }
 
-    fn transform(&self, mut hidden: Tensor, ctx: &TransformContext) -> Result<Tensor> {
-        let cache = &mut self.cache.normal().0;
-
+    fn transform(&self, mut hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
         // Derive mask shape from hidden states: [batch, seq_len, hidden] → [batch, seq_len]
         let mask_shape = hidden.i((.., .., 0usize))?;
         let start_offsets: Vec<usize> = vec![ctx.position_offset];
         let start_offsets_slice = start_offsets.as_slice();
 
+        // Determine past KV len source: paged attention uses offsets, normal uses cache
+        let past_kv_len_cache: &dyn PastKvLenCache = if ctx.paged_attn.is_some() {
+            &start_offsets_slice
+        } else {
+            &cache
+        };
+
         let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
             &mask_shape,
-            ctx.paged_attn
-                .as_ref()
-                .map(|_| &start_offsets_slice as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
+            past_kv_len_cache,
             Some(self.max_seq_len),
             self.dtype,
             self.layers[0].n_head,
@@ -592,21 +580,5 @@ impl TransformerModel for ModelWeights {
 
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         self.apply_lm_head(hidden)
-    }
-
-    fn has_embed(&self) -> bool {
-        self.is_first_stage()
-    }
-
-    fn has_lm_head(&self) -> bool {
-        self.is_last_stage()
-    }
-
-    fn attention_impl(&self) -> AttentionImplementation {
-        if self.layers.first().map(|l| l.paged_attn.is_some()).unwrap_or(false) {
-            AttentionImplementation::PagedAttention
-        } else {
-            AttentionImplementation::Eager
-        }
     }
 }

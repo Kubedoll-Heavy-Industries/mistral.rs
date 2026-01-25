@@ -12,35 +12,20 @@ use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{
+    reshape_attn_output, reshape_for_attn, sdpa_with_cache, Activation, CausalMasker, MatMul, Mlp,
+    QRmsNorm, RotaryEmbedding,
+};
 use crate::layers_masker::PastKvLenCache;
+use crate::models::{Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
-use crate::pipeline::extract_logits;
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
-use crate::pipeline::EitherCache;
-use crate::pipeline::HookContainer;
 use crate::pipeline::KvCache;
-use crate::pipeline::NormalCache;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 // Default fallback for models that don't specify context_length
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
-
-struct Mlp {
-    feed_forward_w1: Arc<dyn QuantMethod>,
-    feed_forward_w2: Arc<dyn QuantMethod>,
-    feed_forward_w3: Arc<dyn QuantMethod>,
-}
-
-impl Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let w1 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w1)?;
-        let w3 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w3)?;
-        let y = crate::ops::mul_and_act(&w1, &w3, crate::layers::Activation::Silu)?;
-        MatMul.qmethod_matmul(&y, &*self.feed_forward_w2)
-    }
-}
 
 enum MlpOrMoe {
     Mlp(Mlp),
@@ -149,6 +134,7 @@ impl LayerWeights {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
+        // QKV projections with dtype conversion
         let q = MatMul
             .qmethod_matmul(x, &*self.attention_wq)?
             .to_dtype(self.dtype)?;
@@ -159,56 +145,29 @@ impl LayerWeights {
             .qmethod_matmul(x, &*self.attention_wv)?
             .to_dtype(self.dtype)?;
 
-        let (q, k, v) = if seq_len != 1 {
-            let q = q
-                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v)
-        } else {
-            let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            (q, k, v)
-        };
+        // Reshape for multi-head attention
+        let q = reshape_for_attn(q, b_sz, seq_len, self.n_head, self.head_dim)?;
+        let k = reshape_for_attn(k, b_sz, seq_len, self.n_kv_head, self.head_dim)?;
+        let v = reshape_for_attn(v, b_sz, seq_len, self.n_kv_head, self.head_dim)?;
 
+        // RoPE
         let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
 
-        let y = match &self.paged_attn {
-            Some(paged_attn) => {
-                let ((key_cache, value_cache), input_metadata) = metadata.unwrap();
-                paged_attn.forward(
-                    &q,
-                    &k,
-                    &v,
-                    mask,
-                    Some(key_cache),
-                    Some(value_cache),
-                    input_metadata,
-                    &self.sdpa_params,
-                    None,
-                )?
-            }
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
+        // SDPA with cache
+        let y = sdpa_with_cache(
+            &q,
+            &k,
+            &v,
+            mask,
+            kv_cache,
+            self.paged_attn.as_ref(),
+            metadata,
+            &self.sdpa_params,
+        )?;
 
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
-            }
-        };
-
-        let y = if mask.is_some() {
-            y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
-        } else {
-            y.reshape((b_sz, seq_len, ()))?
-        };
-
-        let y = MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)?;
-        Ok(y)
+        // Reshape output and project
+        let y = reshape_attn_output(y, b_sz, seq_len, mask.is_some())?;
+        MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)
     }
 }
 
@@ -220,16 +179,9 @@ pub struct ModelWeights {
     /// Output/LM head layer (None for non-last pipeline stages)
     output: Option<Arc<dyn QuantMethod>>,
     pub device: Device,
-    pub cache: EitherCache,
     pub max_seq_len: usize,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
-    /// Starting layer index for pipeline parallelism
-    layer_start: usize,
-    /// Total layers in the full model (for hooks)
-    total_layers: usize,
-    /// Pipeline hook for distributed inference
-    hook: Option<HookContainer>,
 }
 
 impl ModelConfig::FromGGML for ModelWeights {
@@ -262,20 +214,21 @@ impl ModelConfig::FromGGML for ModelWeights {
                 let feed_forward_w1 = ct.remove(&format!("{prefix}.feed_forward.w1.weight"))?;
                 let feed_forward_w2 = ct.remove(&format!("{prefix}.feed_forward.w2.weight"))?;
                 let feed_forward_w3 = ct.remove(&format!("{prefix}.feed_forward.w3.weight"))?;
-                MlpOrMoe::Mlp(Mlp {
-                    feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w1),
+                MlpOrMoe::Mlp(Mlp::from_weights(
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(feed_forward_w1), // gate
                         b: None,
                     })?),
-                    feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w2),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(feed_forward_w3), // up
                         b: None,
                     })?),
-                    feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w3),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(feed_forward_w2), // down
                         b: None,
                     })?),
-                })
+                    Activation::Silu,
+                ))
             };
             let attention_norm = ct.remove(&format!("{prefix}.attention_norm.weight"))?;
             let ffn_norm = ct.remove(&format!("{prefix}.ffn_norm.weight"))?;
@@ -314,7 +267,6 @@ impl ModelConfig::FromGGML for ModelWeights {
                 dtype,
             })
         }
-        let total_layers = ct.hparams.n_layer as usize;
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, ct.hparams.n_embd as usize),
             layers,
@@ -324,16 +276,9 @@ impl ModelConfig::FromGGML for ModelWeights {
                 b: None,
             })?)),
             device: ct.device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(
-                total_layers,
-                DEFAULT_MAX_SEQ_LEN as usize,
-            )),
             max_seq_len: DEFAULT_MAX_SEQ_LEN as usize, // Cannot determine from ggml.
             mapper: None,
             dtype,
-            layer_start: 0, // GGML format doesn't support partial loading
-            total_layers: ct.hparams.n_layer as usize,
-            hook: None,
         })
     }
 }
@@ -517,23 +462,24 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), device)?;
             let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), device)?;
             let mlp_or_moe = if n_expert <= 1 {
-                let feed_forward_w1 = ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
-                let feed_forward_w2 = ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
-                let feed_forward_w3 = ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
-                MlpOrMoe::Mlp(Mlp {
-                    feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w1),
+                let ffn_gate = ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
+                let ffn_down = ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?;
+                let ffn_up = ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?;
+                MlpOrMoe::Mlp(Mlp::from_weights(
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ffn_gate),
                         b: None,
                     })?),
-                    feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w2),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ffn_up),
                         b: None,
                     })?),
-                    feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w3),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(ffn_down),
                         b: None,
                     })?),
-                })
+                    Activation::Silu,
+                ))
             } else {
                 let feed_forward_gate_inp =
                     ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
@@ -563,60 +509,50 @@ impl ModelConfig::FromGGUF for ModelWeights {
                         let down_type = feed_forward_down_exps.dtype();
                         let up_type = feed_forward_up_exps.dtype();
 
-                        for (ff_w1, (ff_w2, ff_w3)) in dequant_ffn_gate
+                        for (ff_gate, (ff_down, ff_up)) in dequant_ffn_gate
                             .into_iter()
                             .zip(dequant_ffn_down.into_iter().zip(dequant_ffn_up))
                         {
-                            experts.push(Mlp {
-                                feed_forward_w1: Arc::new(GgufMatMul::new(
-                                    QuantMethodConfig::Gguf {
-                                        q_weight: Arc::new(QTensor::quantize(&ff_w1, gate_type)?),
-                                        b: None,
-                                    },
-                                )?),
-                                feed_forward_w2: Arc::new(GgufMatMul::new(
-                                    QuantMethodConfig::Gguf {
-                                        q_weight: Arc::new(QTensor::quantize(&ff_w2, down_type)?),
-                                        b: None,
-                                    },
-                                )?),
-                                feed_forward_w3: Arc::new(GgufMatMul::new(
-                                    QuantMethodConfig::Gguf {
-                                        q_weight: Arc::new(QTensor::quantize(&ff_w3, up_type)?),
-                                        b: None,
-                                    },
-                                )?),
-                            })
+                            experts.push(Mlp::from_weights(
+                                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                                    q_weight: Arc::new(QTensor::quantize(&ff_gate, gate_type)?),
+                                    b: None,
+                                })?),
+                                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                                    q_weight: Arc::new(QTensor::quantize(&ff_up, up_type)?),
+                                    b: None,
+                                })?),
+                                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                                    q_weight: Arc::new(QTensor::quantize(&ff_down, down_type)?),
+                                    b: None,
+                                })?),
+                                Activation::Silu,
+                            ))
                         }
                     }
                     Err(_) => {
                         for i in 0..n_expert {
-                            let feed_forward_w1 =
+                            let ffn_gate =
                                 ct.tensor(&format!("{prefix}.ffn_gate.{i}.weight"), device)?;
-                            let feed_forward_w2 =
+                            let ffn_down =
                                 ct.tensor(&format!("{prefix}.ffn_down.{i}.weight"), device)?;
-                            let feed_forward_w3 =
+                            let ffn_up =
                                 ct.tensor(&format!("{prefix}.ffn_up.{i}.weight"), device)?;
-                            experts.push(Mlp {
-                                feed_forward_w1: Arc::new(GgufMatMul::new(
-                                    QuantMethodConfig::Gguf {
-                                        q_weight: Arc::new(feed_forward_w1),
-                                        b: None,
-                                    },
-                                )?),
-                                feed_forward_w2: Arc::new(GgufMatMul::new(
-                                    QuantMethodConfig::Gguf {
-                                        q_weight: Arc::new(feed_forward_w2),
-                                        b: None,
-                                    },
-                                )?),
-                                feed_forward_w3: Arc::new(GgufMatMul::new(
-                                    QuantMethodConfig::Gguf {
-                                        q_weight: Arc::new(feed_forward_w3),
-                                        b: None,
-                                    },
-                                )?),
-                            })
+                            experts.push(Mlp::from_weights(
+                                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                                    q_weight: Arc::new(ffn_gate),
+                                    b: None,
+                                })?),
+                                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                                    q_weight: Arc::new(ffn_up),
+                                    b: None,
+                                })?),
+                                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                                    q_weight: Arc::new(ffn_down),
+                                    b: None,
+                                })?),
+                                Activation::Silu,
+                            ))
                         }
                     }
                 }
@@ -682,178 +618,117 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 }).unwrap()) as Arc<dyn QuantMethod>
             }),
             device: device.clone(),
-            cache: EitherCache::Normal(NormalCache::new(num_loaded_layers, max_seq_len)),
             max_seq_len,
             mapper: Some(mapper),
             dtype,
-            layer_start,
-            total_layers,
-            hook: None,
         })
     }
 }
 
 impl ModelWeights {
-    /// Check if this is the first pipeline stage (has embedding layer).
-    pub fn is_first_stage(&self) -> bool {
-        self.layer_start == 0
-    }
-
-    /// Check if this is the last pipeline stage (has lm_head).
-    pub fn is_last_stage(&self) -> bool {
-        self.layer_start + self.layers.len() >= self.total_layers
-    }
-
-    /// Set a pipeline hook for distributed inference.
-    pub fn set_hook(&mut self, hook: HookContainer) {
-        self.hook = Some(hook);
-    }
-
-    /// Get the current pipeline hook.
-    pub fn get_hook(&self) -> Option<&HookContainer> {
-        self.hook.as_ref()
-    }
-
-    pub fn forward(
+    /// Run transformer layers on hidden states.
+    ///
+    /// This is the core layer iteration logic used by `transform()`.
+    fn run_layers(
         &self,
-        x: &Tensor,
-        start_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        mut hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        metadata: Option<(&[(Tensor, Tensor)], &PagedAttentionInputMetadata)>,
+        cache: &mut [KvCache],
     ) -> Result<Tensor> {
-        // PP: Get embedding for first stage, or placeholder for non-first stages
-        let activation = crate::pp_get_layer_input!(self, x, DType::F32);
-
-        // Prepare context for layer execution
-        let cache = &mut self.cache.normal().0;
-        let mask = CausalMasker.make_causal_mask_matrix(
-            x,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            self.dtype,
-            self.layers[0].n_head,
-        )?;
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-
-        // Build layer context
-        let context = LlamaLayerContext {
-            mask: &mask,
-            start_offsets,
-            cache,
-            metadata,
-        };
-
-        // TODO: Migrate to new pipeline-level hook pattern
-        // Execute layers (simple loop - hooks at pipeline level now)
-        let mut layer_out = activation;
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ref mapper) = self.mapper {
-                layer_out = mapper.map(layer_out, i)?;
+                hidden = mapper.map(hidden, i)?;
             }
-            let residual = &layer_out;
-            let x = layer.attention_norm.forward(&layer_out)?;
+            let residual = &hidden;
+            let x = layer.attention_norm.forward(&hidden)?;
             let attn = layer.forward_attn(
                 &x,
-                context
-                    .mask
-                    .as_ref()
-                    .map(|m| m.to_device(x.device()).unwrap())
+                mask.map(|m| m.to_device(x.device()).unwrap())
                     .as_ref(),
-                context.start_offsets,
-                &mut context.cache[i],
-                context
-                    .metadata
+                position_offsets,
+                &mut cache[i],
+                metadata
                     .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                    .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta)),
             )?;
             let x = (attn + residual)?;
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
             let x = layer.mlp_or_moe.forward(&x)?;
-            layer_out = (x + residual)?;
+            hidden = (x + residual)?;
         }
 
-        // PP: Return activations for non-last stages, logits for last stage
-        if self.is_last_stage() {
-            let layer_out = layer_out.to_device(&self.device)?;
-            let x = self.norm.as_ref().unwrap().forward(&layer_out)?;
-            extract_logits(
-                &MatMul.qmethod_matmul(&x.contiguous()?, &**self.output.as_ref().unwrap())?,
-                context_lens,
-            )
-        } else {
-            Ok(layer_out)
-        }
+        Ok(hidden)
     }
 }
 
-/// Context required for LLaMA layer execution.
-///
-/// This struct contains all model-specific state needed to execute
-/// a single transformer layer.
-pub struct LlamaLayerContext<'a> {
-    pub mask: &'a Option<Tensor>,
-    pub start_offsets: &'a [usize],
-    pub cache: &'a mut Vec<KvCache>,  // Fixed: use correct KvCache type
-    pub metadata: Option<(Vec<(Tensor, Tensor)>, &'a PagedAttentionInputMetadata)>,
+// ============================================================================
+// Model Trait Implementations
+// ============================================================================
+
+impl Model for ModelWeights {
+    fn device(&self) -> &Device {
+        &self.device
+    }
 }
 
-// TODO: Migrate to new Layered trait pattern (see models/llama.rs for reference)
-// use crate::pipeline::LayerExecutor;
-//
-// impl LayerExecutor for ModelLlama {
-//     type Context = LlamaLayerContext<'_>;
-//
-//     fn forward_layer(
-//         &self,
-//         layer_idx: usize,
-//         mut activation: Tensor,
-//         context: &mut Self::Context,
-//     ) -> Result<Tensor> {
-//         // Device mapping (use local index for loaded layers only)
-//         if let Some(ref mapper) = self.mapper {
-//             activation = mapper.map(activation, layer_idx)?;
-//         }
-//
-//         // Transformer layer computation
-//         let layer = &self.layers[layer_idx];
-//         let residual = &activation;
-//         let x = layer.attention_norm.forward(&activation)?;
-//         let attn = layer.forward_attn(
-//             &x,
-//             context
-//                 .mask
-//                 .as_ref()
-//                 .map(|m| m.to_device(x.device()).unwrap())
-//                 .as_ref(),
-//             context.start_offsets,
-//             &mut context.cache[layer_idx],
-//             context
-//                 .metadata
-//                 .as_ref()
-//                 .map(|(kv_cache, metadata)| (kv_cache[layer_idx].clone(), *metadata)),
-//         )?;
-//         let x = (attn + residual)?;
-//
-//         // MLP
-//         let residual = &x;
-//         let x = layer.ffn_norm.forward(&x)?;
-//         let x = layer.mlp_or_moe.forward(&x)?;
-//         Ok((x + residual)?)
-//     }
-//
-//     fn num_layers(&self) -> usize {
-//         self.layers.len()
-//     }
-//
-//     fn layer_start(&self) -> usize {
-//         self.layer_start
-//     }
-// }
+impl TransformerModel for ModelWeights {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(tokens)
+    }
+
+    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+        let seq_len = hidden.dim(1)?;
+        let start_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute causal mask using position offsets
+        let mask = CausalMasker.make_causal_mask_as(
+            seq_len,
+            hidden.device(),
+            &start_offsets.as_slice() as &dyn PastKvLenCache,
+            self.dtype,
+        )?;
+        // Only apply mask on first prompt chunk (optimization for paged attention)
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Run transformer layers
+        let meta_ref = ctx
+            .paged_attn
+            .as_ref()
+            .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
+        self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
+    }
+
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        // Move to model device and apply final norm
+        let hidden = hidden.to_device(&self.device)?;
+        let x = self
+            .norm
+            .as_ref()
+            .expect("lm_head called on non-last pipeline stage")
+            .forward(&hidden)?;
+        // Project to vocabulary
+        MatMul.qmethod_matmul(
+            &x.contiguous()?,
+            &**self
+                .output
+                .as_ref()
+                .expect("lm_head called on non-last pipeline stage"),
+        )
+    }
+}

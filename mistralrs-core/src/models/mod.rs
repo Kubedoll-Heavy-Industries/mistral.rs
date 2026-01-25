@@ -25,10 +25,19 @@ pub(crate) mod qwen3_moe;
 pub(crate) mod smollm3;
 pub(crate) mod starcoder2;
 
-use candle_core::{Result, Tensor};
+use candle_core::{Device, Result, Tensor};
 
-use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
+use crate::pipeline::KvCache;
+
+/// Base trait for all models.
+///
+/// Every model has weights that live on a device. This is the fundamental
+/// property shared by all model types: transformers, diffusion, vision, embedding, etc.
+pub trait Model: Send + Sync {
+    /// The device where model weights reside.
+    fn device(&self) -> &Device;
+}
 
 /// Context for transformer forward pass.
 ///
@@ -58,13 +67,14 @@ pub struct PagedAttentionContext<'a> {
 
 /// Trait for transformer-based language models.
 ///
-/// Decomposes the forward pass into three stages that can be orchestrated independently:
-/// 1. `embed`: tokens → hidden states (first stage only)
-/// 2. `transform`: hidden → hidden (all stages)
-/// 3. `lm_head`: hidden → logits (last stage only)
+/// Extends `Model` with transformer-specific operations. Models define capabilities
+/// as pure functions over tensors. Pipelines decide what to call based on their
+/// stage configuration.
 ///
-/// This separation enables pipeline parallelism where different nodes run different stages.
-/// For single-node inference, call all three in sequence.
+/// # Capabilities
+/// - `embed`: tokens → hidden states
+/// - `transform`: hidden → hidden (through layers)
+/// - `lm_head`: hidden → logits
 ///
 /// # Example: Single-node inference
 /// ```ignore
@@ -73,26 +83,21 @@ pub struct PagedAttentionContext<'a> {
 /// let logits = model.lm_head(hidden)?;
 /// ```
 ///
-/// # Example: Pipeline parallelism (HEAD stage)
-/// ```ignore
-/// let hidden = model.embed(&tokens)?;
-/// let hidden = model.transform(hidden, &ctx)?;
-/// send_to_next_stage(hidden);
-/// ```
-///
-/// # Example: Pipeline parallelism (TAIL stage)
-/// ```ignore
-/// let hidden = receive_from_prev_stage();
-/// let hidden = model.transform(hidden, &ctx)?;
-/// let logits = model.lm_head(hidden)?;
-/// ```
-pub trait TransformerModel: Send + Sync {
+/// # Pipeline parallelism
+/// The pipeline (not the model) determines which methods to call based on its stage:
+/// - HEAD: `embed()` → `transform()` → send activation
+/// - TAIL: receive → `transform()` → `lm_head()`
+pub trait TransformerModel: Model {
+    /// Number of transformer layers in this model.
+    fn num_layers(&self) -> usize;
+
+    /// Maximum sequence length this model supports.
+    fn max_seq_len(&self) -> usize;
+
     /// Convert token IDs to embeddings.
     ///
     /// Input: token IDs [batch, seq_len]
     /// Output: embeddings [batch, seq_len, hidden_dim]
-    ///
-    /// Only called by first pipeline stage (the one with token embeddings).
     fn embed(&self, tokens: &Tensor) -> Result<Tensor>;
 
     /// Transform hidden states through transformer layers.
@@ -100,24 +105,13 @@ pub trait TransformerModel: Send + Sync {
     /// Input: hidden states [batch, seq_len, hidden_dim]
     /// Output: hidden states [batch, seq_len, hidden_dim]
     ///
-    /// Called by all pipeline stages. Each stage processes its assigned layers.
-    /// The context provides position information for RoPE and optional PagedAttention metadata.
-    fn transform(&self, hidden: Tensor, ctx: &TransformContext) -> Result<Tensor>;
+    /// The context provides position information for RoPE and optional paged attention metadata.
+    /// The cache is owned by the Pipeline and passed in - models are stateless.
+    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor>;
 
     /// Project hidden states to vocabulary logits.
     ///
     /// Input: hidden states [batch, seq_len, hidden_dim]
-    /// Output: logits [batch, vocab_size] (typically last position extracted)
-    ///
-    /// Only called by last pipeline stage (the one with lm_head weights).
+    /// Output: logits [batch, seq_len, vocab_size]
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor>;
-
-    /// Whether this model has embedding weights (first pipeline stage).
-    fn has_embed(&self) -> bool;
-
-    /// Whether this model has lm_head weights (last pipeline stage).
-    fn has_lm_head(&self) -> bool;
-
-    /// Attention implementation used by this model.
-    fn attention_impl(&self) -> AttentionImplementation;
 }
