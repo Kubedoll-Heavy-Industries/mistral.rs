@@ -19,6 +19,7 @@ use crate::{
         RmsNorm, Sdpa,
     },
     layers_masker::PastKvLenCache,
+    models::TransformContext,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -680,25 +681,65 @@ impl NormalModel for Llama {
         &self.cfg
     }
 
-    // === Building blocks for pipeline parallelism ===
+    // === TransformerModel methods for pipeline parallelism ===
 
-    fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.get_input_embeddings(input_ids)
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.get_input_embeddings(tokens)
     }
 
-    fn forward_layers(
-        &self,
-        input_ids: &Tensor,
-        x: Tensor,
-        seqlen_offsets: &[usize],
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        self.forward_layers(input_ids, x, seqlen_offsets, metadata, flash_params)
+    fn transform(&self, mut hidden: Tensor, ctx: &TransformContext) -> Result<Tensor> {
+        let cache = &mut self.kv_cache.normal().0;
+        let start_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute mask using position offsets
+        let mask = CausalMasker.make_causal_mask_as(
+            ctx.seq_len,
+            hidden.device(),
+            &start_offsets.as_slice() as &dyn PastKvLenCache,
+            hidden.dtype(),
+        )?;
+        // PagedAttention prompt chunking filter
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Build FlashParams for this transform (minimal for PP)
+        let flash_params = FlashParams {
+            max_q: ctx.seq_len as u32,
+            max_k: (ctx.position_offset + ctx.seq_len) as u32,
+            cumulative_seqlens_q: std::collections::HashMap::new(),
+            cumulative_seqlens_k: std::collections::HashMap::new(),
+            causal: true,
+        };
+
+        // Run through transformer blocks
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            hidden = self.mapper.map(hidden, block_idx)?;
+            hidden = block.forward(
+                &hidden,
+                &mask.clone().map(|m| m.to_device(hidden.device()).unwrap()),
+                &start_offsets,
+                &mut cache[block_idx],
+                ctx.paged_attn
+                    .as_ref()
+                    .map(|pa| (pa.kv_cache[block_idx].clone(), pa.metadata)),
+                &flash_params,
+            )?;
+        }
+
+        Ok(hidden)
     }
 
-    fn apply_lm_head(&self, x: Tensor, context_lens: Vec<(usize, usize)>) -> Result<Tensor> {
-        self.apply_lm_head(x, context_lens)
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        let x = hidden.to_device(&self.device)?;
+        let mut x = self.ln_f.forward(&x)?;
+        if let Some(t) = self.lm_head.quantized_act_type() {
+            x = x.to_dtype(t)?;
+        }
+        MatMul.qmethod_matmul(&x, &*self.lm_head)
     }
 }
 

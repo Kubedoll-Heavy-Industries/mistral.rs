@@ -1,10 +1,380 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use crate::{attention::backends::cpu, pipeline::text_models_inputs_processor::FlashParams};
+use std::sync::Arc;
+
+use crate::attention::backends::cpu;
+use crate::paged_attention::PagedAttention;
+use crate::pipeline::text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata};
+use crate::pipeline::KvCache;
 
 use candle_core::{DType, Device, Result, Tensor};
+use mistralrs_quant::QuantMethod;
 
 mod backends;
+
+// ============================================================================
+// Attention Configuration Types
+// ============================================================================
+
+/// Configuration for attention computation - captures architectural properties.
+///
+/// This struct captures all the variations across transformer attention implementations:
+/// - Head configuration (MHA/GQA/MQA)
+/// - Q/K normalization (Qwen3-specific)
+/// - Softmax modifications (softcapping for Gemma2)
+/// - Sliding window attention
+///
+/// Position encoding (RoPE) is handled separately since it requires mutable state
+/// and different models have different RoPE implementations.
+#[derive(Debug, Clone)]
+pub struct AttentionConfig {
+    /// Number of attention heads
+    pub n_heads: usize,
+    /// Number of key-value heads (for GQA; equals n_heads for MHA)
+    pub n_kv_heads: usize,
+    /// Dimension per attention head
+    pub head_dim: usize,
+    /// Sliding window size (None for full attention)
+    pub sliding_window: Option<usize>,
+    /// Softcap for attention logits (Gemma2-specific)
+    pub softcap: Option<f32>,
+    /// Custom softmax scale (defaults to 1/√head_dim if None)
+    pub softmax_scale: Option<f32>,
+}
+
+impl AttentionConfig {
+    /// Create a new attention configuration.
+    pub fn new(n_heads: usize, n_kv_heads: usize, head_dim: usize) -> Self {
+        Self {
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            sliding_window: None,
+            softcap: None,
+            softmax_scale: None,
+        }
+    }
+
+    /// Set sliding window size.
+    pub fn with_sliding_window(mut self, window: usize) -> Self {
+        self.sliding_window = Some(window);
+        self
+    }
+
+    /// Set softcap for attention logits (Gemma2).
+    pub fn with_softcap(mut self, cap: f32) -> Self {
+        self.softcap = Some(cap);
+        self
+    }
+
+    /// Set custom softmax scale.
+    pub fn with_softmax_scale(mut self, scale: f32) -> Self {
+        self.softmax_scale = Some(scale);
+        self
+    }
+
+    /// Number of KV groups (n_heads / n_kv_heads).
+    #[inline]
+    pub fn n_kv_groups(&self) -> usize {
+        self.n_heads / self.n_kv_heads
+    }
+
+    /// Effective softmax scale (custom or 1/√head_dim).
+    #[inline]
+    pub fn effective_softmax_scale(&self) -> f32 {
+        self.softmax_scale
+            .unwrap_or_else(|| 1.0 / (self.head_dim as f32).sqrt())
+    }
+
+    /// Convert to SdpaParams for the SDPA kernel.
+    pub fn to_sdpa_params(&self) -> SdpaParams {
+        SdpaParams {
+            n_kv_groups: self.n_kv_groups(),
+            softcap: self.softcap,
+            softmax_scale: self.effective_softmax_scale(),
+            sliding_window: self.sliding_window,
+        }
+    }
+}
+
+/// Q/K normalization configuration (Qwen3-specific).
+///
+/// Some models apply per-head RMSNorm to Q and K after projection
+/// but before RoPE. This is separate from attention config because
+/// it requires weight tensors.
+pub trait QkNorm: Send + Sync {
+    /// Apply normalization to Q tensor.
+    /// Input: [batch, n_heads, seq_len, head_dim] flattened to [batch * n_heads * seq_len, head_dim]
+    fn forward_q(&self, q: &Tensor) -> Result<Tensor>;
+    /// Apply normalization to K tensor.
+    fn forward_k(&self, k: &Tensor) -> Result<Tensor>;
+}
+
+/// Position encoding trait - abstracts over RoPE variants.
+///
+/// Different models use different position encoding schemes:
+/// - Standard RoPE (LLaMA, Mistral)
+/// - Partial RoPE (Phi2/3 - only applies to portion of head_dim)
+/// - YaRN extended context (Mistral3)
+pub trait PositionEncoding: Send + Sync {
+    /// Apply position encoding to Q and K tensors.
+    ///
+    /// # Arguments
+    /// * `q` - Query tensor [batch, n_heads, seq_len, head_dim]
+    /// * `k` - Key tensor [batch, n_kv_heads, seq_len, head_dim]
+    /// * `seqlen_offsets` - Position offset for each sequence in batch
+    ///
+    /// # Returns
+    /// (q_with_pos, k_with_pos) with same shapes as input
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)>;
+}
+
+/// Attention mechanism trait - abstracts over attention implementations.
+///
+/// This trait enables composable transformer blocks by allowing different
+/// attention implementations:
+/// - `CausalAttention` (generic, handles Q/K norm, RoPE, paged attention)
+/// - Model-specific inline attention (for custom optimizations)
+pub trait Attention: Send + Sync {
+    /// Forward pass through the attention layer.
+    ///
+    /// # Arguments
+    /// * `x` - Input hidden states after pre-attention norm [batch, seq_len, hidden_dim]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - KV cache (mutated for eager attention)
+    /// * `position_offsets` - Position offsets for RoPE
+    /// * `metadata` - Paged attention metadata (KV cache tensors + input metadata)
+    ///
+    /// # Returns
+    /// Output hidden states [batch, seq_len, hidden_dim]
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut KvCache,
+        position_offsets: &[usize],
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor>;
+
+    /// Check if this attention uses paged attention.
+    fn has_paged_attn(&self) -> bool;
+}
+
+// ============================================================================
+// Concrete QkNorm Implementations
+// ============================================================================
+
+/// Paired RMSNorm for Q and K tensors (Qwen3-style).
+///
+/// Qwen3 applies per-head RMSNorm to Q and K after projection but before RoPE.
+/// The input tensors should be flattened to [batch * n_heads * seq_len, head_dim].
+pub struct RmsNormQkNorm<N> {
+    q_norm: N,
+    k_norm: N,
+}
+
+impl<N> RmsNormQkNorm<N> {
+    pub fn new(q_norm: N, k_norm: N) -> Self {
+        Self { q_norm, k_norm }
+    }
+}
+
+/// Implement QkNorm for any norm type that implements Module (candle_nn::Module trait).
+impl<N: candle_nn::Module + Send + Sync> QkNorm for RmsNormQkNorm<N> {
+    fn forward_q(&self, q: &Tensor) -> Result<Tensor> {
+        self.q_norm.forward(q)
+    }
+
+    fn forward_k(&self, k: &Tensor) -> Result<Tensor> {
+        self.k_norm.forward(k)
+    }
+}
+
+// ============================================================================
+// Generic Causal Attention
+// ============================================================================
+
+/// Generic causal attention module that handles all architectural variations.
+///
+/// This struct consolidates the duplicated attention logic across 8+ model
+/// implementations into a single, configurable component.
+///
+/// # Architecture Support
+/// - MHA, GQA, MQA (via n_heads/n_kv_heads configuration)
+/// - Optional Q/K normalization (Qwen3)
+/// - Optional sliding window attention (Mistral, Phi3)
+/// - Optional softcapping (Gemma2)
+/// - Eager or paged KV cache
+/// - Optional dtype conversion for quantized models
+///
+/// # Example
+/// ```ignore
+/// let attn = CausalAttention::new(config, q_proj, k_proj, v_proj, o_proj, rope);
+/// let output = attn.forward(&hidden, mask, &mut cache, seqlen_offsets, paged_attn)?;
+/// ```
+pub struct CausalAttention {
+    /// Attention configuration (head counts, sliding window, etc.)
+    config: AttentionConfig,
+    /// Query projection
+    q_proj: Arc<dyn QuantMethod>,
+    /// Key projection
+    k_proj: Arc<dyn QuantMethod>,
+    /// Value projection
+    v_proj: Arc<dyn QuantMethod>,
+    /// Output projection
+    o_proj: Arc<dyn QuantMethod>,
+    /// Position encoding (RoPE)
+    rope: Arc<dyn PositionEncoding>,
+    /// Optional Q/K normalization (Qwen3)
+    qk_norm: Option<Arc<dyn QkNorm>>,
+    /// PagedAttention module (if using paged attention)
+    paged_attn: Option<PagedAttention>,
+    /// Target dtype for QKV after RoPE (for quantized models)
+    attn_dtype: Option<DType>,
+}
+
+impl CausalAttention {
+    /// Create a new causal attention module.
+    pub fn new(
+        config: AttentionConfig,
+        q_proj: Arc<dyn QuantMethod>,
+        k_proj: Arc<dyn QuantMethod>,
+        v_proj: Arc<dyn QuantMethod>,
+        o_proj: Arc<dyn QuantMethod>,
+        rope: Arc<dyn PositionEncoding>,
+    ) -> Self {
+        Self {
+            config,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            rope,
+            qk_norm: None,
+            paged_attn: None,
+            attn_dtype: None,
+        }
+    }
+
+    /// Add Q/K normalization (for Qwen3).
+    pub fn with_qk_norm(mut self, qk_norm: Arc<dyn QkNorm>) -> Self {
+        self.qk_norm = Some(qk_norm);
+        self
+    }
+
+    /// Add paged attention support.
+    pub fn with_paged_attn(mut self, paged_attn: PagedAttention) -> Self {
+        self.paged_attn = Some(paged_attn);
+        self
+    }
+
+    /// Set target dtype for attention computation (for quantized models).
+    /// QKV tensors will be converted to this dtype after RoPE and before SDPA.
+    pub fn with_attn_dtype(mut self, dtype: DType) -> Self {
+        self.attn_dtype = Some(dtype);
+        self
+    }
+
+    /// Check if this attention uses paged attention.
+    pub fn has_paged_attn(&self) -> bool {
+        self.paged_attn.is_some()
+    }
+
+    /// Forward pass through the attention layer.
+    ///
+    /// # Arguments
+    /// * `hidden` - Input hidden states [batch, seq_len, hidden_dim]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - KV cache (mutated for eager attention)
+    /// * `seqlen_offsets` - Position offsets for RoPE
+    /// * `paged_metadata` - Paged attention metadata (if using paged attention)
+    ///
+    /// # Returns
+    /// Output hidden states [batch, seq_len, hidden_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        hidden: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut KvCache,
+        seqlen_offsets: &[usize],
+        paged_metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len, _) = hidden.dims3()?;
+        let cfg = &self.config;
+
+        // 1. QKV projections
+        let q = self.q_proj.forward(hidden)?;
+        let k = self.k_proj.forward(hidden)?;
+        let v = self.v_proj.forward(hidden)?;
+
+        // 2. Reshape for multi-head attention
+        let mut q = reshape_for_attn(q, b_sz, seq_len, cfg.n_heads, cfg.head_dim)?;
+        let mut k = reshape_for_attn(k, b_sz, seq_len, cfg.n_kv_heads, cfg.head_dim)?;
+        let v = reshape_for_attn(v, b_sz, seq_len, cfg.n_kv_heads, cfg.head_dim)?;
+
+        // 3. Optional Q/K normalization (Qwen3)
+        if let Some(ref qk_norm) = self.qk_norm {
+            // Flatten for per-head norm: [b, h, s, d] -> [b*h*s, d]
+            let q_flat = q.flatten(0, 2)?;
+            let k_flat = k.flatten(0, 2)?;
+            let q_normed = qk_norm.forward_q(&q_flat)?;
+            let k_normed = qk_norm.forward_k(&k_flat)?;
+            q = q_normed.reshape((b_sz, cfg.n_heads, seq_len, cfg.head_dim))?;
+            k = k_normed.reshape((b_sz, cfg.n_kv_heads, seq_len, cfg.head_dim))?;
+        }
+
+        // 4. Apply position encoding (RoPE)
+        let (q, k) = self.rope.forward(&q, &k, seqlen_offsets)?;
+
+        // 5. Optional dtype conversion (for quantized models)
+        let (q, k, v) = if let Some(dtype) = self.attn_dtype {
+            (q.to_dtype(dtype)?, k.to_dtype(dtype)?, v.to_dtype(dtype)?)
+        } else {
+            (q, k, v)
+        };
+
+        // 6. Scaled dot-product attention with cache
+        let sdpa_params = cfg.to_sdpa_params();
+        let y = sdpa_with_cache(
+            &q,
+            &k,
+            &v,
+            mask,
+            cache,
+            self.paged_attn.as_ref(),
+            paged_metadata,
+            &sdpa_params,
+        )?;
+
+        // 7. Reshape output and apply output projection
+        let y = reshape_attn_output(y, b_sz, seq_len, mask.is_some())?;
+        // Convert back to input dtype if we changed it for attention
+        let y = if self.attn_dtype.is_some() {
+            y.to_dtype(hidden.dtype())?
+        } else {
+            y
+        };
+        self.o_proj.forward(&y)
+    }
+}
+
+impl Attention for CausalAttention {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut KvCache,
+        position_offsets: &[usize],
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        CausalAttention::forward(self, x, mask, cache, position_offsets, metadata)
+    }
+
+    fn has_paged_attn(&self) -> bool {
+        CausalAttention::has_paged_attn(self)
+    }
+}
 
 #[allow(unused)]
 pub(crate) use backends::{flash_attn, maybe_synchronize, naive_sdpa};
@@ -297,6 +667,100 @@ impl Sdpa {
             }
         } else {
             naive_sdpa(q, &k, &v, mask, sdpa_params)
+        }
+    }
+}
+
+// ============================================================================
+// Attention Helpers
+// ============================================================================
+
+/// Reshape a tensor for multi-head attention.
+///
+/// Converts from `[batch, seq_len, n_heads * head_dim]` to `[batch, n_heads, seq_len, head_dim]`.
+/// Uses an optimized path for single-token decode (seq_len == 1) that avoids transpose.
+///
+/// # Arguments
+/// * `x` - Input tensor of shape `[batch, seq_len, n_heads * head_dim]`
+/// * `b_sz` - Batch size
+/// * `seq_len` - Sequence length
+/// * `n_heads` - Number of attention heads
+/// * `head_dim` - Dimension per head
+pub fn reshape_for_attn(
+    x: Tensor,
+    b_sz: usize,
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    if seq_len != 1 {
+        x.reshape((b_sz, seq_len, n_heads, head_dim))?.transpose(1, 2)
+    } else {
+        x.reshape((b_sz, n_heads, seq_len, head_dim))
+    }
+}
+
+/// Reshape attention output back to `[batch, seq_len, hidden_dim]`.
+///
+/// Handles the difference between prefill (needs transpose) and decode (no transpose needed).
+///
+/// # Arguments
+/// * `y` - Attention output of shape `[batch, n_heads, seq_len, head_dim]`
+/// * `b_sz` - Batch size
+/// * `seq_len` - Sequence length
+/// * `had_mask` - Whether a mask was used (indicates prefill vs decode)
+pub fn reshape_attn_output(y: Tensor, b_sz: usize, seq_len: usize, had_mask: bool) -> Result<Tensor> {
+    if had_mask {
+        y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))
+    } else {
+        y.reshape((b_sz, seq_len, ()))
+    }
+}
+
+/// Run scaled dot-product attention with KV cache support.
+///
+/// Dispatches to either paged attention or eager attention based on configuration.
+/// For eager attention, appends K/V to the cache before computing attention.
+///
+/// # Arguments
+/// * `q` - Query tensor `[batch, n_heads, seq_len, head_dim]`
+/// * `k` - Key tensor `[batch, n_kv_heads, seq_len, head_dim]`
+/// * `v` - Value tensor `[batch, n_kv_heads, seq_len, head_dim]`
+/// * `mask` - Optional attention mask
+/// * `kv_cache` - KV cache for eager attention (mutated to append new K/V)
+/// * `paged_attn` - PagedAttention module if using paged attention
+/// * `paged_metadata` - Paged attention metadata (KV cache tensors + input metadata)
+/// * `sdpa_params` - SDPA parameters (softmax scale, softcap, etc.)
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_with_cache(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    kv_cache: &mut KvCache,
+    paged_attn: Option<&PagedAttention>,
+    paged_metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    sdpa_params: &SdpaParams,
+) -> Result<Tensor> {
+    match paged_attn {
+        Some(pa) => {
+            let ((key_cache, value_cache), input_metadata) = paged_metadata
+                .expect("paged_metadata required when using PagedAttention");
+            pa.forward(
+                q,
+                k,
+                v,
+                mask,
+                Some(key_cache),
+                Some(value_cache),
+                input_metadata,
+                sdpa_params,
+                None,
+            )
+        }
+        None => {
+            let (k, v) = kv_cache.append(k, v)?;
+            Sdpa.run_attention(q, &k, &v, mask, None, sdpa_params)
         }
     }
 }

@@ -18,9 +18,119 @@ use mistralrs_quant::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use crate::attention::Sdpa;
+pub use crate::attention::{
+    reshape_attn_output, reshape_for_attn, sdpa_with_cache, Attention, AttentionConfig,
+    CausalAttention, PositionEncoding, QkNorm, RmsNormQkNorm, Sdpa, SdpaParams,
+};
 pub use crate::layers_masker::CausalMasker;
 pub use crate::layers_utils::repeat_kv;
+
+// ============================================================================
+// Feed-Forward Network Trait
+// ============================================================================
+
+/// Feed-forward network trait - abstracts over MLP/MoE implementations.
+///
+/// This trait enables generic transformer blocks that can work with different
+/// feed-forward implementations (standard MLP, gated MLP, MoE, etc.).
+pub trait FeedForward: Send + Sync {
+    /// Apply the feed-forward transformation.
+    ///
+    /// # Arguments
+    /// * `xs` - Input tensor of shape `[batch, seq_len, hidden_size]`
+    ///
+    /// # Returns
+    /// Output tensor of the same shape as input
+    fn forward(&self, xs: &Tensor) -> Result<Tensor>;
+}
+
+// ============================================================================
+// Generic Transformer Block
+// ============================================================================
+
+use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
+use crate::pipeline::KvCache;
+
+/// Generic pre-norm transformer block.
+///
+/// This struct encapsulates the common transformer layer pattern:
+/// ```text
+/// input → attn_norm → attention → +residual → ffn_norm → ffn → +residual → output
+/// ```
+///
+/// It is parameterized over:
+/// - `N`: Normalization layer (e.g., `QRmsNorm`, `RmsNorm`, `LayerNorm`)
+/// - `A`: Attention implementation (e.g., `CausalAttention`)
+/// - `F`: Feed-forward network (e.g., `Mlp`)
+///
+/// This enables zero-cost abstraction through monomorphization while
+/// eliminating code duplication across different model architectures.
+pub struct TransformerBlock<N, A, F> {
+    pub attn_norm: N,
+    pub attention: A,
+    pub ffn_norm: N,
+    pub ffn: F,
+}
+
+impl<N, A, F> TransformerBlock<N, A, F>
+where
+    N: Module,
+    A: Attention,
+    F: FeedForward,
+{
+    /// Create a new transformer block.
+    pub fn new(attn_norm: N, attention: A, ffn_norm: N, ffn: F) -> Self {
+        Self {
+            attn_norm,
+            attention,
+            ffn_norm,
+            ffn,
+        }
+    }
+
+    /// Forward pass through the transformer block.
+    ///
+    /// # Arguments
+    /// * `hidden` - Input hidden states `[batch, seq_len, hidden_size]`
+    /// * `mask` - Optional attention mask
+    /// * `position_offsets` - Position offsets for rotary embeddings
+    /// * `cache` - KV cache for incremental decoding
+    /// * `metadata` - Optional paged attention metadata
+    ///
+    /// # Returns
+    /// Output hidden states of the same shape as input
+    pub fn forward(
+        &self,
+        hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        cache: &mut KvCache,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        // Attention with pre-norm and residual
+        let residual = &hidden;
+        let x = self.attn_norm.forward(&hidden)?;
+
+        // Move mask to same device as x (for device mapping support)
+        let mask = mask.map(|m| m.to_device(x.device()).unwrap());
+        let attn_out = self
+            .attention
+            .forward(&x, mask.as_ref(), cache, position_offsets, metadata)?;
+        let x = (attn_out + residual)?;
+
+        // FFN with pre-norm and residual
+        let residual = &x;
+        let x = self.ffn_norm.forward(&x)?;
+        let ffn_out = self.ffn.forward(&x)?;
+        ffn_out + residual
+    }
+
+    /// Check if this block has paged attention enabled.
+    pub fn has_paged_attn(&self) -> bool {
+        self.attention.has_paged_attn()
+    }
+}
+
 use crate::{
     amoe::{AnyMoeTrainableLayer, MlpLayer},
     embedding_models::embedding_gemma::EmbeddingGemmaConfig,
@@ -304,6 +414,12 @@ impl QRmsNorm {
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
+    }
+}
+
+impl Module for QRmsNorm {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        QRmsNorm::forward(self, xs)
     }
 }
 
@@ -2246,6 +2362,12 @@ impl RotaryEmbedding {
     }
 }
 
+impl crate::attention::PositionEncoding for RotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        RotaryEmbedding::forward(self, q, k, seqlen_offsets)
+    }
+}
+
 /// GPT-OSS style rotary embedding with YARN scaling support.
 /// Uses chunked/GPT-NeoX style rotation and applies attention scaling.
 #[derive(Debug, Clone)]
@@ -2429,6 +2551,46 @@ impl GptOssRotaryEmbedding {
             }
             Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
         }
+    }
+}
+
+impl crate::attention::PositionEncoding for GptOssRotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        GptOssRotaryEmbedding::forward(self, q, k, seqlen_offsets)
+    }
+}
+
+// ============================================================================
+// PositionEncoding implementations for RoPE newtype wrappers
+// ============================================================================
+
+impl crate::attention::PositionEncoding for Llama3RotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        self.0.forward(q, k, seqlen_offsets)
+    }
+}
+
+impl crate::attention::PositionEncoding for SmolLm3RotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        self.0.forward(q, k, seqlen_offsets)
+    }
+}
+
+impl crate::attention::PositionEncoding for Gemma3nRotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        self.0.forward(q, k, seqlen_offsets)
+    }
+}
+
+impl crate::attention::PositionEncoding for Gemma3RotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        self.0.forward(q, k, seqlen_offsets)
+    }
+}
+
+impl crate::attention::PositionEncoding for DeepSeekV2RotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        DeepSeekV2RotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
 
@@ -2805,6 +2967,30 @@ impl Mlp {
         Self::new(vb, params[0], params[1], &None, act, comm)
     }
 
+    /// Create an MLP from pre-built weight matrices.
+    ///
+    /// This is useful for GGUF models where weights are loaded directly from quantized tensors.
+    ///
+    /// # Arguments
+    /// * `gate` - Gate projection weights (also called w1 or ffn_gate)
+    /// * `up` - Up projection weights (also called w3 or ffn_up)
+    /// * `down` - Down projection weights (also called w2 or ffn_down)
+    /// * `act` - Activation function (typically SiLU for LLaMA-style models)
+    pub fn from_weights(
+        gate: Arc<dyn QuantMethod>,
+        up: Arc<dyn QuantMethod>,
+        down: Arc<dyn QuantMethod>,
+        act: Activation,
+    ) -> Self {
+        Self {
+            gate,
+            up,
+            down,
+            act,
+            params: vec![], // Not available for pre-built weights
+        }
+    }
+
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let original_dtype = xs.dtype();
         let mut xs = xs.clone();
@@ -2824,6 +3010,41 @@ impl Mlp {
 }
 
 impl AnyMoeTrainableLayer for Mlp {}
+
+impl FeedForward for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        Mlp::forward(self, xs)
+    }
+}
+
+// ============================================================================
+// Non-Gated MLP (for models like StarCoder2)
+// ============================================================================
+
+/// Non-gated MLP: up → activation → down
+///
+/// Used by models like StarCoder2 that don't use gated activation.
+/// Contrast with `Mlp` which uses gated activation (gate * up → activation → down).
+pub struct NonGatedMlp {
+    pub up: Arc<dyn QuantMethod>,
+    pub down: Arc<dyn QuantMethod>,
+    pub act: Activation,
+}
+
+impl NonGatedMlp {
+    /// Create from pre-loaded weight tensors (for GGUF models).
+    pub fn from_weights(up: Arc<dyn QuantMethod>, down: Arc<dyn QuantMethod>, act: Activation) -> Self {
+        Self { up, down, act }
+    }
+}
+
+impl FeedForward for NonGatedMlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let hidden = MatMul.qmethod_matmul(xs, &*self.up)?;
+        let hidden = self.act.forward(&hidden)?;
+        MatMul.qmethod_matmul(&hidden, &*self.down)
+    }
+}
 
 impl MlpLayer for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {

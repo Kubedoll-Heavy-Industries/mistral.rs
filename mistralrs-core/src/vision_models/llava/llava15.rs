@@ -195,7 +195,7 @@ impl Model {
             .squeeze(1)?
             .to_vec1::<u32>()?;
         let mut result = input_ids.clamp(0i64, i64::MAX)?.to_dtype(DType::U32)?;
-        result = self.llm.embed(&result)?; //[seq_len,hidden_size]
+        result = LLaVALLM::embed(&*self.llm, &result)?; //[seq_len,hidden_size]
         let image_features = self.encode_images(&images.to_dtype(self.dtype)?)?; //[num of images,patch_size*patch_size,hidden_size]
         let num_of_images = image_features.shape().dims()[0];
         let mut image_features_vec = Vec::new();

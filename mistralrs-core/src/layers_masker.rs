@@ -39,6 +39,20 @@ impl PastKvLenCache for Vec<KvCache> {
     }
 }
 
+impl PastKvLenCache for &[KvCache] {
+    fn get_past_kv_len(&self) -> Result<usize> {
+        let kv_cache_1 = &self[0];
+        Ok(kv_cache_1.current_seq_len())
+    }
+}
+
+impl PastKvLenCache for &mut [KvCache] {
+    fn get_past_kv_len(&self) -> Result<usize> {
+        let kv_cache_1 = &self[0];
+        Ok(kv_cache_1.current_seq_len())
+    }
+}
+
 impl PastKvLenCache for &[usize] {
     fn get_past_kv_len(&self) -> Result<usize> {
         if self.windows(2).all(|w| w[0] == w[1]) {
@@ -169,29 +183,40 @@ impl CausalMasker {
         Ok(k_cache_1.dims()[2])
     }
 
-    pub fn make_causal_mask_matrix(
+    /// Create causal mask from explicit shape parameters.
+    ///
+    /// This is the preferred method for pipeline parallelism where activation
+    /// tensors are available but input_ids may not be (TAIL stages receive
+    /// hidden states, not tokens).
+    ///
+    /// # Arguments
+    /// * `seq_len` - Sequence length (from activation tensor dim or token count)
+    /// * `device` - Device to create mask on
+    /// * `cache` - KV cache for past sequence length
+    /// * `dtype` - Data type for the mask
+    pub fn make_causal_mask_as(
         &self,
-        input_ids: &Tensor,
+        seq_len: usize,
+        device: &Device,
         cache: &dyn PastKvLenCache,
         dtype: DType,
-        _n_attn_heads: usize,
     ) -> Result<Option<Tensor>> {
-        let past_kv_len = cache.get_past_kv_len()?;
-        let (_b_sz, tgt_len) = input_ids.dims2()?;
-        if tgt_len == 1 {
+        if seq_len == 1 {
             return Ok(None);
         }
 
+        let past_kv_len = cache.get_past_kv_len()?;
+
         // Avoid materializing large sliding-window masks when flash-attn on CUDA.
-        if crate::using_flash_attn() && input_ids.device().is_cuda() {
-            return Ok(Some(Tensor::zeros((1, 1), dtype, input_ids.device())?));
+        if crate::using_flash_attn() && device.is_cuda() {
+            return Ok(Some(Tensor::zeros((1, 1), dtype, device)?));
         }
 
         let mut causal_mask = self
-            .make_mask(tgt_len, past_kv_len, input_ids.device())?
+            .make_mask(seq_len, past_kv_len, device)?
             .to_dtype(DType::U8)?;
 
-        let zero = Tensor::new(0.0f32, input_ids.device())?;
+        let zero = Tensor::new(0.0f32, device)?;
         causal_mask = {
             let mut mask =
                 causal_mask.broadcast_as((causal_mask.dims()[0], causal_mask.dims()[1]))?;
@@ -205,6 +230,108 @@ impl CausalMasker {
         };
 
         Ok(Some(causal_mask))
+    }
+
+    /// Create causal mask from explicit parameters (no cache trait needed).
+    ///
+    /// This is the simplest form - takes all values directly without needing
+    /// a cache reference. Useful when the pipeline already knows past_kv_len.
+    ///
+    /// # Arguments
+    /// * `seq_len` - Current sequence length being processed
+    /// * `device` - Device to create mask on
+    /// * `past_kv_len` - Number of tokens already in KV cache
+    /// * `dtype` - Data type for the mask
+    pub fn make_causal_mask(
+        &self,
+        seq_len: usize,
+        device: &Device,
+        past_kv_len: usize,
+        dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        if seq_len == 1 {
+            return Ok(None);
+        }
+
+        // Avoid materializing large masks when flash-attn on CUDA.
+        if crate::using_flash_attn() && device.is_cuda() {
+            return Ok(Some(Tensor::zeros((1, 1), dtype, device)?));
+        }
+
+        let mut causal_mask = self
+            .make_mask(seq_len, past_kv_len, device)?
+            .to_dtype(DType::U8)?;
+
+        let zero = Tensor::new(0.0f32, device)?;
+        causal_mask = {
+            let mut mask =
+                causal_mask.broadcast_as((causal_mask.dims()[0], causal_mask.dims()[1]))?;
+            mask = masked_fill(
+                &zero.to_dtype(dtype)?.broadcast_as(mask.shape())?,
+                &mask,
+                f32::NEG_INFINITY,
+            )?;
+            mask
+        };
+
+        Ok(Some(causal_mask))
+    }
+
+    /// Create sliding window causal mask from explicit parameters.
+    ///
+    /// # Arguments
+    /// * `seq_len` - Current sequence length being processed
+    /// * `device` - Device to create mask on
+    /// * `past_kv_len` - Number of tokens already in KV cache
+    /// * `window_size` - Sliding window size
+    /// * `dtype` - Data type for the mask
+    pub fn make_sliding_window_mask(
+        &self,
+        seq_len: usize,
+        device: &Device,
+        past_kv_len: usize,
+        window_size: usize,
+        dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        if seq_len == 1 {
+            return Ok(None);
+        }
+
+        // Avoid materializing large masks when flash-attn on CUDA.
+        if crate::using_flash_attn() && device.is_cuda() {
+            return Ok(Some(Tensor::zeros((1, 1), dtype, device)?));
+        }
+
+        // Adjust past_kv_len for sliding window
+        let adjusted_past_kv_len = past_kv_len.min(window_size.saturating_sub(seq_len));
+
+        Ok(Some(self.make_swa_mask(
+            seq_len,
+            adjusted_past_kv_len,
+            window_size,
+            device,
+            dtype,
+        )?))
+    }
+
+    /// Create causal mask from input_ids tensor.
+    ///
+    /// This extracts shape from the tensor and delegates to `make_causal_mask_as`.
+    /// For pipeline parallelism TAIL stages, prefer `make_causal_mask_as` directly
+    /// with the activation tensor's sequence length.
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use make_causal_mask_as with explicit shape parameters instead"
+    )]
+    pub fn make_causal_mask_matrix(
+        &self,
+        input_ids: &Tensor,
+        cache: &dyn PastKvLenCache,
+        dtype: DType,
+        _n_attn_heads: usize,
+    ) -> Result<Option<Tensor>> {
+        let (_b_sz, seq_len) = input_ids.dims2()?;
+        self.make_causal_mask_as(seq_len, input_ids.device(), cache, dtype)
     }
 
     pub fn make_chunked_mask_matrix(
