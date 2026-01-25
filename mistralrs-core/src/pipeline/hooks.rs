@@ -20,7 +20,8 @@ pub enum ActivationResult {
     /// The tensor shape encodes the phase:
     /// - seq_len > 1: Prefill phase (accumulate in cache, no logits)
     /// - seq_len == 1: Decode phase (process and return logits)
-    /// Position is derived from cache length (stream cursor model).
+    /// Position is derived from cache length (stream cursor model):
+    /// `position = starting_position + cache.len()`
     Data {
         /// Activation tensor [batch, seq_len, hidden_dim].
         tensor: Tensor,
@@ -161,7 +162,8 @@ pub trait PipelineHook: Send + Sync {
     /// # Parameters
     /// * `request_id` - The request UUID (UUID7) for correlation
     /// * `total_prompt_tokens` - Total tokens in the complete prompt (not per-chunk)
-    fn init_pipeline_request(&self, _request_id: uuid::Uuid, _total_prompt_tokens: usize) {
+    /// * `starting_position` - RoPE starting position (prefix cache offset from HEAD)
+    fn init_pipeline_request(&self, _request_id: uuid::Uuid, _total_prompt_tokens: usize, _starting_position: usize) {
         // Default: no-op
     }
 
@@ -265,9 +267,14 @@ impl HookContainer {
     ///
     /// This should be called once per request on the first prefill chunk
     /// to initialize pipeline parallelism metadata.
-    pub fn call_init_pipeline_request(&self, request_id: uuid::Uuid, total_prompt_tokens: usize) {
+    ///
+    /// # Parameters
+    /// * `request_id` - Request UUID for correlation
+    /// * `total_prompt_tokens` - Total tokens in the complete prompt
+    /// * `starting_position` - RoPE starting position (prefix cache offset)
+    pub fn call_init_pipeline_request(&self, request_id: uuid::Uuid, total_prompt_tokens: usize, starting_position: usize) {
         if let Some(hook) = &self.hook {
-            hook.init_pipeline_request(request_id, total_prompt_tokens);
+            hook.init_pipeline_request(request_id, total_prompt_tokens, starting_position);
         }
     }
 
