@@ -1,8 +1,9 @@
 use super::llg::build_llg_factory;
 use super::{
-    get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
-    CacheManager, GeneralMetadata, HookContainer, Loader, ModelKind, ModelPaths, PrettyName,
-    QuantizationKind, TokenSource,
+    get_model_paths, get_xlora_paths,
+    text_models_inputs_processor::ModelInputs,
+    AdapterKind, CacheManager, GeneralMetadata, HookContainer, Loader, ModelKind, ModelPaths,
+    PrettyName, QuantizationKind, TokenSource,
 };
 use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
@@ -16,7 +17,7 @@ use crate::gguf::{
     get_gguf_chat_template, {convert_gguf_to_hf_tokenizer, GgufTokenizerConversion},
 };
 use crate::gguf::{Content, GGUFArchitecture};
-use crate::kv_cache::{FullCacheManager, NormalCacheManager};
+use crate::kv_cache::{FullCacheManager, NormalCache, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
@@ -65,72 +66,62 @@ use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-enum Model {
-    Llama(QLlama),
-    Mistral3(QMistral3),
-    Phi2(QPhi),
+/// Model variant: either a TransformerModel (unified path) or XLora (legacy two-pass).
+///
+/// This replaces the old 10-variant enum with a simpler structure:
+/// - TransformerModel implementations use dynamic dispatch (Box<dyn>)
+/// - XLora models stay concrete until we create an XLoraModel trait
+enum ModelVariant {
+    /// Models implementing TransformerModel (stateless, unified forward path)
+    Transformer(Box<dyn TransformerModel + Send + Sync>),
+    /// XLora Llama (two-pass inference, owns cache)
     XLoraLlama(XLoraQLlama),
+    /// XLora Phi3 (two-pass inference, owns cache)
     XLoraPhi3(XLoraQPhi3),
-    Phi3(QPhi3),
-    Starcoder2(QStarcoder2),
-    Qwen(QQwen),
-    Qwen3(QQwen3),
-    Qwen3MoE(QQwen3MoE),
 }
 
-impl Model {
-    /// Set pipeline hook for distributed inference.
-    fn set_hook(&mut self, hook: HookContainer) {
+impl ModelVariant {
+    /// Get this model as a TransformerModel trait object, if it implements the trait.
+    ///
+    /// Returns Some for TransformerModel, None for XLora models (which need two-pass inference).
+    fn as_transformer_model(&self) -> Option<&dyn TransformerModel> {
         match self {
-            Model::Llama(m) => m.set_hook(hook),
-            Model::Mistral3(m) => m.set_hook(hook),
-            Model::Phi2(m) => m.set_hook(hook),
-            Model::Phi3(m) => m.set_hook(hook),
-            Model::Starcoder2(m) => m.set_hook(hook),
-            Model::Qwen(m) => m.set_hook(hook),
-            Model::Qwen3(m) => m.set_hook(hook),
-            Model::Qwen3MoE(m) => m.set_hook(hook),
-            // XLora models don't support hooks yet
-            Model::XLoraLlama(_) | Model::XLoraPhi3(_) => {
-                tracing::warn!("XLora models do not support pipeline hooks yet");
-            }
+            ModelVariant::Transformer(model) => Some(&**model),
+            ModelVariant::XLoraLlama(_) | ModelVariant::XLoraPhi3(_) => None,
         }
     }
 
-    /// Check if this model supports hooks.
-    fn supports_hooks(&self) -> bool {
+    /// Number of transformer layers in this model.
+    fn num_layers(&self) -> usize {
         match self {
-            Model::Llama(_)
-            | Model::Mistral3(_)
-            | Model::Phi2(_)
-            | Model::Phi3(_)
-            | Model::Starcoder2(_)
-            | Model::Qwen(_)
-            | Model::Qwen3(_)
-            | Model::Qwen3MoE(_) => true,
-            Model::XLoraLlama(_) | Model::XLoraPhi3(_) => false,
+            ModelVariant::Transformer(model) => model.num_layers(),
+            ModelVariant::XLoraLlama(model) => model.cache.normal().0.len(),
+            ModelVariant::XLoraPhi3(model) => model.cache.normal().0.len(),
         }
     }
 
-    /// Get pipeline hook for distributed inference.
-    fn get_hook(&self) -> Option<&HookContainer> {
+    /// Maximum sequence length supported by this model.
+    fn max_seq_len(&self) -> usize {
         match self {
-            Model::Llama(m) => m.get_hook(),
-            Model::Mistral3(m) => m.get_hook(),
-            Model::Phi2(m) => m.get_hook(),
-            Model::Phi3(m) => m.get_hook(),
-            Model::Starcoder2(m) => m.get_hook(),
-            Model::Qwen(m) => m.get_hook(),
-            Model::Qwen3(m) => m.get_hook(),
-            Model::Qwen3MoE(m) => m.get_hook(),
-            // XLora models don't support hooks yet
-            Model::XLoraLlama(_) | Model::XLoraPhi3(_) => None,
+            ModelVariant::Transformer(model) => model.max_seq_len(),
+            ModelVariant::XLoraLlama(model) => model.max_seq_len,
+            ModelVariant::XLoraPhi3(model) => model.max_seq_len,
+        }
+    }
+
+    /// The device where model weights reside.
+    fn device(&self) -> &Device {
+        match self {
+            ModelVariant::Transformer(model) => model.device(),
+            ModelVariant::XLoraLlama(model) => &model.device,
+            ModelVariant::XLoraPhi3(model) => &model.device,
         }
     }
 }
+
 
 pub struct GGUFPipeline {
-    model: Model,
+    model: ModelVariant,
     tokenizer: Arc<Tokenizer>,
     no_kv_cache: bool,
     chat_template: Arc<ChatTemplate>,
@@ -138,6 +129,115 @@ pub struct GGUFPipeline {
     non_granular_state: Option<NonGranularState>,
     metadata: Arc<GeneralMetadata>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
+    /// KV cache owned by the pipeline (models are stateless)
+    cache: EitherCache,
+    /// Pipeline hook for distributed inference (PP stage communication)
+    hook: Option<HookContainer>,
+}
+
+/// Unified forward pass for models implementing TransformerModel.
+///
+/// This is the ONE code path for inference. Pipeline parallelism is just
+/// configuration - hooks fire at boundaries if layers are distributed,
+/// otherwise everything runs locally.
+///
+/// Architecture:
+/// - HEAD (first stage): embed() → transform() → send activation
+/// - TAIL (last stage):  receive → transform() → lm_head()
+/// - Single node:        embed() → transform() → lm_head()
+///
+/// Key insight: After embed(), tokens are gone. Only hidden states flow.
+///
+/// This is a free function to allow borrowing model, cache, and hook separately
+/// (avoids borrow checker conflicts with &mut self).
+#[allow(clippy::too_many_arguments)]
+fn forward_transformer(
+    model: &dyn TransformerModel,
+    cache: &mut [crate::kv_cache::KvCache],
+    hook: Option<&HookContainer>,
+    input_ids: &Tensor,
+    seqlen_offsets: &[usize],
+    context_lens: Vec<(usize, usize)>,
+    paged_attn_meta: Option<(Vec<(Tensor, Tensor)>, &crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata)>,
+    request_id: uuid::Uuid,
+) -> candle_core::Result<ForwardInputsResult> {
+    let has_embedding = hook.as_ref().map_or(true, |h| h.is_first_stage());
+    let has_lm_head = hook.as_ref().map_or(true, |h| h.is_last_stage());
+
+    // Step 1: Get hidden states (embed OR receive from previous stage)
+    let hidden = if has_embedding {
+        model.embed(input_ids)?
+    } else {
+        // TAIL/MIDDLE: receive activation from previous stage
+        match hook.as_ref().unwrap().receive_stage_input(request_id)? {
+            Some(ActivationResult::Data { tensor }) => tensor,
+            Some(ActivationResult::Completed { reason }) => {
+                return Ok(ForwardInputsResult::PipelineCompleted { reason });
+            }
+            None => {
+                candle_core::bail!("Non-first stage expected activation from previous stage");
+            }
+        }
+    };
+
+    // Step 2: Build context and transform
+    // For TAIL, derive position from cache (stream cursor model)
+    let position_offset = if has_embedding {
+        seqlen_offsets.first().copied().unwrap_or(0)
+    } else {
+        // TAIL: position = cache length (tokens already processed)
+        cache.first().map_or(0, |c| c.current_seq_len())
+    };
+
+    let paged_attn_ctx = paged_attn_meta.as_ref().map(|(kv_cache, metadata)| {
+        PagedAttentionContext {
+            kv_cache: kv_cache.clone(),
+            metadata,
+        }
+    });
+    let ctx = TransformContext {
+        seq_len: hidden.dims()[1],
+        position_offset,
+        paged_attn: paged_attn_ctx.as_ref(),
+    };
+
+    let hidden = model.transform(hidden, &ctx, cache)?;
+
+    // Step 3: Output (send activation OR compute logits)
+    if !has_lm_head {
+        // HEAD/MIDDLE: send activation to next stage
+        // Note: tokens are not used by streaming_hook - only hidden states matter
+        hook.as_ref().unwrap().send_stage_output(&hidden, &[], request_id, position_offset)?;
+
+        if hook.as_ref().unwrap().needs_external_logits() {
+            // HEAD: wait for logits from TAIL
+            let logits = hook.as_ref().unwrap().receive_response_logits()?;
+            return Ok(ForwardInputsResult::CausalGeneration {
+                logits: logits.unsqueeze(1)?,
+            });
+        }
+
+        // MIDDLE: shouldn't reach here (has no lm_head but doesn't need external logits)
+        candle_core::bail!("Middle stage completed send but has nowhere to return");
+    }
+
+    // TAIL or single-node: compute logits
+    let logits = model.lm_head(hidden)?;
+
+    // Extract last position's logits for sampling.
+    // For TAIL, context_lens was computed for HEAD's tokens - use logits shape instead.
+    let actual_context_lens = if !has_embedding {
+        // TAIL: extract only last position from actual logits shape
+        let batch = logits.dims()[0];
+        let seq_len = logits.dims()[1];
+        vec![(seq_len - 1, 1); batch]
+    } else {
+        // Single-node or HEAD with lm_head: use passed-in context_lens
+        context_lens
+    };
+
+    let logits = crate::pipeline::extract_logits(&logits, actual_context_lens)?;
+    Ok(ForwardInputsResult::RawLogits { logits })
 }
 
 /// Loader for a GGUF model.
@@ -581,23 +681,43 @@ impl Loader for GGUFLoader {
         };
 
         // Config into model:
-        let model = match self.kind {
+        // TransformerModel implementations are boxed for dynamic dispatch.
+        // XLora models stay concrete (they have different forward signature).
+        let model: ModelVariant = match self.kind {
             ModelKind::GgufQuantized { .. } => match arch {
-                GGUFArchitecture::Llama => Model::Llama(QLlama::try_from(model_config)?),
-                GGUFArchitecture::Mistral3 => Model::Mistral3(QMistral3::try_from(model_config)?),
-                GGUFArchitecture::Phi2 => Model::Phi2(QPhi::try_from(model_config)?),
-                GGUFArchitecture::Phi3 => Model::Phi3(QPhi3::try_from(model_config)?),
-                GGUFArchitecture::Starcoder2 => {
-                    Model::Starcoder2(QStarcoder2::try_from(model_config)?)
+                GGUFArchitecture::Llama => {
+                    ModelVariant::Transformer(Box::new(QLlama::try_from(model_config)?))
                 }
-                GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
-                GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
-                GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
+                GGUFArchitecture::Mistral3 => {
+                    ModelVariant::Transformer(Box::new(QMistral3::try_from(model_config)?))
+                }
+                GGUFArchitecture::Phi2 => {
+                    ModelVariant::Transformer(Box::new(QPhi::try_from(model_config)?))
+                }
+                GGUFArchitecture::Phi3 => {
+                    ModelVariant::Transformer(Box::new(QPhi3::try_from(model_config)?))
+                }
+                GGUFArchitecture::Starcoder2 => {
+                    ModelVariant::Transformer(Box::new(QStarcoder2::try_from(model_config)?))
+                }
+                GGUFArchitecture::Qwen2 => {
+                    ModelVariant::Transformer(Box::new(QQwen::try_from(model_config)?))
+                }
+                GGUFArchitecture::Qwen3 => {
+                    ModelVariant::Transformer(Box::new(QQwen3::try_from(model_config)?))
+                }
+                GGUFArchitecture::Qwen3MoE => {
+                    ModelVariant::Transformer(Box::new(QQwen3MoE::try_from(model_config)?))
+                }
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
-                GGUFArchitecture::Llama => Model::XLoraLlama(XLoraQLlama::try_from(model_config)?),
-                GGUFArchitecture::Phi3 => Model::XLoraPhi3(XLoraQPhi3::try_from(model_config)?),
+                GGUFArchitecture::Llama => {
+                    ModelVariant::XLoraLlama(XLoraQLlama::try_from(model_config)?)
+                }
+                GGUFArchitecture::Phi3 => {
+                    ModelVariant::XLoraPhi3(XLoraQPhi3::try_from(model_config)?)
+                }
                 GGUFArchitecture::Mistral3 => {
                     bail!("Mistral3 adapters are not supported yet")
                 }
@@ -684,31 +804,12 @@ impl Loader for GGUFLoader {
             gguf_chat_template,
         );
 
-        let max_seq_len = match model {
-            Model::Llama(ref l) => l.max_seq_len,
-            Model::Mistral3(ref m) => m.max_seq_len,
-            Model::Phi2(ref p) => p.max_seq_len,
-            Model::XLoraLlama(ref xl) => xl.max_seq_len,
-            Model::Phi3(ref p) => p.max_seq_len,
-            Model::XLoraPhi3(ref p) => p.max_seq_len,
-            Model::Starcoder2(ref p) => p.max_seq_len,
-            Model::Qwen(ref p) => p.max_seq_len,
-            Model::Qwen3(ref p) => p.max_seq_len,
-            Model::Qwen3MoE(ref p) => p.max_seq_len,
-        };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
-        let num_hidden_layers = match model {
-            Model::Llama(ref model) => model.cache.normal().0.len(),
-            Model::Mistral3(ref model) => model.cache.normal().0.len(),
-            Model::Phi2(ref model) => model.cache.normal().0.len(),
-            Model::XLoraLlama(ref model) => model.cache.full().lock().len(),
-            Model::Phi3(ref model) => model.cache.normal().0.len(),
-            Model::XLoraPhi3(ref model) => model.cache.full().lock().len(),
-            Model::Starcoder2(ref model) => model.cache.normal().0.len(),
-            Model::Qwen(ref model) => model.cache.normal().0.len(),
-            Model::Qwen3(ref model) => model.cache.normal().0.len(),
-            Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
-        };
+
+        // Create cache for pipeline (models are stateless, pipeline owns the cache)
+        let num_hidden_layers = model.num_layers();
+        let max_seq_len = model.max_seq_len();
+        let cache = EitherCache::Normal(NormalCache::new(num_hidden_layers, max_seq_len));
 
         if chat_template.bos_token.is_none() {
             if let Some(v) = bos {
@@ -727,6 +828,7 @@ impl Loader for GGUFLoader {
         }
 
         let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
+
         Ok(Arc::new(Mutex::new(GGUFPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -761,7 +863,9 @@ impl Loader for GGUFLoader {
                     output: vec![SupportedModality::Text],
                 },
             }),
+            cache,
             mapper: pipeline_mapper,
+            hook: None,
         })))
     }
 
@@ -831,35 +935,13 @@ impl CacheManagerMixin for GGUFPipeline {
         }
     }
     fn cache(&self) -> &EitherCache {
-        match self.model {
-            Model::Llama(ref model) => &model.cache,
-            Model::Mistral3(ref model) => &model.cache,
-            Model::Phi2(ref model) => &model.cache,
-            Model::XLoraLlama(ref model) => &model.cache,
-            Model::Phi3(ref model) => &model.cache,
-            Model::XLoraPhi3(ref model) => &model.cache,
-            Model::Starcoder2(ref model) => &model.cache,
-            Model::Qwen(ref model) => &model.cache,
-            Model::Qwen3(ref model) => &model.cache,
-            Model::Qwen3MoE(ref model) => &model.cache,
-        }
+        &self.cache
     }
 }
 
 impl MetadataMixin for GGUFPipeline {
     fn device(&self) -> Device {
-        match self.model {
-            Model::Llama(ref model) => model.device.clone(),
-            Model::Mistral3(ref model) => model.device.clone(),
-            Model::Phi2(ref model) => model.device.clone(),
-            Model::XLoraLlama(ref model) => model.device.clone(),
-            Model::Phi3(ref model) => model.device.clone(),
-            Model::XLoraPhi3(ref model) => model.device.clone(),
-            Model::Starcoder2(ref model) => model.device.clone(),
-            Model::Qwen(ref model) => model.device.clone(),
-            Model::Qwen3(ref model) => model.device.clone(),
-            Model::Qwen3MoE(ref model) => model.device.clone(),
-        }
+        self.model.device().clone()
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
         Some(self.tokenizer.clone())
@@ -884,7 +966,7 @@ impl MetadataMixin for GGUFPipeline {
 #[async_trait::async_trait]
 impl Pipeline for GGUFPipeline {
     fn get_hook(&self) -> Option<&crate::pipeline::HookContainer> {
-        self.model.get_hook()
+        self.hook.as_ref()
     }
 
     fn forward_inputs(
@@ -907,12 +989,12 @@ impl Pipeline for GGUFPipeline {
         } = *inputs.downcast().expect("Downcast failed.");
 
         // Set request context on hook BEFORE forward (proper design: context on hook, not threaded through model)
-        if let Some(hook) = self.model.get_hook() {
+        if let Some(hook) = self.hook.as_ref() {
             hook.set_request_context(request_id);
 
             use crate::pipeline::text_models_inputs_processor::InferenceStep;
-            if let InferenceStep::Prefill { total_prompt_tokens, .. } = inference_step {
-                hook.call_init_pipeline_request(request_id, total_prompt_tokens);
+            if let InferenceStep::Prefill { total_prompt_tokens, chunk_start_position, .. } = inference_step {
+                hook.call_init_pipeline_request(request_id, total_prompt_tokens, chunk_start_position);
             }
         }
 
@@ -929,17 +1011,28 @@ impl Pipeline for GGUFPipeline {
             }
             (None, None) => None,
         };
+        // Models implementing TransformerModel use the unified forward path.
+        // Check BEFORE the match to avoid borrow conflicts.
+        if self.model.as_transformer_model().is_some() {
+            // Safe to unwrap: we just checked it's Some
+            let model = self.model.as_transformer_model().unwrap();
+            let cache = &mut self.cache.normal().0;
+            let hook = self.hook.as_ref();
+            return forward_transformer(
+                model,
+                cache,
+                hook,
+                &input_ids,
+                &seqlen_offsets,
+                context_lens,
+                paged_attn_meta,
+                request_id,
+            );
+        }
+
+        // Legacy path for XLora models (two-pass inference, own cache)
         let logits = match self.model {
-            Model::Llama(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::Mistral3(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::Phi2(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::XLoraLlama(ref model) => model.forward(
+            ModelVariant::XLoraLlama(ref model) => model.forward(
                 &input_ids,
                 input_ids_full.as_ref().unwrap_or(&input_ids),
                 &seqlen_offsets,
@@ -950,60 +1043,7 @@ impl Pipeline for GGUFPipeline {
                 &flash_meta,
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
-            Model::Phi3(ref model) => {
-                // Pipeline parallelism: receive activation from previous stage if not first stage
-                let received = if let Some(hook) = model.get_hook() {
-                    hook.receive_stage_input(request_id)?
-                } else {
-                    None
-                };
-
-                // For TAIL stages, use received activation
-                // Position derived from cache (stream cursor model)
-                // Cache lifecycle (reset vs continue) is handled by the engine via CacheInstruction.
-                let input_activation: Option<&Tensor> = match &received {
-                    Some(ActivationResult::Data { tensor }) => Some(tensor),
-                    Some(ActivationResult::Completed { reason }) => {
-                        return Ok(ForwardInputsResult::PipelineCompleted { reason: *reason });
-                    }
-                    None => None,
-                };
-
-                let output = model.forward(
-                    &input_ids,
-                    input_activation,
-                    input_ids_full.as_ref(),
-                    &seqlen_offsets,
-                    paged_attn_meta,
-                    request_id,
-                )?;
-
-                // Pipeline parallelism flow (same as Qwen3)
-                if let Some(hook) = model.get_hook() {
-                    if !hook.is_last_stage() {
-                        let tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
-                        let sequence_position = seqlen_offsets.first().copied().unwrap_or(0);
-                        hook.send_stage_output(&output, &tokens, request_id, sequence_position)?;
-
-                        if hook.needs_external_logits() {
-                            let logits = hook.receive_response_logits()?;
-                            let logits_3d = logits.unsqueeze(1)?;
-                            if return_raw_logits {
-                                return Ok(ForwardInputsResult::RawLogits { logits: logits_3d });
-                            } else {
-                                return Ok(ForwardInputsResult::CausalGeneration { logits: logits_3d });
-                            }
-                        }
-
-                        return Err(candle_core::Error::Msg(
-                            "Middle stage in PP should not reach here".to_string()
-                        ));
-                    }
-                }
-
-                output
-            }
-            Model::XLoraPhi3(ref model) => model.forward(
+            ModelVariant::XLoraPhi3(ref model) => model.forward(
                 &input_ids,
                 input_ids_full.as_ref().unwrap_or(&input_ids),
                 &seqlen_offsets,
@@ -1014,159 +1054,9 @@ impl Pipeline for GGUFPipeline {
                 &flash_meta,
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
-            Model::Starcoder2(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
-            }
-            Model::Qwen(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
-            }
-            Model::Qwen3(ref model) => {
-                // ====================================================================
-                // Pipeline Parallelism using TransformerModel trait
-                // ====================================================================
-                //
-                // Clean abstraction: embed → transform → lm_head
-                // - HEAD: embed(tokens) → transform(hidden) → send to TAIL
-                // - TAIL: receive → transform(hidden) → lm_head(hidden) → return logits
-                //
-                // No more "input_activation" hack - each stage calls the methods it needs.
-
-                // Step 1: Receive activation from previous stage (if TAIL)
-                let received = if let Some(hook) = model.get_hook() {
-                    hook.receive_stage_input(request_id)?
-                } else {
-                    None
-                };
-
-                // Handle completion signal from HEAD
-                if let Some(ActivationResult::Completed { reason }) = &received {
-                    return Ok(ForwardInputsResult::PipelineCompleted { reason: *reason });
-                }
-
-                // Step 2: Determine hidden states and position
-                // Position comes from cache (stream cursor model) - no metadata needed.
-                // Cache lifecycle (reset vs continue) is handled by the engine via CacheInstruction.
-                // Track activation info for PP TAIL state machine.
-                let (hidden, position_offset, effective_context_lens, tail_activation_info) = match &received {
-                    Some(ActivationResult::Data { tensor }) => {
-                        // TAIL stage: use received activation
-                        // Position from stream cursor: cache.current_seq_len() is where we are.
-                        let cache = model.cache.normal();
-                        let cache_position = cache.0.first().map(|kv| kv.current_seq_len()).unwrap_or(0);
-                        drop(cache);
-
-                        let seq_len = tensor.dims()[1];
-                        let ctx_lens = vec![(0, seq_len)];
-
-                        tracing::debug!(
-                            ?request_id,
-                            seq_len,
-                            cache_position,
-                            "PP TAIL: Using received activation"
-                        );
-
-                        // Capture activation info for InferenceStep computation
-                        (tensor.clone(), cache_position, ctx_lens, Some((seq_len, cache_position)))
-                    }
-                    _ => {
-                        // HEAD stage or no PP: compute embeddings locally
-                        let hidden = model.embed(&input_ids)?;
-                        let position_offset = seqlen_offsets.first().copied().unwrap_or(0);
-
-                        tracing::debug!(
-                            ?request_id,
-                            position_offset,
-                            hidden_shape = ?hidden.shape(),
-                            "PP HEAD: Computed embeddings"
-                        );
-
-                        (hidden, position_offset, context_lens.clone(), None)
-                    }
-                };
-
-                // Step 3: Build transform context
-                let paged_attn_ctx = paged_attn_meta.map(|(kv_cache, metadata)| {
-                    PagedAttentionContext { kv_cache, metadata }
-                });
-                let ctx = TransformContext {
-                    seq_len: hidden.dims()[1],
-                    position_offset,
-                    paged_attn: paged_attn_ctx.as_ref(),
-                };
-
-                // Step 4: Transform through layers
-                let hidden = model.transform(hidden, &ctx)?;
-
-                tracing::debug!(
-                    ?request_id,
-                    hidden_shape = ?hidden.shape(),
-                    "PP: After transform"
-                );
-
-                // Step 5: Route based on pipeline stage
-                if let Some(hook) = model.get_hook() {
-                    if !model.has_lm_head() {
-                        // HEAD stage: send hidden to TAIL, wait for logits
-                        let tokens: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
-                        let sequence_position = seqlen_offsets.first().copied().unwrap_or(0);
-
-                        tracing::debug!(
-                            ?request_id,
-                            hidden_shape = ?hidden.shape(),
-                            num_tokens = tokens.len(),
-                            "PP HEAD: Sending to next stage"
-                        );
-
-                        hook.send_stage_output(&hidden, &tokens, request_id, sequence_position)?;
-
-                        if hook.needs_external_logits() {
-                            let logits = hook.receive_response_logits()?;
-                            let logits_3d = logits.unsqueeze(1)?;
-                            if return_raw_logits {
-                                return Ok(ForwardInputsResult::RawLogits { logits: logits_3d });
-                            } else {
-                                return Ok(ForwardInputsResult::CausalGeneration { logits: logits_3d });
-                            }
-                        }
-
-                        return Err(candle_core::Error::Msg(
-                            "HEAD stage without external logits should not reach here".to_string()
-                        ));
-                    }
-                }
-
-                // TAIL stage or no PP: apply lm_head
-                let logits = model.lm_head(hidden)?;
-                let logits = crate::pipeline::extract_logits(&logits, effective_context_lens)?;
-
-                // For PP TAIL: return PipelineLogits with InferenceStep computed from activation shape
-                if let Some((activation_seq_len, cache_position)) = tail_activation_info {
-                    use crate::pipeline::text_models_inputs_processor::InferenceStep;
-                    // Get total_prompt_tokens from the inference_step we received
-                    let total_prompt_tokens = match &inference_step {
-                        InferenceStep::Prefill { total_prompt_tokens, .. } => *total_prompt_tokens,
-                        InferenceStep::Decode { position, .. } => *position, // fallback
-                    };
-                    let corrected_step = InferenceStep::from_activation_shape(
-                        activation_seq_len,
-                        cache_position,
-                        total_prompt_tokens,
-                    );
-                    tracing::debug!(
-                        ?request_id,
-                        ?corrected_step,
-                        "PP TAIL: Returning PipelineLogits with InferenceStep"
-                    );
-                    return Ok(ForwardInputsResult::PipelineLogits {
-                        logits,
-                        inference_step: corrected_step,
-                    });
-                }
-
-                logits
-            }
-            Model::Qwen3MoE(ref model) => {
-                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta, request_id)?
+            // TransformerModel handled in unified path above
+            ModelVariant::Transformer(_) => {
+                unreachable!("TransformerModel handled in unified path above")
             }
         };
         if return_raw_logits {
@@ -1189,10 +1079,10 @@ impl Pipeline for GGUFPipeline {
         ModelCategory::Text
     }
     fn set_hook(&mut self, hook: HookContainer) {
-        self.model.set_hook(hook);
+        self.hook = Some(hook);
     }
     fn supports_hooks(&self) -> bool {
-        self.model.supports_hooks()
+        true // Pipeline always supports hooks
     }
 }
 
