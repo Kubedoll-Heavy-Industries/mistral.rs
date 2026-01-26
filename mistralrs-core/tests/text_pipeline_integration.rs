@@ -341,7 +341,7 @@ fn test_builder_from_paths() {
 
     println!("Testing CausalLMLoaderBuilder with model: {:?}", model_path);
 
-    let pipeline = CausalLMLoaderBuilder::from_paths(&[&model_path])
+    let pipeline = CausalLMLoaderBuilder::from_gguf_paths(&[&model_path])
         .with_device(Device::Cpu)
         .with_dtype(DType::F32)
         .silent()
@@ -370,7 +370,7 @@ fn test_builder_with_layer_range() {
     let mid = total_layers / 2;
     println!("Loading layers 0..{}", mid);
 
-    let result = CausalLMLoaderBuilder::from_paths(&[&model_path])
+    let result = CausalLMLoaderBuilder::from_gguf_paths(&[&model_path])
         .with_device(Device::Cpu)
         .with_dtype(DType::F32)
         .with_layer_range(0..mid)
@@ -389,13 +389,13 @@ fn test_builder_with_layer_range() {
 }
 
 #[test]
-fn test_builder_from_hf() {
+fn test_builder_from_hf_gguf() {
     // This test downloads from HuggingFace Hub
     // Using the same small model as other tests
 
-    println!("Testing CausalLMLoaderBuilder::from_hf()");
+    println!("Testing CausalLMLoaderBuilder::from_hf_gguf()");
 
-    let pipeline = CausalLMLoaderBuilder::from_hf(
+    let pipeline = CausalLMLoaderBuilder::from_hf_gguf(
         DEFAULT_MODEL_REPO,
         &[DEFAULT_MODEL_FILE],
     )
@@ -416,7 +416,7 @@ fn test_builder_build_async() {
 
     println!("Testing CausalLMLoaderBuilder::build_async()");
 
-    let pipeline = CausalLMLoaderBuilder::from_paths(&[&model_path])
+    let pipeline = CausalLMLoaderBuilder::from_gguf_paths(&[&model_path])
         .with_device(Device::Cpu)
         .with_dtype(DType::F32)
         .silent()
