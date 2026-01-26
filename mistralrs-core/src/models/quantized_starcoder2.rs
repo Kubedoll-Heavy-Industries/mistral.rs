@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use candle_core::quantized::QTensor;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, LayerNorm, Module};
-use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
+use mistralrs_quant::QuantMethod;
 
+use crate::attention::PositionEncoding;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{
@@ -17,6 +17,7 @@ use crate::layers::{
 use crate::layers_masker::PastKvLenCache;
 use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
+use crate::pipeline::loaders::{GgufNaming, GgufWeightSource, TensorNaming, WeightSource};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
 use crate::utils::gguf_metadata::ContentMetadata;
@@ -30,12 +31,6 @@ use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 /// - `CausalAttention` for attention (with RoPE)
 /// - `NonGatedMlp` for feed-forward (GELU, non-gated)
 type StarCoder2Block = TransformerBlock<LayerNorm, CausalAttention, NonGatedMlp>;
-
-fn layer_norm(w: QTensor, b: QTensor, eps: f64) -> Result<LayerNorm> {
-    let w = w.dequantize(&w.device())?;
-    let b = b.dequantize(&b.device())?;
-    Ok(LayerNorm::new(w, b, eps))
-}
 
 pub struct ModelWeights {
     tok_embeddings: Embedding,
@@ -118,7 +113,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             rope_freq_base,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
-        // Determine layer range for partial loading (pipeline parallelism)
+        // Determine layer range for pipeline parallelism
         let layer_range = layer_range.unwrap_or(0..block_count);
         let layer_start = layer_range.start;
         let layer_end = layer_range.end.min(block_count);
@@ -131,37 +126,39 @@ impl ModelConfig::FromGGUF for ModelWeights {
             );
         }
 
-        let tok_embeddings = ct.tensor("token_embd.weight", device)?;
-        let tok_embeddings = tok_embeddings.dequantize(device)?;
         let head_dim = embedding_length / head_count;
 
-        let output_norm = layer_norm(
-            ct.tensor("output_norm.weight", device)?,
-            ct.tensor("output_norm.bias", device)?,
-            layer_norm_epsilon,
-        )?;
-        let output = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-            q_weight: Arc::new(ct.tensor("output.weight", device)?),
-            b: None,
-        })?);
+        // Create weight source and naming
+        let mut weights = GgufWeightSource::new(&mut ct);
+        let naming = GgufNaming;
 
-        // Create RoPE embeddings for loaded layers
-        let mut ropes = HashMap::new();
+        // Load embedding and output weights
+        let tok_embeddings = weights.load_embedding(
+            &naming.token_embd(),
+            0, // vocab_size inferred from tensor
+            embedding_length,
+            device,
+        )?;
+        let output_norm = weights.load_layer_norm("output_norm", layer_norm_epsilon, device)?;
+        let output = weights.load_linear(&naming.output(), device)?;
+
+        // Create RoPE embeddings per device
+        let mut ropes: HashMap<candle_core::DeviceLocation, Arc<RotaryEmbedding>> = HashMap::new();
         for layer_idx in layer_start..layer_end {
-            let device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            ropes.insert(
-                device.location(),
-                Arc::new(RotaryEmbedding::new(
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            if let std::collections::hash_map::Entry::Vacant(e) = ropes.entry(layer_device.location()) {
+                e.insert(Arc::new(RotaryEmbedding::new(
                     rope_freq_base,
                     head_dim,
                     context_window,
-                    device,
+                    layer_device,
                     true,
                     dtype,
-                )?),
-            );
+                )?));
+            }
         }
 
+        // Load transformer layers
         let mut layers = Vec::with_capacity(num_loaded_layers);
 
         for layer_idx in NiceProgressBar::<_, 'b'>(
@@ -169,63 +166,26 @@ impl ModelConfig::FromGGUF for ModelWeights {
             "Loading repeating layers",
             &new_multi_progress(),
         ) {
-            let prefix = format!("blk.{layer_idx}");
-            let device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
             let rotary = ropes
-                .get(&device.location())
+                .get(&layer_device.location())
                 .expect("No RoPE for device location!")
                 .clone();
 
-            // Helper to load optional bias and dequantize
-            let load_bias = |ct: &mut Content<'_, R>, name: &str| -> Result<Option<Tensor>> {
-                match ct.tensor(name, device) {
-                    Ok(qt) => Ok(Some(qt.dequantize(device)?)),
-                    Err(_) => Ok(None),
-                }
-            };
+            // Load attention projections with optional biases (Starcoder2 uses biases)
+            let q_proj = weights.load_linear_with_optional_bias(&naming.attn_q(layer_idx), layer_device)?;
+            let k_proj = weights.load_linear_with_optional_bias(&naming.attn_k(layer_idx), layer_device)?;
+            let v_proj = weights.load_linear_with_optional_bias(&naming.attn_v(layer_idx), layer_device)?;
+            let o_proj = weights.load_linear_with_optional_bias(&naming.attn_output(layer_idx), layer_device)?;
 
-            // Attention projections
-            let q_proj: Arc<dyn QuantMethod> = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_q.weight"), device)?),
-                b: load_bias(&mut ct, &format!("{prefix}.attn_q.bias"))?,
-            })?);
-            let k_proj: Arc<dyn QuantMethod> = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_k.weight"), device)?),
-                b: load_bias(&mut ct, &format!("{prefix}.attn_k.bias"))?,
-            })?);
-            let v_proj: Arc<dyn QuantMethod> = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_v.weight"), device)?),
-                b: load_bias(&mut ct, &format!("{prefix}.attn_v.bias"))?,
-            })?);
-            let o_proj: Arc<dyn QuantMethod> = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_output.weight"), device)?),
-                b: load_bias(&mut ct, &format!("{prefix}.attn_output.bias"))?,
-            })?);
+            // Load MLP weights with optional biases
+            let up_proj = weights.load_linear_with_optional_bias(&naming.ffn_up(layer_idx), layer_device)?;
+            let down_proj = weights.load_linear_with_optional_bias(&naming.ffn_down(layer_idx), layer_device)?;
+            let mlp = NonGatedMlp::from_weights(up_proj, down_proj, Activation::GeluPytorchTanh);
 
-            // MLP weights
-            let mlp = NonGatedMlp::from_weights(
-                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?),
-                    b: load_bias(&mut ct, &format!("{prefix}.ffn_up.bias"))?,
-                })?),
-                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?),
-                    b: load_bias(&mut ct, &format!("{prefix}.ffn_down.bias"))?,
-                })?),
-                Activation::GeluPytorchTanh,
-            );
-
-            // Layer norms
-            let attn_norm = layer_norm(
-                ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?,
-                ct.tensor(&format!("{prefix}.attn_norm.bias"), device)?,
-                layer_norm_epsilon,
-            )?;
-            let ffn_norm = layer_norm(
-                ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?,
-                ct.tensor(&format!("{prefix}.ffn_norm.bias"), device)?,
-                layer_norm_epsilon,
-            )?;
+            // Load LayerNorms (Starcoder2 uses LayerNorm, not RmsNorm)
+            let attn_norm = weights.load_layer_norm(&naming.attn_norm(layer_idx).replace(".weight", ""), layer_norm_epsilon, layer_device)?;
+            let ffn_norm = weights.load_layer_norm(&naming.ffn_norm(layer_idx).replace(".weight", ""), layer_norm_epsilon, layer_device)?;
 
             // Build CausalAttention
             let attn_config = AttentionConfig::new(head_count, head_count_kv, head_dim);
@@ -235,19 +195,19 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 k_proj,
                 v_proj,
                 o_proj,
-                rotary.clone() as Arc<dyn crate::attention::PositionEncoding>,
+                rotary.clone() as Arc<dyn PositionEncoding>,
             )
             .with_attn_dtype(dtype);
 
             if let AttentionImplementation::PagedAttention = &attention_mechanism {
-                attention = attention.with_paged_attn(PagedAttention::new(head_dim, device, None)?);
+                attention = attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
             }
 
             layers.push(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp));
         }
 
         Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings,
             layers,
             output_norm,
             output,
