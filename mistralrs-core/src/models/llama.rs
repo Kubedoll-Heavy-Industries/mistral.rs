@@ -30,7 +30,7 @@ use crate::{
         RmsNorm, RotaryEmbedding, Sdpa,
     },
     layers_masker::PastKvLenCache,
-    models::{LanguageModel, LlamaConfig, Model, TransformContext, TransformerModel},
+    models::{LanguageModel, LanguageModelConfig, Model, TransformContext, TransformerModel},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -81,7 +81,7 @@ pub struct Config {
     pub tie_word_embeddings: bool,
 }
 
-impl LlamaConfig for Config {
+impl crate::models::LanguageModelConfig for Config {
     fn hidden_size(&self) -> usize {
         self.hidden_size
     }
@@ -431,6 +431,8 @@ impl<P: PositionEncoding + Send + Sync> Llama<P> {
             seq_len,
             position_offset,
             paged_attn: paged_attn_ctx.as_ref(),
+            flash_params: None,
+            position_ids: None,
         };
 
         // Transform through layers

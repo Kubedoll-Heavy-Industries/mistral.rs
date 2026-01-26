@@ -241,7 +241,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
             head_count_kv,
             block_count,
             embedding_length,
-            i_size,
+            intermediate_size: i_size,
             rope_dim,
             rms_eps,
             context_window,

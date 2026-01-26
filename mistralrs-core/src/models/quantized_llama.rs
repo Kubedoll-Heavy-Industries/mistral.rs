@@ -378,9 +378,9 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
     }
 }
 
-use crate::models::LlamaConfig;
+use crate::models::LanguageModelConfig;
 
-impl LlamaConfig for PropsGGUF {
+impl LanguageModelConfig for PropsGGUF {
     fn hidden_size(&self) -> usize {
         self.embedding_length
     }

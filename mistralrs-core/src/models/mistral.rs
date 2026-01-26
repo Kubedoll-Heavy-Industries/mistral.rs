@@ -20,7 +20,7 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, HookContainer, IsqModel, KvCache, NormalCache, NormalLoadingMetadata,
+        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata,
         NormalModel,
     },
     serde_default_fn,
@@ -381,8 +381,6 @@ pub struct Model {
     max_seq_len: usize,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     cfg: ModelConfigMetadata,
-    /// Pipeline hook for distributed inference.
-    hook: Option<HookContainer>,
     /// Starting layer index for partial layer loading (pipeline parallelism).
     /// When Some, only layers [layer_start..layer_start+layers.len()) are loaded.
     layer_start: usize,
@@ -553,7 +551,6 @@ impl Model {
                 v_head_dim: cfg.head_dim(),
             },
             mapper,
-            hook: None,
             layer_start,
             total_layers,
         })
@@ -758,15 +755,7 @@ impl NormalModel for Model {
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg
     }
-    fn set_hook(&mut self, hook: HookContainer) {
-        self.hook = Some(hook);
-    }
-    fn get_hook(&self) -> Option<&HookContainer> {
-        self.hook.as_ref()
-    }
-    fn supports_hooks(&self) -> bool {
-        true
-    }
+    // Hook methods use default implementations - hooks belong in pipelines, not models
 }
 
 impl AnyMoeBaseModelMixin for Model {
