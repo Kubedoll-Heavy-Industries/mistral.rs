@@ -216,6 +216,8 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
             seq_len: hidden.dims()[1],
             position_offset,
             paged_attn: paged_attn_ctx.as_ref(),
+            flash_params: None,
+            position_ids: None,
         };
 
         // Transform through layers - MONOMORPHIZED, zero vtable overhead

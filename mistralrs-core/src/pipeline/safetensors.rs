@@ -1276,6 +1276,8 @@ impl Pipeline for SafetensorsPipeline {
                         seq_len,
                         position_offset,
                         paged_attn: paged_attn_ctx.as_ref(),
+                        flash_params: None,
+                        position_ids: None,
                     };
                     let activation = self.model.transform(activation, &transform_ctx)?;
 

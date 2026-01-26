@@ -181,6 +181,8 @@ impl TextGenerationPipeline {
             seq_len: hidden.dims()[1],
             position_offset,
             paged_attn: paged_attn_ctx.as_ref(),
+            flash_params: None,
+            position_ids: None,
         };
 
         // Step 3: Transform through our layers

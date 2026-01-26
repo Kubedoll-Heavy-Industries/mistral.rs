@@ -559,6 +559,8 @@ impl Pipeline for GGMLPipeline {
                 seq_len: input_ids.dims()[1],
                 position_offset,
                 paged_attn: None, // GGML doesn't support paged attention
+                flash_params: None,
+                position_ids: None,
             };
 
             let hidden = model.embed(&input_ids)?;
