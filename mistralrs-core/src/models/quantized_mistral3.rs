@@ -16,25 +16,156 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Embedding, Module};
-use mistralrs_quant::QuantMethod;
+use mistralrs_quant::{QuantMethod, QuantizedConfig, ShardedVarBuilder};
 
 use crate::attention::PositionEncoding;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, RmsNorm};
+use crate::layers::{Activation, CausalMasker, MatMul, RmsNorm};
 use crate::layers_masker::PastKvLenCache;
 use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::loaders::{
-    load_transformer_layers, GgufNaming, GgufWeightSource, StandardTransformerBlock,
-    TensorNaming, TransformerConfig, WeightSource,
+    load_transformer_from_safetensors, load_transformer_layers, GgufNaming, GgufWeightSource,
+    StandardTransformerBlock, TensorNaming, TransformerConfig, WeightSource,
 };
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
+use crate::serde_default_fn;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
+
+// =============================================================================
+// Safetensors Configuration (JSON config.json)
+// =============================================================================
+
+serde_default_fn!(bool, word_emb_default, false);
+serde_default_fn!(f64, default_rope_theta, 1_000_000.0);
+serde_default_fn!(f32, default_mscale, 0.1);
+
+/// RoPE type for Mistral3 models
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RopeType {
+    #[default]
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "yarn")]
+    Yarn,
+}
+
+/// RoPE scaling parameters for Mistral3 (supports YaRN)
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct RopeScaling {
+    #[serde(default)]
+    pub rope_type: RopeType,
+    pub factor: Option<f32>,
+    pub beta_fast: Option<f32>,
+    pub beta_slow: Option<f32>,
+    pub mscale: Option<f32>,
+    pub original_max_position_embeddings: Option<usize>,
+}
+
+/// Configuration for Mistral3 model loaded from safetensors.
+/// Mirrors the config.json structure from HuggingFace.
+#[derive(Debug, Clone, serde::Deserialize, Default, serde::Serialize)]
+pub struct Config {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub max_position_embeddings: usize,
+    pub sliding_window: Option<usize>,
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f64,
+    pub rms_norm_eps: f64,
+    pub hidden_act: Activation,
+    pub head_dim: Option<usize>,
+    pub rope_scaling: Option<RopeScaling>,
+    pub quantization_config: Option<QuantizedConfig>,
+    #[serde(default = "word_emb_default")]
+    pub tie_word_embeddings: bool,
+}
+
+impl Config {
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Get YarnConfig from rope_scaling if present and type is yarn
+    pub fn yarn_config(&self) -> Option<YarnConfig> {
+        self.rope_scaling.as_ref().and_then(|rs| {
+            if matches!(rs.rope_type, RopeType::Yarn) {
+                Some(YarnConfig {
+                    factor: rs.factor.unwrap_or(16.0),
+                    original_max_position_embeddings: rs
+                        .original_max_position_embeddings
+                        .unwrap_or(16384),
+                    beta_fast: rs.beta_fast.unwrap_or(32.0),
+                    beta_slow: rs.beta_slow.unwrap_or(1.0),
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Get mscale coefficient for YaRN
+    pub fn mscale_coefficient(&self) -> f32 {
+        self.rope_scaling
+            .as_ref()
+            .and_then(|rs| rs.mscale)
+            .unwrap_or(0.1)
+    }
+}
+
+impl crate::models::LanguageModelConfig for Config {
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+    fn intermediate_size(&self) -> usize {
+        self.intermediate_size
+    }
+    fn num_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> usize {
+        self.num_attention_heads
+    }
+    fn num_key_value_heads(&self) -> usize {
+        self.num_key_value_heads
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta as f32
+    }
+    fn max_seq_len(&self) -> usize {
+        self.max_position_embeddings
+    }
+    fn hidden_act(&self) -> crate::layers::Activation {
+        self.hidden_act
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+    fn quantization_config(&self) -> Option<&mistralrs_quant::QuantizedConfig> {
+        self.quantization_config.as_ref()
+    }
+}
+
+// =============================================================================
+// YaRN RoPE Configuration and Embedding
+// =============================================================================
 
 /// YaRN RoPE scaling configuration for Mistral3
 #[derive(Debug, Clone)]
@@ -462,9 +593,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
         };
         let output = if is_last_stage {
             Some(if weights.has_tensor(&naming.output()) {
-                weights.load_linear(&naming.output(), device)?
+                weights.load_linear(&naming.output(), config.hidden_size, config.vocab_size, device)?
             } else {
-                weights.load_linear(&naming.token_embd(), device)?
+                weights.load_linear(&naming.token_embd(), config.hidden_size, config.vocab_size, device)?
             })
         } else {
             None
@@ -541,6 +672,110 @@ impl ModelConfig::FromGGUF for ModelWeights {
             output,
             device: device.clone(),
             max_seq_len: config.max_seq_len,
+            mapper: Some(mapper),
+            dtype,
+        })
+    }
+}
+
+// =============================================================================
+// FromSafetensors Implementation
+// =============================================================================
+
+impl ModelConfig::FromSafetensors for ModelWeights {
+    type Config = Config;
+
+    fn from_safetensors(
+        cfg: &Self::Config,
+        vb: ShardedVarBuilder,
+        device: &Device,
+        mapper: Box<dyn DeviceMapper + Send + Sync>,
+        attention_mechanism: AttentionImplementation,
+        dtype: DType,
+        layer_range: Option<std::ops::Range<usize>>,
+    ) -> Result<Self> {
+        // Derived values for YaRN RoPE setup
+        let num_layers = cfg.num_hidden_layers;
+        let head_dim = cfg.head_dim();
+
+        // Determine layer range for YaRN RoPE setup
+        let layer_start = layer_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let layer_end = layer_range
+            .as_ref()
+            .map(|r| r.end.min(num_layers))
+            .unwrap_or(num_layers);
+
+        // Create YaRN RoPE embeddings per device (Mistral3-specific, BEFORE layer loading)
+        let yarn_config = cfg.yarn_config();
+        let mscale_coefficient = cfg.mscale_coefficient();
+        let mut yarn_ropes: HashMap<candle_core::DeviceLocation, Arc<Mistral3RotaryEmbedding>> =
+            HashMap::new();
+        for layer_idx in layer_start..layer_end {
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                yarn_ropes.entry(layer_device.location())
+            {
+                let mut rope = if let Some(ref yarn) = yarn_config {
+                    tracing::info!(
+                        "Using YaRN RoPE scaling for Mistral3: factor={}, beta_fast={}, beta_slow={}, mscale_coefficient={}, head_dim={}",
+                        yarn.factor,
+                        yarn.beta_fast,
+                        yarn.beta_slow,
+                        mscale_coefficient,
+                        head_dim
+                    );
+                    Mistral3RotaryEmbedding::new_yarn(
+                        cfg.rope_theta as f32,
+                        head_dim,
+                        cfg.max_position_embeddings,
+                        yarn,
+                        mscale_coefficient,
+                        dtype,
+                        layer_device,
+                    )?
+                } else {
+                    Mistral3RotaryEmbedding::new_unscaled(
+                        cfg.rope_theta as f32,
+                        head_dim,
+                        cfg.max_position_embeddings,
+                        dtype,
+                        layer_device,
+                    )?
+                };
+                // Set partial rotary flag if rope_dim < head_dim
+                // For safetensors, assume full rotary (rope_dim == head_dim)
+                rope.set_partial(head_dim);
+                e.insert(Arc::new(rope));
+            }
+        }
+
+        // Load transformer with YaRN RoPE customization
+        let loaded = load_transformer_from_safetensors(
+            cfg,
+            TransformerConfig::from_config(cfg),
+            vb,
+            device,
+            &*mapper,
+            attention_mechanism,
+            dtype,
+            layer_range,
+            |ctx, builder, _weights| {
+                // Replace default RoPE with YaRN RoPE for this layer's device
+                let yarn_rope = yarn_ropes
+                    .get(&ctx.device.location())
+                    .expect("No YaRN RoPE for device location!")
+                    .clone();
+                Ok(builder.rope(yarn_rope as Arc<dyn PositionEncoding>))
+            },
+        )?;
+
+        Ok(Self {
+            tok_embeddings: loaded.tok_embeddings,
+            layers: loaded.layers,
+            norm: Some(loaded.output_norm),
+            output: Some(loaded.output),
+            device: device.clone(),
+            max_seq_len: loaded.max_seq_len,
             mapper: Some(mapper),
             dtype,
         })

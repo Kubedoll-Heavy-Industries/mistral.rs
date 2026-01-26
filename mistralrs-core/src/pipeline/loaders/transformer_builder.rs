@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result};
 use candle_nn::{Embedding, LayerNorm};
-use mistralrs_quant::QuantMethod;
+use mistralrs_quant::{QuantMethod, QuantizedConfig, ShardedVarBuilder};
 
 use crate::attention::{AttentionConfig, CausalAttention, PositionEncoding, QkNorm};
 use crate::device_map::DeviceMapper;
@@ -257,6 +257,35 @@ impl TransformerConfig {
         self.use_attention_bias = true;
         self
     }
+
+    /// Create TransformerConfig from any config implementing LanguageModelConfig.
+    ///
+    /// This enables generic loading code that works with any decoder-only transformer
+    /// config struct (Llama, Qwen, Phi, Mistral, etc.).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let transformer_cfg = TransformerConfig::from_config(&config);
+    /// let layers = load_transformer_layers(&transformer_cfg, ...);
+    /// ```
+    pub fn from_config<C: crate::models::LanguageModelConfig>(cfg: &C) -> Self {
+        Self {
+            hidden_size: cfg.hidden_size(),
+            num_heads: cfg.num_attention_heads(),
+            num_kv_heads: cfg.num_key_value_heads(),
+            head_dim: cfg.head_dim(),
+            num_layers: cfg.num_layers(),
+            intermediate_size: cfg.intermediate_size(),
+            vocab_size: cfg.vocab_size(),
+            max_seq_len: cfg.max_seq_len(),
+            rope_theta: cfg.rope_theta(),
+            rms_norm_eps: cfg.rms_norm_eps(),
+            hidden_act: cfg.hidden_act(),
+            tie_word_embeddings: cfg.tie_word_embeddings(),
+            sliding_window: None,
+            use_attention_bias: false,
+        }
+    }
 }
 
 // ============================================================================
@@ -268,17 +297,40 @@ impl TransformerConfig {
 /// This trait provides a uniform interface for loading weights regardless
 /// of the underlying format. Implementations handle format-specific details
 /// like tensor naming conventions and quantization.
+///
+/// # Dimension Parameters
+///
+/// Linear layer methods take `in_dim` and `out_dim` parameters:
+/// - **GGUF**: Dimensions are available in tensor metadata, so these parameters
+///   are not strictly needed. However, they're accepted for API uniformity.
+/// - **Safetensors**: Dimensions are required for weight validation.
+///
+/// This design allows generic code to work with both formats by always
+/// providing dimensions from the model config.
 pub trait WeightSource {
     /// Load a linear layer weight as quantized method.
-    fn load_linear(&mut self, name: &str, device: &Device) -> Result<Arc<dyn QuantMethod>>;
+    ///
+    /// # Arguments
+    /// * `name` - Tensor name
+    /// * `in_dim` - Input dimension (used by safetensors, available but unused by GGUF)
+    /// * `out_dim` - Output dimension (used by safetensors, available but unused by GGUF)
+    /// * `device` - Target device
+    fn load_linear(
+        &mut self,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+        device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>>;
 
     /// Load a linear layer with an optional bias tensor.
     ///
     /// Bias tensor name is derived by replacing `.weight` suffix with `.bias`.
-    /// If the bias tensor exists, it will be dequantized and included in the result.
     fn load_linear_with_optional_bias(
         &mut self,
         weight_name: &str,
+        in_dim: usize,
+        out_dim: usize,
         device: &Device,
     ) -> Result<Arc<dyn QuantMethod>>;
 
@@ -327,7 +379,14 @@ impl<'a, 'c, R: std::io::Seek + std::io::Read> GgufWeightSource<'a, 'c, R> {
 }
 
 impl<R: std::io::Seek + std::io::Read> WeightSource for GgufWeightSource<'_, '_, R> {
-    fn load_linear(&mut self, name: &str, device: &Device) -> Result<Arc<dyn QuantMethod>> {
+    fn load_linear(
+        &mut self,
+        name: &str,
+        _in_dim: usize,
+        _out_dim: usize,
+        device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        // GGUF: dimensions are in tensor metadata, so in_dim/out_dim are unused
         let qtensor = self.content.tensor(name, device)?;
         Ok(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
             q_weight: Arc::new(qtensor),
@@ -338,8 +397,11 @@ impl<R: std::io::Seek + std::io::Read> WeightSource for GgufWeightSource<'_, '_,
     fn load_linear_with_optional_bias(
         &mut self,
         weight_name: &str,
+        _in_dim: usize,
+        _out_dim: usize,
         device: &Device,
     ) -> Result<Arc<dyn QuantMethod>> {
+        // GGUF: dimensions are in tensor metadata, so in_dim/out_dim are unused
         let qtensor = self.content.tensor(weight_name, device)?;
 
         // Derive bias name by replacing `.weight` suffix with `.bias`
@@ -390,6 +452,93 @@ impl<R: std::io::Seek + std::io::Read> WeightSource for GgufWeightSource<'_, '_,
 
     fn has_tensor(&self, name: &str) -> bool {
         self.content.has_tensor(name)
+    }
+}
+
+// ============================================================================
+// Safetensors Weight Source Implementation
+// ============================================================================
+
+use crate::layers::embedding;
+
+/// Safetensors weight source - wraps ShardedVarBuilder for loading from safetensors files.
+///
+/// This weight source supports HuggingFace model format including:
+/// - Standard (unquantized) weights
+/// - Pre-quantized weights (GPTQ, AWQ, etc.) via QuantizedConfig
+pub struct SafetensorsWeightSource<'a> {
+    vb: &'a ShardedVarBuilder,
+    quantization_config: Option<&'a QuantizedConfig>,
+}
+
+impl<'a> SafetensorsWeightSource<'a> {
+    /// Create a new safetensors weight source.
+    ///
+    /// # Arguments
+    /// * `vb` - ShardedVarBuilder pointing to model weights (e.g., `vb.pp("model")`)
+    /// * `quantization_config` - Optional quantization config for pre-quantized models
+    pub fn new(vb: &'a ShardedVarBuilder, quantization_config: Option<&'a QuantizedConfig>) -> Self {
+        Self { vb, quantization_config }
+    }
+}
+
+impl WeightSource for SafetensorsWeightSource<'_> {
+    fn load_linear(
+        &mut self,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+        _device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        // Safetensors: dimensions are required for weight validation
+        mistralrs_quant::linear_no_bias(
+            in_dim,
+            out_dim,
+            &self.quantization_config.cloned(),
+            self.vb.pp(name),
+        )
+    }
+
+    fn load_linear_with_optional_bias(
+        &mut self,
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+        _device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        // Safetensors: try loading with bias, dimensions required for validation
+        mistralrs_quant::linear(
+            in_dim,
+            out_dim,
+            &self.quantization_config.cloned(),
+            self.vb.pp(name),
+        )
+    }
+
+    fn load_embedding(
+        &mut self,
+        name: &str,
+        vocab_size: usize,
+        hidden_size: usize,
+        _device: &Device,
+    ) -> Result<Embedding> {
+        embedding(vocab_size, hidden_size, self.vb.pp(name), &self.quantization_config.cloned())
+    }
+
+    fn load_rms_norm(&mut self, name: &str, eps: f64, _device: &Device) -> Result<RmsNorm> {
+        // Note: hidden_size parameter is ignored for RmsNorm when loading from vb
+        RmsNorm::new(0, eps, self.vb.pp(name))
+    }
+
+    fn load_layer_norm(&mut self, base_name: &str, eps: f64, _device: &Device) -> Result<LayerNorm> {
+        let vb = self.vb.pp(base_name);
+        let weight = vb.get_with_hints((), "weight", Default::default())?;
+        let bias = vb.get_with_hints((), "bias", Default::default())?;
+        Ok(LayerNorm::new(weight, bias, eps))
+    }
+
+    fn has_tensor(&self, name: &str) -> bool {
+        self.vb.contains_tensor(&format!("{name}.weight"))
     }
 }
 
@@ -719,39 +868,55 @@ impl GgufNaming {
 /// Safetensors (HuggingFace) tensor naming convention.
 pub struct SafetensorsNaming;
 
+impl SafetensorsNaming {
+    /// Qwen3-specific: Q norm tensor name
+    /// Note: Relative to "model" prefix (vb.pp("model"))
+    pub fn attn_q_norm(&self, layer_idx: usize) -> String {
+        format!("layers.{layer_idx}.self_attn.q_norm")
+    }
+
+    /// Qwen3-specific: K norm tensor name
+    /// Note: Relative to "model" prefix (vb.pp("model"))
+    pub fn attn_k_norm(&self, layer_idx: usize) -> String {
+        format!("layers.{layer_idx}.self_attn.k_norm")
+    }
+}
+
 impl TensorNaming for SafetensorsNaming {
+    // Note: These names are relative to the "model" prefix, which is added
+    // by the weight source (vb.pp("model")).
     fn attn_q(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.self_attn.q_proj")
+        format!("layers.{layer_idx}.self_attn.q_proj")
     }
     fn attn_k(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.self_attn.k_proj")
+        format!("layers.{layer_idx}.self_attn.k_proj")
     }
     fn attn_v(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.self_attn.v_proj")
+        format!("layers.{layer_idx}.self_attn.v_proj")
     }
     fn attn_output(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.self_attn.o_proj")
+        format!("layers.{layer_idx}.self_attn.o_proj")
     }
     fn ffn_gate(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.mlp.gate_proj")
+        format!("layers.{layer_idx}.mlp.gate_proj")
     }
     fn ffn_up(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.mlp.up_proj")
+        format!("layers.{layer_idx}.mlp.up_proj")
     }
     fn ffn_down(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.mlp.down_proj")
+        format!("layers.{layer_idx}.mlp.down_proj")
     }
     fn attn_norm(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.input_layernorm")
+        format!("layers.{layer_idx}.input_layernorm")
     }
     fn ffn_norm(&self, layer_idx: usize) -> String {
-        format!("model.layers.{layer_idx}.post_attention_layernorm")
+        format!("layers.{layer_idx}.post_attention_layernorm")
     }
     fn token_embd(&self) -> String {
-        "model.embed_tokens".to_string()
+        "embed_tokens".to_string()
     }
     fn output_norm(&self) -> String {
-        "model.norm".to_string()
+        "norm".to_string()
     }
     fn output(&self) -> String {
         "lm_head".to_string()
@@ -878,25 +1043,32 @@ where
             .expect("No RoPE for device location!")
             .clone();
 
-        // Load layer weights
+        // Extract dimensions from config
+        let hidden_size = config.hidden_size;
+        let num_heads = config.num_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let intermediate_size = config.intermediate_size;
+
+        // Load layer weights with dimensions from config
         // Use optional bias loading for Q/K/V if enabled (Qwen2-style)
         let (q_proj, k_proj, v_proj) = if config.use_attention_bias {
             (
-                weights.load_linear_with_optional_bias(&naming.attn_q(layer_idx), layer_device)?,
-                weights.load_linear_with_optional_bias(&naming.attn_k(layer_idx), layer_device)?,
-                weights.load_linear_with_optional_bias(&naming.attn_v(layer_idx), layer_device)?,
+                weights.load_linear_with_optional_bias(&naming.attn_q(layer_idx), hidden_size, num_heads * head_dim, layer_device)?,
+                weights.load_linear_with_optional_bias(&naming.attn_k(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
+                weights.load_linear_with_optional_bias(&naming.attn_v(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
             )
         } else {
             (
-                weights.load_linear(&naming.attn_q(layer_idx), layer_device)?,
-                weights.load_linear(&naming.attn_k(layer_idx), layer_device)?,
-                weights.load_linear(&naming.attn_v(layer_idx), layer_device)?,
+                weights.load_linear(&naming.attn_q(layer_idx), hidden_size, num_heads * head_dim, layer_device)?,
+                weights.load_linear(&naming.attn_k(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
+                weights.load_linear(&naming.attn_v(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
             )
         };
-        let o_proj = weights.load_linear(&naming.attn_output(layer_idx), layer_device)?;
-        let gate_proj = weights.load_linear(&naming.ffn_gate(layer_idx), layer_device)?;
-        let up_proj = weights.load_linear(&naming.ffn_up(layer_idx), layer_device)?;
-        let down_proj = weights.load_linear(&naming.ffn_down(layer_idx), layer_device)?;
+        let o_proj = weights.load_linear(&naming.attn_output(layer_idx), num_heads * head_dim, hidden_size, layer_device)?;
+        let gate_proj = weights.load_linear(&naming.ffn_gate(layer_idx), hidden_size, intermediate_size, layer_device)?;
+        let up_proj = weights.load_linear(&naming.ffn_up(layer_idx), hidden_size, intermediate_size, layer_device)?;
+        let down_proj = weights.load_linear(&naming.ffn_down(layer_idx), intermediate_size, hidden_size, layer_device)?;
         let attn_norm =
             weights.load_rms_norm(&naming.attn_norm(layer_idx), config.rms_norm_eps, layer_device)?;
         let ffn_norm =
@@ -948,6 +1120,317 @@ where
     }
 
     Ok(layers)
+}
+
+// ============================================================================
+// Safetensors Transformer Loading Helper
+// ============================================================================
+
+use mistralrs_quant::ReplicatedLayer;
+
+/// Components loaded from safetensors for a transformer model.
+///
+/// This struct holds the loaded weights for assembly into a model struct.
+/// The model's `FromSafetensors` implementation assembles these into its
+/// concrete type and adds runtime state (device, mapper, dtype).
+pub struct LoadedTransformer {
+    /// Token embedding layer.
+    pub tok_embeddings: Embedding,
+    /// Transformer layers (attention + MLP blocks).
+    pub layers: Vec<StandardTransformerBlock>,
+    /// Output normalization (before LM head).
+    pub output_norm: RmsNorm,
+    /// Output projection (LM head).
+    pub output: Arc<dyn QuantMethod>,
+    /// Maximum sequence length from config.
+    pub max_seq_len: usize,
+}
+
+/// Load a transformer from safetensors format with customization support.
+///
+/// This is the primary helper for implementing `FromSafetensors`. It handles:
+/// - Quantization logging
+/// - Token embeddings
+/// - Transformer layers (with customization)
+/// - Output normalization
+/// - Output projection (with tie_word_embeddings support)
+///
+/// Unlike GGUF loading which uses the `WeightSource` trait (dimensions inferred
+/// from tensor metadata), safetensors loading passes explicit dimensions from config.
+///
+/// # Customization Axes
+///
+/// 1. **`transformer_config`**: Structural customization (attention bias, sliding window)
+///    - Standard: `TransformerConfig::from_config(cfg)`
+///    - Qwen2: `TransformerConfig::from_config(cfg).with_attention_bias()`
+///
+/// 2. **`layer_customizer`**: Per-layer weight customization
+///    - Standard: `|_, builder, _| Ok(builder)` (identity)
+///    - Qwen3: Load Q/K normalization weights
+///    - Mistral3: Inject YaRN RoPE embeddings
+///
+/// # Example
+///
+/// ```ignore
+/// // Standard model (no customization)
+/// impl FromSafetensors for ModelWeights {
+///     fn from_safetensors(cfg: &Config, vb: ShardedVarBuilder, ...) -> Result<Self> {
+///         let loaded = load_transformer_from_safetensors(
+///             cfg,
+///             TransformerConfig::from_config(cfg),
+///             vb, device, &*mapper, attention, dtype, layer_range,
+///             |_, builder, _| Ok(builder),
+///         )?;
+///         Ok(Self { tok_embeddings: loaded.tok_embeddings, layers: loaded.layers, ... })
+///     }
+/// }
+///
+/// // Model with Q/K normalization (Qwen3)
+/// impl FromSafetensors for ModelWeights {
+///     fn from_safetensors(cfg: &Config, vb: ShardedVarBuilder, ...) -> Result<Self> {
+///         let naming = SafetensorsNaming;
+///         let loaded = load_transformer_from_safetensors(
+///             cfg,
+///             TransformerConfig::from_config(cfg),
+///             vb, device, &*mapper, attention, dtype, layer_range,
+///             |ctx, builder, weights| {
+///                 let q_norm = weights.load_rms_norm(&naming.attn_q_norm(ctx.layer_idx), ctx.rms_norm_eps)?;
+///                 let k_norm = weights.load_rms_norm(&naming.attn_k_norm(ctx.layer_idx), ctx.rms_norm_eps)?;
+///                 Ok(builder.with_qk_norm(Arc::new(RmsNormQkNorm::new(q_norm, k_norm))))
+///             },
+///         )?;
+///         Ok(Self { ... })
+///     }
+/// }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn load_transformer_from_safetensors<C, F>(
+    cfg: &C,
+    transformer_config: TransformerConfig,
+    vb: ShardedVarBuilder,
+    device: &Device,
+    mapper: &dyn DeviceMapper,
+    attention_mechanism: AttentionImplementation,
+    dtype: DType,
+    layer_range: Option<Range<usize>>,
+    mut layer_customizer: F,
+) -> Result<LoadedTransformer>
+where
+    C: crate::models::LanguageModelConfig,
+    F: FnMut(
+        LayerCustomizerContext,
+        TransformerLayerBuilder,
+        &mut SafetensorsWeightSource,
+    ) -> Result<TransformerLayerBuilder>,
+{
+    // Log quantization info if present
+    if let Some(quant_cfg) = cfg.quantization_config() {
+        tracing::info!(
+            "Using {} quantization: {}.",
+            quant_cfg.name(),
+            quant_cfg.get_bits_name(&vb)
+        );
+    }
+
+    let vb_m = vb.pp("model");
+    let naming = SafetensorsNaming;
+
+    // Create weight source for customizer access
+    let mut weights = SafetensorsWeightSource::new(&vb_m, cfg.quantization_config());
+
+    // Load embedding weights
+    let tok_embeddings = embedding(
+        cfg.vocab_size(),
+        cfg.hidden_size(),
+        vb_m.pp("embed_tokens"),
+        &cfg.quantization_config().cloned(),
+    )?;
+
+    // Load output norm
+    let output_norm = RmsNorm::new(cfg.hidden_size(), cfg.rms_norm_eps(), vb_m.pp("norm"))?;
+
+    // Load output weights (may be tied to embeddings)
+    let output: Arc<dyn QuantMethod> = if !cfg.tie_word_embeddings() {
+        mistralrs_quant::linear_no_bias(
+            cfg.hidden_size(),
+            cfg.vocab_size(),
+            &cfg.quantization_config().cloned(),
+            vb.pp("lm_head"),
+        )?
+    } else {
+        ReplicatedLayer::from_linear(candle_nn::Linear::new(
+            tok_embeddings.embeddings().clone(),
+            None,
+        ))?
+    };
+
+    // Determine layer range
+    let config = &transformer_config;
+    let layer_start = layer_range.as_ref().map(|r| r.start).unwrap_or(0);
+    let layer_end = layer_range
+        .as_ref()
+        .map(|r| r.end.min(config.num_layers))
+        .unwrap_or(config.num_layers);
+    let num_loaded_layers = layer_end - layer_start;
+
+    if layer_start > 0 || layer_end < config.num_layers {
+        tracing::info!(
+            "Pipeline parallelism: loading layers {}..{} of {} total",
+            layer_start,
+            layer_end,
+            config.num_layers
+        );
+    }
+
+    // Create RoPE embeddings for each device location
+    let mut ropes: HashMap<candle_core::DeviceLocation, Arc<RotaryEmbedding>> = HashMap::new();
+    for layer_idx in layer_start..layer_end {
+        let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+        if let std::collections::hash_map::Entry::Vacant(e) = ropes.entry(layer_device.location()) {
+            e.insert(Arc::new(RotaryEmbedding::new(
+                config.rope_theta,
+                config.head_dim,
+                config.max_seq_len,
+                layer_device,
+                true, // is_gptx
+                DType::F32,
+            )?));
+        }
+    }
+
+    // Extract dimensions from config for loading
+    let hidden_size = config.hidden_size;
+    let num_heads = config.num_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let intermediate_size = config.intermediate_size;
+    let quant_cfg = cfg.quantization_config().cloned();
+
+    // Load transformer layers
+    let mut layers = Vec::with_capacity(num_loaded_layers);
+    let vb_l = vb_m.pp("layers");
+
+    for layer_idx in NiceProgressBar::<_, 'b'>(
+        layer_start..layer_end,
+        "Loading repeating layers",
+        &new_multi_progress(),
+    ) {
+        let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+
+        // Get RoPE for this device
+        let rotary = ropes
+            .get(&layer_device.location())
+            .expect("No RoPE for device location!")
+            .clone();
+
+        let vb_layer = vb_l.pp(layer_idx);
+        let vb_attn = vb_layer.pp("self_attn");
+        let vb_mlp = vb_layer.pp("mlp");
+
+        // Load layer weights with explicit dimensions from config
+        // Use optional bias loading for Q/K/V if enabled (Qwen2-style)
+        let (q_proj, k_proj, v_proj) = if config.use_attention_bias {
+            (
+                mistralrs_quant::linear(hidden_size, num_heads * head_dim, &quant_cfg, vb_attn.pp("q_proj"))?,
+                mistralrs_quant::linear(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("k_proj"))?,
+                mistralrs_quant::linear(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("v_proj"))?,
+            )
+        } else {
+            (
+                mistralrs_quant::linear_no_bias(hidden_size, num_heads * head_dim, &quant_cfg, vb_attn.pp("q_proj"))?,
+                mistralrs_quant::linear_no_bias(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("k_proj"))?,
+                mistralrs_quant::linear_no_bias(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("v_proj"))?,
+            )
+        };
+        let o_proj = mistralrs_quant::linear_no_bias(num_heads * head_dim, hidden_size, &quant_cfg, vb_attn.pp("o_proj"))?;
+
+        // Load MLP weights
+        let gate_proj = mistralrs_quant::linear_no_bias(hidden_size, intermediate_size, &quant_cfg, vb_mlp.pp("gate_proj"))?;
+        let up_proj = mistralrs_quant::linear_no_bias(hidden_size, intermediate_size, &quant_cfg, vb_mlp.pp("up_proj"))?;
+        let down_proj = mistralrs_quant::linear_no_bias(intermediate_size, hidden_size, &quant_cfg, vb_mlp.pp("down_proj"))?;
+
+        // Load normalization layers
+        let attn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(&naming.attn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
+        let ffn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(&naming.ffn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
+
+        // Build layer config
+        let layer_config = LayerConfig::new(
+            config.num_heads,
+            config.num_kv_heads,
+            config.head_dim,
+            config.hidden_act,
+        );
+        let layer_config = if let Some(window) = config.sliding_window {
+            layer_config.with_sliding_window(window)
+        } else {
+            layer_config
+        };
+
+        // Create builder with loaded weights
+        let mut builder = TransformerLayerBuilder::new(layer_config)
+            .q_proj(q_proj)
+            .k_proj(k_proj)
+            .v_proj(v_proj)
+            .o_proj(o_proj)
+            .gate_proj(gate_proj)
+            .up_proj(up_proj)
+            .down_proj(down_proj)
+            .attn_norm(attn_norm)
+            .ffn_norm(ffn_norm)
+            .rope(rotary as Arc<dyn PositionEncoding>)
+            .with_attn_dtype(dtype);
+
+        // Add paged attention if enabled
+        if let AttentionImplementation::PagedAttention = attention_mechanism {
+            builder = builder.with_paged_attn(PagedAttention::new(config.head_dim, layer_device, None)?);
+        }
+
+        // Apply model-specific customization
+        let ctx = LayerCustomizerContext {
+            layer_idx,
+            device: layer_device,
+            rms_norm_eps: config.rms_norm_eps,
+        };
+        builder = layer_customizer(ctx, builder, &mut weights)?;
+
+        // Build the layer
+        layers.push(builder.build()?);
+    }
+
+    Ok(LoadedTransformer {
+        tok_embeddings,
+        layers,
+        output_norm,
+        output,
+        max_seq_len: cfg.max_seq_len(),
+    })
+}
+
+/// Load a standard transformer from safetensors (no customization).
+///
+/// Convenience wrapper for models with standard Llama-like structure.
+/// For models needing customization, use `load_transformer_from_safetensors` directly.
+#[allow(clippy::too_many_arguments)]
+pub fn load_standard_transformer<C: crate::models::LanguageModelConfig>(
+    cfg: &C,
+    vb: ShardedVarBuilder,
+    device: &Device,
+    mapper: &dyn DeviceMapper,
+    attention_mechanism: AttentionImplementation,
+    dtype: DType,
+    layer_range: Option<Range<usize>>,
+) -> Result<LoadedTransformer> {
+    load_transformer_from_safetensors(
+        cfg,
+        TransformerConfig::from_config(cfg),
+        vb,
+        device,
+        mapper,
+        attention_mechanism,
+        dtype,
+        layer_range,
+        |_ctx, builder, _weights| Ok(builder),
+    )
 }
 
 #[cfg(test)]

@@ -15,7 +15,9 @@ use crate::layers::{
     RotaryEmbedding, TransformerBlock,
 };
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
+use crate::models::{
+    LanguageModel, LanguageModelExt, Model, TransformContext, TransformerModel, TransformerModelExt,
+};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::loaders::{GgufNaming, GgufWeightSource, TensorNaming, WeightSource};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -57,6 +59,7 @@ pub(crate) struct PropsGGUF {
     pub head_count_kv: usize,
     pub block_count: usize,
     pub embedding_length: usize,
+    pub intermediate_size: usize,
     pub layer_norm_epsilon: f64,
     pub context_window: usize,
     pub rope_freq_base: f32,
@@ -73,6 +76,7 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             "attention.head_count_kv",
             "block_count",
             "embedding_length",
+            "feed_forward_length",
             "attention.layer_norm_epsilon",
             "context_length",
         ];
@@ -83,6 +87,7 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             head_count_kv: c.get_value::<u32>("attention.head_count_kv")? as usize,
             block_count: c.get_value::<u32>("block_count")? as usize,
             embedding_length: c.get_value::<u32>("embedding_length")? as usize,
+            intermediate_size: c.get_value::<u32>("feed_forward_length")? as usize,
             layer_norm_epsilon: c.get_value::<f32>("attention.layer_norm_epsilon")? as f64,
             context_window: c.get_value::<u32>("context_length")? as usize,
             rope_freq_base: c.get_value("rope.freq_base").ok().unwrap_or(100_000_f32),
@@ -108,6 +113,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             head_count_kv,
             block_count,
             embedding_length,
+            intermediate_size,
             layer_norm_epsilon,
             context_window,
             rope_freq_base,
@@ -139,8 +145,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
             embedding_length,
             device,
         )?;
+        // Get vocab_size from embedding tensor shape (GGUF stores dimensions)
+        let vocab_size = tok_embeddings.embeddings().dim(0)?;
         let output_norm = weights.load_layer_norm("output_norm", layer_norm_epsilon, device)?;
-        let output = weights.load_linear(&naming.output(), device)?;
+        let output = weights.load_linear(&naming.output(), embedding_length, vocab_size, device)?;
 
         // Create RoPE embeddings per device
         let mut ropes: HashMap<candle_core::DeviceLocation, Arc<RotaryEmbedding>> = HashMap::new();
@@ -173,14 +181,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 .clone();
 
             // Load attention projections with optional biases (Starcoder2 uses biases)
-            let q_proj = weights.load_linear_with_optional_bias(&naming.attn_q(layer_idx), layer_device)?;
-            let k_proj = weights.load_linear_with_optional_bias(&naming.attn_k(layer_idx), layer_device)?;
-            let v_proj = weights.load_linear_with_optional_bias(&naming.attn_v(layer_idx), layer_device)?;
-            let o_proj = weights.load_linear_with_optional_bias(&naming.attn_output(layer_idx), layer_device)?;
+            let q_out_dim = head_count * head_dim;
+            let kv_out_dim = head_count_kv * head_dim;
+            let q_proj = weights.load_linear_with_optional_bias(&naming.attn_q(layer_idx), embedding_length, q_out_dim, layer_device)?;
+            let k_proj = weights.load_linear_with_optional_bias(&naming.attn_k(layer_idx), embedding_length, kv_out_dim, layer_device)?;
+            let v_proj = weights.load_linear_with_optional_bias(&naming.attn_v(layer_idx), embedding_length, kv_out_dim, layer_device)?;
+            let o_proj = weights.load_linear_with_optional_bias(&naming.attn_output(layer_idx), q_out_dim, embedding_length, layer_device)?;
 
             // Load MLP weights with optional biases
-            let up_proj = weights.load_linear_with_optional_bias(&naming.ffn_up(layer_idx), layer_device)?;
-            let down_proj = weights.load_linear_with_optional_bias(&naming.ffn_down(layer_idx), layer_device)?;
+            let up_proj = weights.load_linear_with_optional_bias(&naming.ffn_up(layer_idx), embedding_length, intermediate_size, layer_device)?;
+            let down_proj = weights.load_linear_with_optional_bias(&naming.ffn_down(layer_idx), intermediate_size, embedding_length, layer_device)?;
             let mlp = NonGatedMlp::from_weights(up_proj, down_proj, Activation::GeluPytorchTanh);
 
             // Load LayerNorms (Starcoder2 uses LayerNorm, not RmsNorm)
@@ -295,5 +305,38 @@ impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         let x = self.output_norm.forward(&hidden)?;
         MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)
+    }
+}
+
+// Extension trait - accessors and associated types for typed pipelines
+impl TransformerModelExt for ModelWeights {
+    type Layer = StarCoder2Block;
+    type Norm = LayerNorm;
+
+    fn tok_embeddings(&self) -> &Embedding {
+        &self.tok_embeddings
+    }
+
+    fn layers(&self) -> &[Self::Layer] {
+        &self.layers
+    }
+
+    fn output_norm(&self) -> &Self::Norm {
+        &self.output_norm
+    }
+
+    fn mapper(&self) -> Option<&dyn DeviceMapper> {
+        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+    }
+
+    fn model_dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+// Extension trait - output accessor for typed pipelines
+impl LanguageModelExt for ModelWeights {
+    fn output(&self) -> &Arc<dyn QuantMethod> {
+        &self.output
     }
 }

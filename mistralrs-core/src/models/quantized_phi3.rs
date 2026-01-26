@@ -1,163 +1,71 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+//! Phi3 model using the generic transformer infrastructure.
+//!
+//! Uses `TransformerBlock<RmsNorm, FusedQkvCausalAttention, FusedGatedMlp>` composition
+//! to reduce code duplication while handling Phi3's fused weight layout.
+//!
+//! Supports loading from both GGUF and safetensors formats via `FromGGUF` and
+//! `FromSafetensors` traits.
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::attention::SdpaParams;
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
+use candle_nn::{Embedding, Module};
+use mistralrs_quant::{QuantMethod, QuantizedConfig, ReplicatedLayer, ShardedVarBuilder};
+
+use crate::attention::{AttentionConfig, FusedQkvCausalAttention, PositionEncoding};
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, RmsNorm, Sdpa};
-use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
+use crate::layers::{
+    embedding, Activation, CausalMasker, FusedGatedMlp, MatMul, PhiRopeScalingConfig, RmsNorm,
+    RotaryEmbedding, TransformerBlock,
+};
 use crate::layers_masker::PastKvLenCache;
+use crate::models::{
+    LanguageModel, LanguageModelExt, Model, TransformContext, TransformerModel, TransformerModelExt,
+};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
+use crate::pipeline::loaders::{GgufWeightSource, WeightSource};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
+use crate::serde_default_fn;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
-use candle_core::quantized::QMatMul;
-use candle_core::quantized::QTensor;
-use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::Embedding;
-use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 
-#[derive(Clone)]
-struct Mlp {
-    ffn_up: Arc<dyn QuantMethod>,
-    ffn_down: Arc<dyn QuantMethod>,
-    i_size: usize,
-}
+/// A transformer block for Phi3 using fused QKV attention and fused gated MLP.
+///
+/// Uses the generic `TransformerBlock` with:
+/// - `RmsNorm` for normalization
+/// - `FusedQkvCausalAttention` for attention (fused Q+K+V projection)
+/// - `FusedGatedMlp` for feed-forward (fused gate+up projection)
+type Phi3Block = TransformerBlock<RmsNorm, FusedQkvCausalAttention, FusedGatedMlp>;
 
-impl Module for Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let up_states = MatMul.qmethod_matmul(xs, &*self.ffn_up)?;
-        let gate = up_states.narrow(D::Minus1, 0, self.i_size)?;
-        let up_states = up_states.narrow(D::Minus1, self.i_size, self.i_size)?;
-        let up_states =
-            crate::ops::mul_and_act(&gate, &up_states, crate::layers::Activation::Silu)?;
-        MatMul.qmethod_matmul(&up_states, &*self.ffn_down)
-    }
-}
-
-fn rms_norm(w: QTensor, eps: f64) -> Result<RmsNorm> {
-    let w = w.dequantize(&w.device())?;
-    let rms = RmsNorm::from_w(w, eps)?;
-    Ok(rms)
-}
-
-struct LayerWeights {
-    attn_qkv: Arc<dyn QuantMethod>,
-    attn_output: Arc<dyn QuantMethod>,
-    attn_norm: RmsNorm,
-    ffn_norm: RmsNorm,
-    mlp: Mlp,
-    n_head: usize,
-    n_kv_head: usize,
-    head_dim: usize,
-    cos: Tensor,
-    sin: Tensor,
-    paged_attn: Option<PagedAttention>,
-    sdpa_params: SdpaParams,
-    dtype: DType,
-}
-
-impl LayerWeights {
-    fn apply_rotary_emb(&self, xs: &Tensor, seqlen_offsets: &[usize]) -> Result<Tensor> {
-        let (_b_sz, _h, seq_len, _n_embd) = xs.dims4()?;
-        let mut outputs = Vec::new();
-        for (i, offset) in seqlen_offsets.iter().enumerate() {
-            let cos = self.cos.narrow(0, *offset, seq_len)?;
-            let sin = self.sin.narrow(0, *offset, seq_len)?;
-            outputs.push(candle_nn::rotary_emb::rope(
-                &xs.i(i)?.unsqueeze(0)?.contiguous()?,
-                &cos,
-                &sin,
-            )?);
-        }
-        Tensor::cat(&outputs, 0)
-    }
-
-    fn forward_attn(
-        &self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        seqlen_offsets: &[usize],
-        kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
-    ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = x.dims3()?;
-        let qkv = MatMul
-            .qmethod_matmul(x, &*self.attn_qkv)?
-            .to_dtype(self.dtype)?;
-        let query_pos = self.n_head * self.head_dim;
-        let q = qkv.narrow(D::Minus1, 0, query_pos)?;
-        let k = qkv.narrow(D::Minus1, query_pos, self.n_kv_head * self.head_dim)?;
-        let v = qkv.narrow(
-            D::Minus1,
-            query_pos + self.n_kv_head * self.head_dim,
-            self.n_kv_head * self.head_dim,
-        )?;
-
-        let (q, k, v) = if seq_len != 1 {
-            let q = q
-                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v.contiguous()?)
-        } else {
-            let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            (q, k, v)
-        };
-
-        let q = self.apply_rotary_emb(&q, seqlen_offsets)?;
-        let k = self.apply_rotary_emb(&k, seqlen_offsets)?;
-        let y = match &self.paged_attn {
-            Some(paged_attn) => {
-                let ((key_cache, value_cache), input_metadata) = metadata.unwrap();
-                paged_attn.forward(
-                    &q,
-                    &k,
-                    &v,
-                    mask,
-                    Some(key_cache),
-                    Some(value_cache),
-                    input_metadata,
-                    &self.sdpa_params,
-                    None,
-                )?
-            }
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
-            }
-        };
-
-        let y = if mask.is_some() {
-            y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
-        } else {
-            y.reshape((b_sz, seq_len, ()))?
-        };
-        let y = MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attn_output)?;
-        Ok(y)
-    }
-}
-
+/// Phi3 model weights implementing `LanguageModel` trait.
+///
+/// This is the canonical Phi3 implementation that can be loaded from either:
+/// - **GGUF format**: via `FromGGUF` trait (llama.cpp quantized models)
+/// - **Safetensors format**: via `FromSafetensors` trait (HuggingFace models)
+///
+/// The model is stateless - the KV cache is passed into `transform()` from the pipeline.
+///
+/// # Features
+/// - Pipeline parallelism support (layer range loading)
+/// - Paged attention support
+/// - Device mapping for multi-GPU
+/// - Sliding window attention
 pub struct ModelWeights {
-    pub tok_embeddings: Embedding,
-    layers: Vec<LayerWeights>,
+    tok_embeddings: Embedding,
+    layers: Vec<Phi3Block>,
     output_norm: RmsNorm,
-    output: QMatMul,
+    output: Arc<dyn QuantMethod>,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     pub device: Device,
     pub max_seq_len: usize,
     dtype: DType,
+    n_heads: usize,
 }
 
 impl ModelWeights {
@@ -167,36 +75,14 @@ impl ModelWeights {
     }
 }
 
-fn precomput_freqs_cis(
-    head_dim: usize,
-    freq_base: f32,
-    device: &Device,
-    context_window: usize,
-    dtype: DType,
-) -> Result<(Tensor, Tensor)> {
-    let theta: Vec<_> = (0..head_dim)
-        .step_by(2)
-        .map(|i| 1f32 / freq_base.powf(i as f32 / head_dim as f32))
-        .collect();
-    let theta = Tensor::new(theta.as_slice(), device)?;
-    let idx_theta = Tensor::arange(0, context_window as u32, device)?
-        .to_dtype(DType::F32)?
-        .reshape((context_window, 1))?
-        .matmul(&theta.reshape((1, theta.elem_count()))?)?;
-    let cos = idx_theta.cos()?.to_dtype(dtype)?;
-    let sin = idx_theta.sin()?.to_dtype(dtype)?;
-    Ok((cos, sin))
-}
-
 // phi3 `llm` fields:
 // https://github.com/ggerganov/ggml/blob/master/docs/gguf.md#llm
-// NOTE: Types here do not match spec
 pub(crate) struct PropsGGUF {
     pub head_count: usize,
     pub head_count_kv: usize,
     pub block_count: usize,
     pub embedding_length: usize,
-    pub i_size: usize,
+    pub intermediate_size: usize,
     pub rope_dim: usize,
     pub rms_eps: f64,
     pub context_window: usize,
@@ -220,22 +106,291 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
         ];
         c.has_required_keys(&required)?;
 
-        // NOTE: Values are not aligned with GGUFv3 types
-        // TODO: Normalize value types to spec
-        let props = Self {
+        Ok(Self {
             head_count: c.get_value::<u32>("attention.head_count")? as usize,
             head_count_kv: c.get_value::<u32>("attention.head_count_kv")? as usize,
             block_count: c.get_value::<u32>("block_count")? as usize,
             embedding_length: c.get_value::<u32>("embedding_length")? as usize,
-            i_size: c.get_value::<u32>("feed_forward_length")? as usize,
+            intermediate_size: c.get_value::<u32>("feed_forward_length")? as usize,
             rope_dim: c.get_value::<u32>("rope.dimension_count")? as usize,
             rms_eps: c.get_value::<f32>("attention.layer_norm_rms_epsilon")? as f64,
             context_window: c.get_value::<u32>("context_length")? as usize,
-        };
-
-        Ok(props)
+        })
     }
 }
+
+// =============================================================================
+// Safetensors Configuration (JSON config.json)
+// =============================================================================
+
+serde_default_fn!(bool, word_emb_default, false);
+
+/// Configuration for Phi3 model loaded from safetensors.
+/// Mirrors the config.json structure from HuggingFace.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+pub struct Config {
+    pub vocab_size: usize,
+    pub hidden_act: Activation,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub bos_token_id: Option<u32>,
+    pub eos_token_id: Option<u32>,
+    pub rope_scaling: Option<PhiRopeScalingConfig>,
+    pub max_position_embeddings: usize,
+    pub sliding_window: Option<usize>,
+    pub original_max_position_embeddings: usize,
+    pub quantization_config: Option<QuantizedConfig>,
+    #[serde(default = "word_emb_default")]
+    pub tie_word_embeddings: bool,
+    pub partial_rotary_factor: Option<f64>,
+}
+
+impl Config {
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
+}
+
+impl crate::models::LanguageModelConfig for Config {
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+    fn intermediate_size(&self) -> usize {
+        self.intermediate_size
+    }
+    fn num_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> usize {
+        self.num_attention_heads
+    }
+    fn num_key_value_heads(&self) -> usize {
+        self.num_key_value_heads
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta as f32
+    }
+    fn max_seq_len(&self) -> usize {
+        self.max_position_embeddings
+    }
+    fn hidden_act(&self) -> crate::layers::Activation {
+        self.hidden_act
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+    fn quantization_config(&self) -> Option<&mistralrs_quant::QuantizedConfig> {
+        self.quantization_config.as_ref()
+    }
+}
+
+// =============================================================================
+// FromSafetensors Implementation
+// =============================================================================
+
+impl ModelConfig::FromSafetensors for ModelWeights {
+    type Config = Config;
+
+    fn from_safetensors(
+        cfg: &Self::Config,
+        vb: ShardedVarBuilder,
+        device: &Device,
+        mapper: Box<dyn DeviceMapper + Send + Sync>,
+        attention_mechanism: AttentionImplementation,
+        dtype: DType,
+        layer_range: Option<std::ops::Range<usize>>,
+    ) -> Result<Self> {
+        if let Some(ref quant_cfg) = &cfg.quantization_config {
+            tracing::info!(
+                "Using {} quantization: {}.",
+                quant_cfg.name(),
+                quant_cfg.get_bits_name(&vb)
+            );
+        }
+
+        let head_dim = cfg.head_dim();
+        let num_layers = cfg.num_hidden_layers;
+
+        // Determine layer range for pipeline parallelism
+        let layer_range = layer_range.unwrap_or(0..num_layers);
+        let layer_start = layer_range.start;
+        let layer_end = layer_range.end.min(num_layers);
+        let num_loaded_layers = layer_end - layer_start;
+
+        if layer_start > 0 || layer_end < num_layers {
+            tracing::info!(
+                "Pipeline parallelism: loading layers {}..{} of {} total",
+                layer_start,
+                layer_end,
+                num_layers
+            );
+        }
+
+        let vb_m = vb.pp("model");
+
+        // Load embeddings
+        let tok_embeddings = embedding(
+            cfg.vocab_size,
+            cfg.hidden_size,
+            vb_m.pp("embed_tokens"),
+            &cfg.quantization_config,
+        )?;
+
+        // Create RotaryEmbedding per device
+        // Note: Using simple RoPE. For complex scaling (YaRN, etc.), extend this.
+        let rope_dim = head_dim; // Phi3 uses full head_dim for RoPE
+        let max_seq_len = cfg.sliding_window.unwrap_or(cfg.max_position_embeddings);
+        let mut ropes: HashMap<candle_core::DeviceLocation, Arc<RotaryEmbedding>> = HashMap::new();
+        for layer_idx in layer_start..layer_end {
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                ropes.entry(layer_device.location())
+            {
+                e.insert(Arc::new(RotaryEmbedding::new(
+                    cfg.rope_theta as f32,
+                    rope_dim,
+                    max_seq_len,
+                    layer_device,
+                    true, // is_gpt_neox style
+                    dtype,
+                )?));
+            }
+        }
+
+        // Load transformer layers
+        let vb_l = vb_m.pp("layers");
+        let mut layers = Vec::with_capacity(num_loaded_layers);
+
+        for layer_idx in NiceProgressBar::<_, 'b'>(
+            layer_start..layer_end,
+            "Loading repeating layers",
+            &new_multi_progress(),
+        ) {
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            let rotary = ropes
+                .get(&layer_device.location())
+                .expect("No RoPE for device location!")
+                .clone();
+
+            let vb_layer = vb_l.pp(layer_idx);
+
+            // Load fused QKV projection
+            let op_size =
+                cfg.num_attention_heads * head_dim + 2 * cfg.num_key_value_heads * head_dim;
+            let qkv_proj = mistralrs_quant::linear_no_bias(
+                cfg.hidden_size,
+                op_size,
+                &cfg.quantization_config,
+                vb_layer.pp("self_attn").pp("qkv_proj"),
+            )?;
+
+            // Load output projection
+            let o_proj = mistralrs_quant::linear_no_bias(
+                cfg.num_attention_heads * head_dim,
+                cfg.hidden_size,
+                &cfg.quantization_config,
+                vb_layer.pp("self_attn").pp("o_proj"),
+            )?;
+
+            // Load fused gate+up projection
+            let gate_up_proj = mistralrs_quant::linear_no_bias(
+                cfg.hidden_size,
+                2 * cfg.intermediate_size,
+                &cfg.quantization_config,
+                vb_layer.pp("mlp").pp("gate_up_proj"),
+            )?;
+
+            // Load down projection
+            let down_proj = mistralrs_quant::linear_no_bias(
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                &cfg.quantization_config,
+                vb_layer.pp("mlp").pp("down_proj"),
+            )?;
+
+            // Load normalization layers
+            let attn_norm = RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb_layer.pp("input_layernorm"),
+            )?;
+            let ffn_norm = RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb_layer.pp("post_attention_layernorm"),
+            )?;
+
+            // Build attention with sliding window
+            let attn_config =
+                AttentionConfig::new(cfg.num_attention_heads, cfg.num_key_value_heads, head_dim)
+                    .with_sliding_window(cfg.sliding_window.unwrap_or(cfg.max_position_embeddings));
+
+            let mut attention = FusedQkvCausalAttention::new(
+                attn_config,
+                qkv_proj,
+                o_proj,
+                rotary.clone() as Arc<dyn PositionEncoding>,
+            )
+            .with_attn_dtype(dtype);
+
+            if let AttentionImplementation::PagedAttention = &attention_mechanism {
+                attention =
+                    attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
+            }
+
+            // Build MLP with fused gate+up
+            let mlp =
+                FusedGatedMlp::from_weights(gate_up_proj, down_proj, cfg.hidden_act, cfg.intermediate_size);
+
+            layers.push(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp));
+        }
+
+        // Load output norm
+        let output_norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+
+        // Load output projection (may be tied to embeddings)
+        let output: Arc<dyn QuantMethod> = if !cfg.tie_word_embeddings {
+            mistralrs_quant::linear_no_bias(
+                cfg.hidden_size,
+                cfg.vocab_size,
+                &cfg.quantization_config,
+                vb.pp("lm_head"),
+            )?
+        } else {
+            ReplicatedLayer::from_linear(candle_nn::Linear::new(
+                tok_embeddings.embeddings().clone(),
+                None,
+            ))?
+        };
+
+        Ok(Self {
+            tok_embeddings,
+            layers,
+            output_norm,
+            output,
+            mapper: Some(mapper),
+            device: device.clone(),
+            max_seq_len: cfg.sliding_window.unwrap_or(cfg.max_position_embeddings),
+            dtype,
+            n_heads: cfg.num_attention_heads,
+        })
+    }
+}
+
+// =============================================================================
+// FromGGUF Implementation
+// =============================================================================
 
 impl ModelConfig::FromGGUF for ModelWeights {
     fn from_gguf<R: std::io::Seek + std::io::Read>(
@@ -246,7 +401,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self> {
-        // Parameter extraction from metadata.
+        // Extract configuration from GGUF metadata
         let metadata = ContentMetadata {
             path_prefix: "phi3",
             metadata: ct.get_metadata(),
@@ -256,119 +411,139 @@ impl ModelConfig::FromGGUF for ModelWeights {
             head_count_kv,
             block_count,
             embedding_length,
-            i_size,
+            intermediate_size,
             rope_dim,
             rms_eps,
             context_window,
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
-        // Determine layer range for partial loading (pipeline parallelism)
-        let total_layers = block_count;
-        let layer_range = layer_range.unwrap_or(0..total_layers);
+        // Determine layer range for pipeline parallelism
+        let layer_range = layer_range.unwrap_or(0..block_count);
         let layer_start = layer_range.start;
-        let layer_end = layer_range.end.min(total_layers);
+        let layer_end = layer_range.end.min(block_count);
         let num_loaded_layers = layer_end - layer_start;
 
-        if layer_start > 0 || layer_end < total_layers {
+        if layer_start > 0 || layer_end < block_count {
             tracing::info!(
                 "Pipeline parallelism: loading layers {}..{} of {} total",
                 layer_start,
                 layer_end,
-                total_layers
+                block_count
             );
         }
 
-        let (cos, sin) = precomput_freqs_cis(rope_dim, 10_000., device, context_window, dtype)?;
-
-        let tok_embeddings = ct.tensor("token_embd.weight", device)?;
-        let tok_embeddings = tok_embeddings.dequantize(device)?;
-        let output_norm = rms_norm(ct.tensor("output_norm.weight", device)?, rms_eps)?;
-        let output = QMatMul::from_qtensor(ct.tensor("output.weight", device)?)?;
-        let mut layers = Vec::with_capacity(num_loaded_layers);
         let head_dim = embedding_length / head_count;
 
-        // Only load layers in the specified range
+        // Create weight source
+        let mut weights = GgufWeightSource::new(&mut ct);
+
+        // Load embedding and output weights
+        let tok_embeddings =
+            weights.load_embedding("token_embd.weight", 0, embedding_length, device)?;
+        // Get vocab_size from embedding tensor shape (GGUF stores dimensions)
+        let vocab_size = tok_embeddings.embeddings().dim(0)?;
+        let output_norm = weights.load_rms_norm("output_norm.weight", rms_eps, device)?;
+        let output = weights.load_linear("output.weight", embedding_length, vocab_size, device)?;
+
+        // Create RoPE embeddings per device (reused across layers on same device)
+        let mut ropes: HashMap<candle_core::DeviceLocation, Arc<RotaryEmbedding>> = HashMap::new();
+        for layer_idx in layer_start..layer_end {
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                ropes.entry(layer_device.location())
+            {
+                e.insert(Arc::new(RotaryEmbedding::new(
+                    10_000.0, // Phi3 uses standard RoPE base
+                    rope_dim,
+                    context_window,
+                    layer_device,
+                    true,
+                    dtype,
+                )?));
+            }
+        }
+
+        // Load transformer layers
+        let mut layers = Vec::with_capacity(num_loaded_layers);
+
         for layer_idx in NiceProgressBar::<_, 'b'>(
             layer_start..layer_end,
             "Loading repeating layers",
             &new_multi_progress(),
         ) {
-            let prefix = format!("blk.{layer_idx}");
-            let device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            let ffn_up =
-                QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.ffn_up.weight"), device)?)?;
-            let ffn_down =
-                QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.ffn_down.weight"), device)?)?;
-            let QMatMul::QTensor(ffn_up_w) = ffn_up else {
-                unreachable!()
-            };
-            let QMatMul::QTensor(ffn_down_w) = ffn_down else {
-                unreachable!()
-            };
-            let mlp = Mlp {
-                ffn_up: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: ffn_up_w,
-                    b: None,
-                })?),
-                ffn_down: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: ffn_down_w,
-                    b: None,
-                })?),
-                i_size,
-            };
-            let attn_norm = rms_norm(
-                ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?,
-                rms_eps,
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            let rotary = ropes
+                .get(&layer_device.location())
+                .expect("No RoPE for device location!")
+                .clone();
+
+            // Load fused QKV and output projections
+            // QKV: embedding_length -> (head_count + 2*head_count_kv) * head_dim
+            let qkv_out_dim = head_count * head_dim + 2 * head_count_kv * head_dim;
+            let qkv_proj = weights.load_linear(
+                &format!("blk.{layer_idx}.attn_qkv.weight"),
+                embedding_length,
+                qkv_out_dim,
+                layer_device,
             )?;
-            let ffn_norm = rms_norm(
-                ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?,
-                rms_eps,
+            let o_proj = weights.load_linear(
+                &format!("blk.{layer_idx}.attn_output.weight"),
+                head_count * head_dim,
+                embedding_length,
+                layer_device,
             )?;
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
-            };
-            let qkv =
-                QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.attn_qkv.weight"), device)?)?;
-            let out =
-                QMatMul::from_qtensor(ct.tensor(&format!("{prefix}.attn_output.weight"), device)?)?;
-            let QMatMul::QTensor(qkv_w) = qkv.clone() else {
-                unreachable!()
-            };
-            let QMatMul::QTensor(out_w) = out.clone() else {
-                unreachable!()
-            };
-            layers.push(LayerWeights {
-                attn_qkv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: qkv_w,
-                    b: None,
-                })?),
-                attn_output: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: out_w,
-                    b: None,
-                })?),
-                attn_norm,
-                ffn_norm,
-                mlp,
-                n_head: head_count,
-                n_kv_head: head_count_kv,
-                head_dim,
-                cos: cos.to_device(device)?,
-                sin: sin.to_device(device)?,
-                paged_attn,
-                sdpa_params: SdpaParams {
-                    n_kv_groups: head_count / head_count_kv,
-                    softcap: None,
-                    softmax_scale: 1.0 / (head_dim as f32).sqrt(),
-                    sliding_window: Some(context_window),
-                },
-                dtype,
-            })
+
+            // Load fused gate+up and down projections
+            // Gate+Up is fused: embedding_length -> 2 * intermediate_size
+            let gate_up = weights.load_linear(
+                &format!("blk.{layer_idx}.ffn_up.weight"),
+                embedding_length,
+                2 * intermediate_size,
+                layer_device,
+            )?;
+            let down = weights.load_linear(
+                &format!("blk.{layer_idx}.ffn_down.weight"),
+                intermediate_size,
+                embedding_length,
+                layer_device,
+            )?;
+
+            // Load normalization layers
+            let attn_norm = weights.load_rms_norm(
+                &format!("blk.{layer_idx}.attn_norm.weight"),
+                rms_eps,
+                layer_device,
+            )?;
+            let ffn_norm = weights.load_rms_norm(
+                &format!("blk.{layer_idx}.ffn_norm.weight"),
+                rms_eps,
+                layer_device,
+            )?;
+
+            // Build attention with sliding window
+            let attn_config = AttentionConfig::new(head_count, head_count_kv, head_dim)
+                .with_sliding_window(context_window);
+
+            let mut attention = FusedQkvCausalAttention::new(
+                attn_config,
+                qkv_proj,
+                o_proj,
+                rotary.clone() as Arc<dyn PositionEncoding>,
+            )
+            .with_attn_dtype(dtype);
+
+            if let AttentionImplementation::PagedAttention = &attention_mechanism {
+                attention = attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
+            }
+
+            // Build MLP with fused gate+up
+            let mlp = FusedGatedMlp::from_weights(gate_up, down, Activation::Silu, intermediate_size);
+
+            layers.push(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp));
         }
+
         Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings,
             layers,
             output_norm,
             output,
@@ -376,128 +551,32 @@ impl ModelConfig::FromGGUF for ModelWeights {
             device: device.clone(),
             max_seq_len: context_window,
             dtype,
+            n_heads: head_count,
         })
     }
 }
 
 impl ModelWeights {
-    /// Get input embeddings from token IDs.
-    /// Consumes: token IDs [batch, seq_len]
-    /// Produces: embeddings [batch, seq_len, hidden_dim]
-    pub fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.tok_embeddings.forward(input_ids)
-    }
-
-    /// Run transformer layers on activations.
-    /// Consumes: activations [batch, seq_len, hidden_dim], tokens
-    /// Produces: activations [batch, seq_len, hidden_dim]
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_layers(
+    fn run_layers(
         &self,
-        input_ids: &Tensor,
-        mut xs: Tensor,
-        _input_ids_full: Option<&Tensor>,
-        seqlen_offsets: &[usize],
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        _request_id: uuid::Uuid,
+        mut hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        metadata: Option<(&[(Tensor, Tensor)], &PagedAttentionInputMetadata)>,
         cache: &mut [KvCache],
     ) -> Result<Tensor> {
-        // PastKvLenCache trait object - use reference to slice
-        let past_kv_len_cache: &dyn PastKvLenCache = if metadata.is_some() {
-            &seqlen_offsets
-        } else {
-            &cache
-        };
-        let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
-            input_ids,
-            past_kv_len_cache,
-            Some(self.max_seq_len),
-            self.dtype,
-            self.layers[0].n_head,
-        )?;
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
         for (i, layer) in self.layers.iter().enumerate() {
-            // Use local index for device mapping (device map is computed for loaded layers only)
             if let Some(ref mapper) = self.mapper {
-                xs = mapper.map(xs, i)?;
+                hidden = mapper.map(hidden, i)?;
             }
 
-            let residual = &xs;
-            let ys = xs.apply(&layer.attn_norm)?;
-            let ys = layer.forward_attn(
-                &ys,
-                mask.as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
-                seqlen_offsets,
-                &mut cache[i],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
-            )?;
-            let ys = (ys + residual)?;
-            let residual = &ys;
-            let ys = ys.apply(&layer.ffn_norm)?;
-            let ys = layer.mlp.forward(&ys)?;
-            xs = (ys + residual)?;
+            let layer_metadata = metadata
+                .as_ref()
+                .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta));
+
+            hidden = layer.forward(hidden, mask, position_offsets, &mut cache[i], layer_metadata)?;
         }
-
-        Ok(xs)
-    }
-
-    /// Apply lm_head to convert hidden states to logits (last stage only).
-    /// Consumes: activations [batch, seq_len, hidden_dim]
-    /// Produces: logits [batch, vocab_size]
-    pub fn apply_lm_head(&self, xs: Tensor) -> Result<Tensor> {
-        let (_b_sz, seq_len, _) = xs.dims3()?;
-        let xs = xs.apply(&self.output_norm)?.i((.., seq_len - 1, ..))?;
-        MatMul.qmatmul(&xs, &self.output)
-    }
-
-    /// Forward pass (consumes tokens, produces logits).
-    ///
-    /// # Parameters
-    /// * `input_ids` - Token IDs tensor
-    /// * `input_activation` - Activation tensor (if provided, skip embedding)
-    /// * `input_ids_full` - Full input IDs for context
-    /// * `seqlen_offsets` - Sequence position offsets for RoPE
-    /// * `metadata` - PagedAttention metadata if enabled
-    /// * `request_id` - UUID for distributed tracing
-    /// * `cache` - KV cache for attention layers
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        input_activation: Option<&Tensor>,
-        input_ids_full: Option<&Tensor>,
-        seqlen_offsets: &[usize],
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        request_id: uuid::Uuid,
-        cache: &mut [KvCache],
-    ) -> Result<Tensor> {
-        // Use provided activation or compute embeddings
-        let xs = match input_activation {
-            Some(act) => act.clone(),
-            None => self.tok_embeddings.forward(input_ids)?,
-        };
-
-        // Run layers
-        let xs = self.forward_layers(
-            input_ids,
-            xs,
-            input_ids_full,
-            seqlen_offsets,
-            metadata,
-            request_id,
-            cache,
-        )?;
-
-        self.apply_lm_head(xs)
+        Ok(hidden)
     }
 }
 
@@ -524,27 +603,33 @@ impl TransformerModel for ModelWeights {
         self.tok_embeddings.forward(tokens)
     }
 
-    fn transform(&self, mut hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
-        // Derive mask shape from hidden states: [batch, seq_len, hidden] → [batch, seq_len]
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        // Create 2D shape tensor for mask function [batch, seq_len]
         let mask_shape = hidden.i((.., .., 0usize))?;
         let start_offsets: Vec<usize> = vec![ctx.position_offset];
-        let start_offsets_slice = start_offsets.as_slice();
 
-        // Determine past KV len source: paged attention uses offsets, normal uses cache
+        // Determine past KV len source for masking
         let past_kv_len_cache: &dyn PastKvLenCache = if ctx.paged_attn.is_some() {
-            &start_offsets_slice
+            &start_offsets.as_slice()
         } else {
             &cache
         };
 
+        // Create sliding window causal mask
         let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
             &mask_shape,
             past_kv_len_cache,
             Some(self.max_seq_len),
             self.dtype,
-            self.layers[0].n_head,
+            self.n_heads,
         )?;
 
+        // Skip mask for non-first chunks in paged attention
         let mask = mask.filter(|_| {
             ctx.paged_attn
                 .as_ref()
@@ -552,37 +637,50 @@ impl TransformerModel for ModelWeights {
                 .unwrap_or(true)
         });
 
-        for (i, layer) in self.layers.iter().enumerate() {
-            if let Some(ref mapper) = self.mapper {
-                hidden = mapper.map(hidden, i)?;
-            }
-
-            let residual = &hidden;
-            let ys = hidden.apply(&layer.attn_norm)?;
-            let ys = layer.forward_attn(
-                &ys,
-                mask.as_ref()
-                    .map(|m| m.to_device(hidden.device()).unwrap())
-                    .as_ref(),
-                &start_offsets,
-                &mut cache[i],
-                ctx.paged_attn
-                    .as_ref()
-                    .map(|pa| (pa.kv_cache[i].clone(), pa.metadata)),
-            )?;
-            let ys = (ys + residual)?;
-            let residual = &ys;
-            let ys = ys.apply(&layer.ffn_norm)?;
-            let ys = layer.mlp.forward(&ys)?;
-            hidden = (ys + residual)?;
-        }
-
-        Ok(hidden)
+        let meta_ref = ctx
+            .paged_attn
+            .as_ref()
+            .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
+        self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
 }
 
 impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
-        self.apply_lm_head(hidden)
+        let x = self.output_norm.forward(&hidden)?;
+        MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)
+    }
+}
+
+// Extension trait - accessors and associated types for typed pipelines
+impl TransformerModelExt for ModelWeights {
+    type Layer = Phi3Block;
+    type Norm = RmsNorm;
+
+    fn tok_embeddings(&self) -> &Embedding {
+        &self.tok_embeddings
+    }
+
+    fn layers(&self) -> &[Self::Layer] {
+        &self.layers
+    }
+
+    fn output_norm(&self) -> &Self::Norm {
+        &self.output_norm
+    }
+
+    fn mapper(&self) -> Option<&dyn DeviceMapper> {
+        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+    }
+
+    fn model_dtype(&self) -> DType {
+        self.dtype
+    }
+}
+
+// Extension trait - output accessor for typed pipelines
+impl LanguageModelExt for ModelWeights {
+    fn output(&self) -> &Arc<dyn QuantMethod> {
+        &self.output
     }
 }
