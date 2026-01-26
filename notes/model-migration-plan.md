@@ -37,7 +37,7 @@ Some models require features not yet in transformer_builder:
 | Attention biases | Qwen2, Phi2, Starcoder2 | ✅ Implemented (`load_linear_with_optional_bias`, `with_attention_bias`) |
 | Non-gated MLP | Phi2, Starcoder2 | ⚠️ Exists (`NonGatedMlp`) but not in builder |
 | Fused QKV projection | Phi3 | Not implemented |
-| Custom RoPE (YaRN) | Mistral3 | ⚠️ Exists (`Mistral3RotaryEmbedding`) but needs `PositionEncoding` impl |
+| Custom RoPE (YaRN) | Mistral3 | ✅ Implemented (`impl PositionEncoding for Mistral3RotaryEmbedding`) |
 | Custom RoPE (Phi3) | Phi3 | Not implemented |
 
 ---
@@ -106,19 +106,21 @@ These models need transformer_builder extensions first:
 
 **Estimated Result:** ~120 lines (80% reduction)
 
-#### 5. `quantized_mistral3.rs` - 1380 lines
+#### 5. `quantized_mistral3.rs` - ✅ MIGRATED
+
+**Original:** 1387 lines → **Result:** 1202 lines (13% reduction)
 
 **Architecture:** YaRN RoPE scaling, otherwise standard Llama-like
 
-**Required Extensions:**
-- None (YaRN RoPE is model-specific, stays in model file)
+**Migration completed:**
+- Added `impl PositionEncoding for Mistral3RotaryEmbedding`
+- Uses `TransformerConfig::from_gguf_metadata()` for base config
+- Uses `load_transformer_layers()` with customizer to inject YaRN RoPE
+- Kept `YarnConfig`, `Mistral3RotaryEmbedding`, and extensive tests
+- Simplified `from_gguf` and `run_layers` methods
 
-**Migration Strategy:**
-1. Keep `Mistral3RotaryEmbedding` and `YarnConfig` in model file
-2. Use customizer to inject YaRN rotary into layers
-3. Standard layer structure otherwise
-
-**Estimated Result:** ~250 lines (82% reduction)
+**Note:** Most of the file is YaRN-specific code (~290 lines) and tests (~550 lines)
+that must remain. The `from_gguf` method was reduced from ~230 to ~150 lines.
 
 ---
 
@@ -142,6 +144,7 @@ These models need transformer_builder extensions first:
 |-------|--------|-------|
 | `quantized_qwen3.rs` | ✅ Done | Reference implementation |
 | `quantized_qwen.rs` | ✅ Done | Migrated with attention bias support (566→249 lines) |
+| `quantized_mistral3.rs` | ✅ Done | YaRN RoPE injected via customizer (1387→1202 lines) |
 | `quantized_llama.rs` | Skip | Safetensors primary, has both paths |
 | `mixtral.rs` | ✅ Done | New MoE implementation |
 
@@ -235,24 +238,19 @@ Keep that logic but simplify layer loading.
 Test: cargo test -p mistralrs-core --lib
 ```
 
-### Package F: Mistral3 Migration
+### Package F: Mistral3 Migration - ✅ COMPLETE
 
-**Agent Task:**
-```
-Migrate quantized_mistral3.rs to transformer_builder.
+**Status:** Migrated successfully (1387 → 1202 lines, 13% reduction)
 
-Key aspects:
-1. Keep YarnConfig and Mistral3RotaryEmbedding - model-specific
-2. Standard layer structure otherwise (RmsNorm, gated MLP)
-3. Customizer injects YaRN rotary per layer
+**Implementation:**
+- Added `impl PositionEncoding for Mistral3RotaryEmbedding`
+- Uses `TransformerConfig::from_gguf_metadata()` for base config
+- Uses `load_transformer_layers()` with customizer to inject YaRN RoPE
+- Kept `YarnConfig`, `Mistral3RotaryEmbedding`, and extensive tests (~550 lines)
+- Simplified `from_gguf` method to use generic layer loading
 
-This is the largest model (1380 lines) but much is YaRN RoPE code
-that should remain. Focus on simplifying from_gguf loading.
-
-Target: ~250 lines total (rope code + slim loader)
-
-Test: cargo test -p mistralrs-core --lib
-```
+**Note:** Modest line reduction due to extensive YaRN RoPE implementation and tests
+that are essential to keep. The key benefit is consistency with other models.
 
 ---
 

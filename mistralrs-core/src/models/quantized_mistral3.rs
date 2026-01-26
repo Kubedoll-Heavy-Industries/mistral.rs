@@ -16,20 +16,23 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Embedding, Module};
-use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
+use mistralrs_quant::QuantMethod;
 
-use crate::attention::SdpaParams;
+use crate::attention::PositionEncoding;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, RmsNorm, Sdpa};
+use crate::layers::{CausalMasker, MatMul, RmsNorm};
 use crate::layers_masker::PastKvLenCache;
 use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
-use crate::paged_attention::{AttentionImplementation, PagedAttention};
+use crate::paged_attention::AttentionImplementation;
+use crate::pipeline::loaders::{
+    load_transformer_layers, GgufNaming, GgufWeightSource, StandardTransformerBlock,
+    TensorNaming, TransformerConfig, WeightSource,
+};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
-use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
 
@@ -284,117 +287,22 @@ impl Mistral3RotaryEmbedding {
     }
 }
 
-struct Mlp {
-    feed_forward_w1: Arc<dyn QuantMethod>,
-    feed_forward_w2: Arc<dyn QuantMethod>,
-    feed_forward_w3: Arc<dyn QuantMethod>,
-}
-
-impl Mlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let w1 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w1)?;
-        let w3 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w3)?;
-        let y = &(candle_nn::ops::silu(&w1)? * w3)?;
-        MatMul.qmethod_matmul(y, &*self.feed_forward_w2)
+/// Implement PositionEncoding trait so YaRN RoPE can be used with CausalAttention.
+impl PositionEncoding for Mistral3RotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        Mistral3RotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
 
-struct LayerWeights {
-    attention_wq: Arc<dyn QuantMethod>,
-    attention_wk: Arc<dyn QuantMethod>,
-    attention_wv: Arc<dyn QuantMethod>,
-    attention_wo: Arc<dyn QuantMethod>,
-    attention_norm: RmsNorm,
-    mlp: Mlp,
-    ffn_norm: RmsNorm,
-    n_head: usize,
-    n_kv_head: usize,
-    head_dim: usize,
-    rotary: Arc<Mistral3RotaryEmbedding>,
-    paged_attn: Option<PagedAttention>,
-    sdpa_params: SdpaParams,
-    dtype: DType,
-}
-
-impl LayerWeights {
-    fn forward_attn(
-        &self,
-        x: &Tensor,
-        mask: Option<&Tensor>,
-        start_offsets: &[usize],
-        kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
-    ) -> Result<Tensor> {
-        let (b_sz, seq_len, _) = x.dims3()?;
-
-        let q = MatMul
-            .qmethod_matmul(x, &*self.attention_wq)?
-            .to_dtype(self.dtype)?;
-        let k = MatMul
-            .qmethod_matmul(x, &*self.attention_wk)?
-            .to_dtype(self.dtype)?;
-        let v = MatMul
-            .qmethod_matmul(x, &*self.attention_wv)?
-            .to_dtype(self.dtype)?;
-
-        let (q, k, v) = if seq_len != 1 {
-            let q = q
-                .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?;
-            // NOTE: Metal SDPA requires contiguous tensors after transpose
-            // See candle fix: https://github.com/huggingface/candle/commit/57f41da1
-            let v = v
-                .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
-                .transpose(1, 2)?
-                .contiguous()?;
-            (q, k, v)
-        } else {
-            let q = q.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            (q, k, v)
-        };
-
-        let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
-
-        let y = match &self.paged_attn {
-            Some(paged_attn) => {
-                let ((key_cache, value_cache), input_metadata) = metadata.unwrap();
-                paged_attn.forward(
-                    &q,
-                    &k,
-                    &v,
-                    mask,
-                    Some(key_cache),
-                    Some(value_cache),
-                    input_metadata,
-                    &self.sdpa_params,
-                    None,
-                )?
-            }
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-                Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?
-            }
-        };
-
-        let y = if mask.is_some() {
-            y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
-        } else {
-            y.reshape((b_sz, seq_len, ()))?
-        };
-
-        let y = MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)?;
-        Ok(y)
-    }
-}
-
+/// Mistral3 model weights using the generic transformer builder infrastructure.
+///
+/// Uses YaRN RoPE for extended context and standard Llama-like architecture:
+/// - RMS normalization for attention and FFN
+/// - Gated MLP with SiLU activation
+/// - YaRN-scaled RoPE positional embeddings
 pub struct ModelWeights {
     tok_embeddings: Embedding,
-    layers: Vec<LayerWeights>,
+    layers: Vec<StandardTransformerBlock>,
     /// Final norm layer (None for non-last pipeline stages)
     norm: Option<RmsNorm>,
     /// Output/LM head layer (None for non-last pipeline stages)
@@ -499,102 +407,92 @@ impl ModelConfig::FromGGUF for ModelWeights {
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self> {
+        // Parse Mistral3-specific metadata (includes YaRN config)
         let metadata = ContentMetadata {
             path_prefix: "mistral3",
             metadata: ct.get_metadata(),
         };
-        let PropsGGUF {
-            head_count,
-            head_count_kv,
-            block_count,
-            embedding_length,
-            rope_dim,
-            rms_norm_eps,
-            max_seq_len,
-            rope_freq_base,
-            key_length,
-            value_length,
-            yarn_config,
-            attn_temperature_scale,
-        } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
+        let props = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
-        // Determine layer range for partial loading (pipeline parallelism)
-        let total_layers = block_count;
-        let layer_range = layer_range.unwrap_or(0..total_layers);
-        let layer_start = layer_range.start;
-        let layer_end = layer_range.end.min(total_layers);
-        let num_loaded_layers = layer_end - layer_start;
+        // Parse common transformer config from GGUF metadata
+        let metadata = ContentMetadata {
+            path_prefix: "mistral3",
+            metadata: ct.get_metadata(),
+        };
+        let config = TransformerConfig::from_gguf_metadata(&metadata)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            .with_head_dim(props.key_length)
+            .with_rope_theta(props.rope_freq_base);
 
-        if layer_start > 0 || layer_end < total_layers {
-            tracing::info!(
-                "Pipeline parallelism: loading layers {}..{} of {} total",
-                layer_start,
-                layer_end,
-                total_layers
-            );
-        }
+        tracing::info!(
+            "Mistral3 model config: head_dim={}, rope_dim={}, head_count={}, head_count_kv={}, embedding_length={}, block_count={}",
+            config.head_dim,
+            props.rope_dim,
+            config.num_heads,
+            config.num_kv_heads,
+            config.hidden_size,
+            config.num_layers
+        );
 
-        let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
-        let tok_embeddings = qtok_embeddings.dequantize(device)?;
+        // Determine layer range for pipeline parallelism
+        let layer_start = layer_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let layer_end = layer_range
+            .as_ref()
+            .map(|r| r.end.min(config.num_layers))
+            .unwrap_or(config.num_layers);
+
+        // Create weight source wrapper
+        let mut weights = GgufWeightSource::new(&mut ct);
+        let naming = GgufNaming;
+
+        // Load embedding weights
+        let tok_embeddings = weights.load_embedding(
+            &naming.token_embd(),
+            config.vocab_size,
+            config.hidden_size,
+            device,
+        )?;
 
         // PP: Only load norm and output (LM head) for last stage
-        let is_last_stage = layer_end >= total_layers;
+        let is_last_stage = layer_end >= config.num_layers;
         let norm = if is_last_stage {
-            Some(RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
+            Some(weights.load_rms_norm(&naming.output_norm(), config.rms_norm_eps, device)?)
         } else {
             None
         };
         let output = if is_last_stage {
-            Some(if !ct.has_tensor("output.weight") {
-                ct.tensor("token_embd.weight", device)?
+            Some(if weights.has_tensor(&naming.output()) {
+                weights.load_linear(&naming.output(), device)?
             } else {
-                ct.tensor("output.weight", device)?
+                weights.load_linear(&naming.token_embd(), device)?
             })
         } else {
             None
         };
 
-        let mut layers = Vec::with_capacity(num_loaded_layers);
-        let head_dim = key_length;
-
-        tracing::info!(
-            "Mistral3 model config: head_dim={}, rope_dim={}, head_count={}, head_count_kv={}, embedding_length={}, block_count={}",
-            head_dim,
-            rope_dim,
-            head_count,
-            head_count_kv,
-            embedding_length,
-            block_count
-        );
-
-        if key_length != value_length {
-            candle_core::bail!(
-                "Expected key_length == value_length, got {key_length} != {value_length}"
-            );
-        }
-
-        // Create rotary embeddings with YaRN if configured
+        // Create YaRN RoPE embeddings per device (Mistral3-specific)
         // The temperature_scale from GGUF is the coefficient for YaRN mscale formula
-        // Only create RoPE embeddings for loaded layers
-        let mscale_coefficient = attn_temperature_scale.unwrap_or(0.1);
-        let mut ropes = HashMap::new();
-        #[allow(clippy::map_entry)] // Complex construction logic; entry API would be awkward
+        let mscale_coefficient = props.attn_temperature_scale.unwrap_or(0.1);
+        let mut yarn_ropes: HashMap<candle_core::DeviceLocation, Arc<Mistral3RotaryEmbedding>> =
+            HashMap::new();
         for layer_idx in layer_start..layer_end {
             let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            if !ropes.contains_key(&layer_device.location()) {
-                let mut rope = if let Some(ref yarn) = yarn_config {
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                yarn_ropes.entry(layer_device.location())
+            {
+                let mut rope = if let Some(ref yarn) = props.yarn_config {
                     tracing::info!(
                         "Using YaRN RoPE scaling for Mistral3: factor={}, beta_fast={}, beta_slow={}, mscale_coefficient={}, rope_dim={}",
                         yarn.factor,
                         yarn.beta_fast,
                         yarn.beta_slow,
                         mscale_coefficient,
-                        rope_dim
+                        props.rope_dim
                     );
                     Mistral3RotaryEmbedding::new_yarn(
-                        rope_freq_base,
-                        rope_dim,
-                        max_seq_len,
+                        props.rope_freq_base,
+                        props.rope_dim,
+                        config.max_seq_len,
                         yarn,
                         mscale_coefficient,
                         dtype,
@@ -602,118 +500,47 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     )?
                 } else {
                     Mistral3RotaryEmbedding::new_unscaled(
-                        rope_freq_base,
-                        rope_dim,
-                        max_seq_len,
+                        props.rope_freq_base,
+                        props.rope_dim,
+                        config.max_seq_len,
                         dtype,
                         layer_device,
                     )?
                 };
                 // Set partial rotary flag if rope_dim < head_dim
-                rope.set_partial(head_dim);
-                ropes.insert(layer_device.location(), Arc::new(rope));
+                rope.set_partial(config.head_dim);
+                e.insert(Arc::new(rope));
             }
         }
 
-        // Standard softmax scale - temperature scaling is applied via YaRN mscale to RoPE embeddings
-        let softmax_scale = 1f32 / (head_dim as f32).sqrt();
-
-        // Only load layers in the specified range
-        for layer_idx in NiceProgressBar::<_, 'b'>(
-            layer_start..layer_end,
-            "Loading repeating layers",
-            &new_multi_progress(),
-        ) {
-            let prefix = format!("blk.{layer_idx}");
-            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            let rotary = ropes
-                .get(&layer_device.location())
-                .expect("No RoPE for device location!")
-                .clone();
-
-            let attention_wq = ct.tensor(&format!("{prefix}.attn_q.weight"), layer_device)?;
-            let attention_wk = ct.tensor(&format!("{prefix}.attn_k.weight"), layer_device)?;
-            let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), layer_device)?;
-            let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), layer_device)?;
-
-            let feed_forward_w1 = ct.tensor(&format!("{prefix}.ffn_gate.weight"), layer_device)?;
-            let feed_forward_w2 = ct.tensor(&format!("{prefix}.ffn_down.weight"), layer_device)?;
-            let feed_forward_w3 = ct.tensor(&format!("{prefix}.ffn_up.weight"), layer_device)?;
-
-            let attention_norm =
-                RmsNorm::from_qtensor(ct.tensor(&format!("{prefix}.attn_norm.weight"), layer_device)?, rms_norm_eps)?;
-            let ffn_norm =
-                RmsNorm::from_qtensor(ct.tensor(&format!("{prefix}.ffn_norm.weight"), layer_device)?, rms_norm_eps)?;
-
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, layer_device, None)?)
-                }
-            };
-
-            let sdpa_params = SdpaParams {
-                n_kv_groups: head_count / head_count_kv,
-                softcap: None,
-                softmax_scale,
-                sliding_window: None,
-            };
-
-            layers.push(LayerWeights {
-                attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wq),
-                    b: None,
-                })?),
-                attention_wk: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wk),
-                    b: None,
-                })?),
-                attention_wv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wv),
-                    b: None,
-                })?),
-                attention_wo: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(attention_wo),
-                    b: None,
-                })?),
-                attention_norm,
-                mlp: Mlp {
-                    feed_forward_w1: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w1),
-                        b: None,
-                    })?),
-                    feed_forward_w2: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w2),
-                        b: None,
-                    })?),
-                    feed_forward_w3: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                        q_weight: Arc::new(feed_forward_w3),
-                        b: None,
-                    })?),
-                },
-                ffn_norm,
-                n_head: head_count,
-                n_kv_head: head_count_kv,
-                head_dim,
-                rotary,
-                paged_attn,
-                sdpa_params,
-                dtype,
-            });
-        }
+        // Load transformer layers using generic infrastructure
+        // Mistral3-specific: inject YaRN RoPE via customizer
+        let layers = load_transformer_layers(
+            &config,
+            &mut weights,
+            &naming,
+            layer_range,
+            &*mapper,
+            device,
+            attention_mechanism,
+            dtype,
+            |ctx, builder, _weights| {
+                // Replace default RoPE with YaRN RoPE for this layer's device
+                let yarn_rope = yarn_ropes
+                    .get(&ctx.device.location())
+                    .expect("No YaRN RoPE for device location!")
+                    .clone();
+                Ok(builder.rope(yarn_rope as Arc<dyn PositionEncoding>))
+            },
+        )?;
 
         Ok(Self {
-            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            tok_embeddings,
             layers,
             norm,
-            output: output.map(|q_tensor| {
-                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(q_tensor),
-                    b: None,
-                }).unwrap()) as Arc<dyn QuantMethod>
-            }),
+            output,
             device: device.clone(),
-            max_seq_len,
+            max_seq_len: config.max_seq_len,
             mapper: Some(mapper),
             dtype,
         })
@@ -736,23 +563,18 @@ impl ModelWeights {
             if let Some(ref mapper) = self.mapper {
                 hidden = mapper.map(hidden, i)?;
             }
-            let residual = &hidden;
-            let x = layer.attention_norm.forward(&hidden)?;
-            let attn = layer.forward_attn(
-                &x,
-                mask.map(|m| m.to_device(x.device()).unwrap())
-                    .as_ref(),
+
+            let layer_metadata = metadata
+                .as_ref()
+                .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta));
+
+            hidden = layer.forward(
+                hidden,
+                mask,
                 position_offsets,
                 &mut cache[i],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta)),
+                layer_metadata,
             )?;
-            let x = (attn + residual)?;
-            let residual = &x;
-            let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.mlp.forward(&x)?;
-            hidden = (x + residual)?;
         }
 
         Ok(hidden)
