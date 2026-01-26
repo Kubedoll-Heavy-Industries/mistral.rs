@@ -33,11 +33,11 @@ Some models require features not yet in transformer_builder:
 
 | Feature | Needed By | Status |
 |---------|-----------|--------|
-| LayerNorm (not RmsNorm) | Phi2, Starcoder2 | Not implemented |
-| Attention biases | Qwen2, Phi2, Starcoder2 | Not implemented |
-| Non-gated MLP | Phi2, Starcoder2 | Not implemented |
+| LayerNorm (not RmsNorm) | Phi2, Starcoder2 | ✅ Implemented (`load_layer_norm`) |
+| Attention biases | Qwen2, Phi2, Starcoder2 | ✅ Implemented (`load_linear_with_optional_bias`, `with_attention_bias`) |
+| Non-gated MLP | Phi2, Starcoder2 | ⚠️ Exists (`NonGatedMlp`) but not in builder |
 | Fused QKV projection | Phi3 | Not implemented |
-| Custom RoPE (YaRN) | Mistral3 | Not implemented |
+| Custom RoPE (YaRN) | Mistral3 | ⚠️ Exists (`Mistral3RotaryEmbedding`) but needs `PositionEncoding` impl |
 | Custom RoPE (Phi3) | Phi3 | Not implemented |
 
 ---
@@ -48,21 +48,14 @@ Some models require features not yet in transformer_builder:
 
 These models can be migrated immediately using existing infrastructure:
 
-#### 1. `quantized_qwen.rs` (Qwen2) - 566 lines
+#### 1. `quantized_qwen.rs` (Qwen2) - ✅ MIGRATED
 
-**Architecture:** Standard Llama-like with optional Q/K biases
+**Original:** 566 lines → **Result:** 249 lines (56% reduction)
 
-**Differences from Qwen3:**
-- Has optional attention biases (Q, K, V)
-- No Q/K normalization
-- Otherwise identical structure
-
-**Migration Strategy:**
-1. Use `TransformerConfig::from_gguf_metadata()` for config
-2. Use `load_transformer_layers()` with customizer for biases
-3. Customizer loads biases if present, passes to `TransformerLayerBuilder`
-
-**Estimated Result:** ~100 lines (82% reduction)
+**Migration completed:**
+- Uses `TransformerConfig::from_gguf_metadata().with_attention_bias()`
+- Uses `load_transformer_layers()` with customizer for optional Q/K norm
+- Supports both "qwen2" and "qwen3" architectures
 
 ---
 
@@ -147,60 +140,44 @@ These models need transformer_builder extensions first:
 
 | Model | Status | Notes |
 |-------|--------|-------|
-| `quantized_qwen3.rs` | Done | Reference implementation |
+| `quantized_qwen3.rs` | ✅ Done | Reference implementation |
+| `quantized_qwen.rs` | ✅ Done | Migrated with attention bias support (566→249 lines) |
 | `quantized_llama.rs` | Skip | Safetensors primary, has both paths |
-| `mixtral.rs` | Done | New MoE implementation |
+| `mixtral.rs` | ✅ Done | New MoE implementation |
 
 ---
 
 ## Parallel Work Packages
 
-### Package A: Qwen2 Migration (No infrastructure changes)
+### Package A: Qwen2 Migration - ✅ COMPLETE
 
-**Agent Task:**
-```
-Migrate quantized_qwen.rs to use transformer_builder infrastructure.
+**Status:** Migrated successfully (566 → 249 lines, 56% reduction)
 
-Reference: quantized_qwen3.rs for pattern
+**Commits:**
+- `76d9a3d1a refactor(models): extend transformer_builder and migrate Qwen2`
 
-Key differences from Qwen3:
-- Qwen2 has optional attention biases (attn_q.bias, attn_k.bias, attn_v.bias)
-- No Q/K normalization (remove that customizer logic)
-- Same layer structure otherwise
+**Implementation:**
+- Uses `TransformerConfig::from_gguf_metadata().with_attention_bias()`
+- Uses `load_transformer_layers()` with customizer for optional Q/K norm
+- Supports both "qwen2" and "qwen3" architectures via the same file
 
-Steps:
-1. Replace PropsGGUF with TransformerConfig::from_gguf_metadata()
-2. Use GgufWeightSource for weight loading
-3. Use load_transformer_layers() with customizer that:
-   - Loads attention biases if present (ct.has_tensor check)
-   - Passes biases to TransformerLayerBuilder
-4. Keep Model, TransformerModel, LanguageModel trait impls (copy from qwen3)
-5. Remove all manual layer-by-layer loading code
+### Package B: LayerNorm + Non-gated MLP Infrastructure - ⏳ PARTIAL
 
-Verify: Architecture detection handles "qwen2" and "qwen3" (existing logic)
-Test: cargo test -p mistralrs-core --lib
-```
+**Completed:**
+- ✅ `WeightSource::load_layer_norm()` - Loads LayerNorm (weight + bias)
+- ✅ `WeightSource::load_linear_with_optional_bias()` - Loads linear with optional bias
+- ✅ `TransformerConfig::with_attention_bias()` - Enable Q/K/V bias loading
 
-### Package B: LayerNorm + Non-gated MLP Infrastructure
+**Remaining:**
+- ❌ Non-gated MLP support in `TransformerLayerBuilder` (need generic return type)
+- ❌ Alternative block type for LayerNorm models (current `StandardTransformerBlock` uses RmsNorm)
 
-**Agent Task:**
-```
-Extend transformer_builder.rs with LayerNorm and non-gated MLP support.
+**Commits:**
+- `76d9a3d1a refactor(models): extend transformer_builder and migrate Qwen2`
 
-Add to WeightSource trait:
-- load_layer_norm(name, eps, device) -> LayerNorm
-
-Add to StandardTransformerBlock:
-- Option for non-gated MLP (no gate projection, just up->act->down)
-
-Add to TransformerLayerBuilder:
-- with_layer_norm() instead of with_rms_norm()
-- with_non_gated_mlp() flag
-
-Reference: quantized_starcoder2.rs for LayerNorm/non-gated patterns
-
-Test: cargo test -p mistralrs-core --lib
-```
+**Note:** The `NonGatedMlp` struct exists in `layers.rs` and implements `FeedForward`.
+To use it with transformer_builder, need to make `load_transformer_layers` generic
+over the block type or create a separate loading function.
 
 ### Package C: Starcoder2 Migration
 
