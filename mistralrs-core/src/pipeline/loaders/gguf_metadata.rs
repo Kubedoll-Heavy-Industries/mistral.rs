@@ -50,7 +50,8 @@ use crate::utils::gguf_metadata::ContentConfig;
 use crate::utils::model_config::FromGGUF;
 
 // Type aliases for models (used in architecture dispatch)
-use crate::models::llama::LlamaModel as QLlama;
+use crate::models::llama::LlamaModel;
+use crate::models::mixtral::Mixtral;
 use crate::models::quantized_mistral3::ModelWeights as QMistral3;
 use crate::models::quantized_phi2::ModelWeights as QPhi2;
 use crate::models::quantized_phi3::ModelWeights as QPhi3;
@@ -176,6 +177,9 @@ pub struct GgufMetadata {
 
     /// Vocabulary size
     pub vocab_size: usize,
+
+    /// Number of experts (0 for dense models, >1 for MoE)
+    pub expert_count: usize,
 }
 
 impl LoaderMetadata for GgufMetadata {
@@ -287,6 +291,11 @@ impl GgufLoader {
             .and_then(|v| v.to_string().ok())
             .map(|s| s.to_string());
 
+        let expert_count = gguf_metadata
+            .get(&format!("{arch_str}.expert_count"))
+            .map(|v| v.to_u32().unwrap_or(0) as usize)
+            .unwrap_or(0);
+
         Ok(GgufMetadata {
             architecture: arch,
             model_name,
@@ -298,6 +307,7 @@ impl GgufLoader {
             hidden_size: embedding_length,
             num_layers: block_count,
             vocab_size,
+            expert_count,
         })
     }
 
@@ -581,8 +591,18 @@ pub fn load_text_pipeline(
     // a typed pipeline wrapped in the enum. All forward passes are monomorphized.
     match arch {
         GGUFArchitecture::Llama => {
-            let pipeline = load_pipeline_for_model::<QLlama>(&loader, device, mapper, attention, dtype, layer_range)?;
-            Ok(CausalLMPipeline::Llama(pipeline))
+            // Check for MoE: Mixtral uses Llama architecture but with experts
+            if loader.metadata().expert_count > 1 {
+                info!(
+                    "Detected MoE model (expert_count={}), using Mixtral",
+                    loader.metadata().expert_count
+                );
+                let pipeline = load_pipeline_for_model::<Mixtral>(&loader, device, mapper, attention, dtype, layer_range)?;
+                Ok(CausalLMPipeline::Mixtral(pipeline))
+            } else {
+                let pipeline = load_pipeline_for_model::<LlamaModel>(&loader, device, mapper, attention, dtype, layer_range)?;
+                Ok(CausalLMPipeline::Llama(pipeline))
+            }
         }
         GGUFArchitecture::Mistral3 => {
             let pipeline = load_pipeline_for_model::<QMistral3>(&loader, device, mapper, attention, dtype, layer_range)?;
@@ -1033,8 +1053,18 @@ impl CausalLMLoaderBuilder {
 
         match arch {
             GGUFArchitecture::Llama => {
-                let pipeline = self.build_typed_pipeline::<QLlama>(loader)?;
-                Ok(CausalLMPipeline::Llama(pipeline))
+                // Check for MoE: Mixtral uses Llama architecture but with experts
+                if loader.metadata().expert_count > 1 {
+                    info!(
+                        "Detected MoE model (expert_count={}), using Mixtral",
+                        loader.metadata().expert_count
+                    );
+                    let pipeline = self.build_typed_pipeline::<Mixtral>(loader)?;
+                    Ok(CausalLMPipeline::Mixtral(pipeline))
+                } else {
+                    let pipeline = self.build_typed_pipeline::<LlamaModel>(loader)?;
+                    Ok(CausalLMPipeline::Llama(pipeline))
+                }
             }
             GGUFArchitecture::Mistral3 => {
                 let pipeline = self.build_typed_pipeline::<QMistral3>(loader)?;

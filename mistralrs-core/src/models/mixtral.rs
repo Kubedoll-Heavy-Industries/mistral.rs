@@ -1,35 +1,31 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-/// Mixtral Model
-/// https://github.com/huggingface/transformers/blob/main/src/transformers/models/mixtral/modeling_mixtral.py
-/// https://mistral.ai/news/mixtral-of-experts/
-use candle_core::{DType, Device, Module, Result, Tensor};
-use mistralrs_quant::{
-    ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
-    ShardedVarBuilder,
-};
+//! Mixtral model implementation (Mixture of Experts).
+//!
+//! Mixtral uses the Llama architecture with MoE (Mixture of Experts) replacing
+//! the standard MLP. Each token is routed to top-k experts, combining their outputs.
+//!
+//! This is a fundamentally different compute pattern from dense models:
+//! - Sparse activation: only k of n experts run per token
+//! - Different memory access patterns
+//! - Different parallelism strategies
+//!
+//! For these reasons, Mixtral is a separate type from Llama, not a hidden variant.
+
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{Embedding, Module};
+use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig, QuantizedConfig};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
-use crate::{
-    amoe::AnyMoeBaseModelMixin,
-    attention::SdpaParams,
-    device_map::DeviceMapper,
-    layers::{self, Activation, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
-    layers_masker::PastKvLenCache,
-    paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
-    pipeline::{
-        extract_logits,
-        text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
-    },
-    serde_default_fn,
-    utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
-};
+use crate::{layers::Activation, serde_default_fn};
 
 serde_default_fn!(bool, word_emb_default, false);
 
-/// https://github.com/huggingface/transformers/blob/1a585c1222a56bcaecc070966d558d4a9d862e83/src/transformers/models/mixtral/configuration_mixtral.py#L113
+/// Mixtral configuration (for safetensors loading).
+///
+/// This is the JSON config.json structure from HuggingFace Mixtral models.
+/// For GGUF loading, configuration is extracted from file metadata instead.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub(crate) vocab_size: usize,
@@ -50,724 +46,643 @@ pub struct Config {
     pub(crate) tie_word_embeddings: bool,
 }
 
+use crate::{
+    attention::SdpaParams,
+    device_map::DeviceMapper,
+    gguf::Content,
+    layers::{
+        reshape_attn_output, reshape_for_attn, sdpa_with_cache, CausalMasker, MatMul,
+        Mlp, RmsNorm, RotaryEmbedding,
+    },
+    layers_masker::PastKvLenCache,
+    models::{LanguageModel, Model, TransformContext, TransformerModel},
+    paged_attention::{AttentionImplementation, PagedAttention},
+    pipeline::text_models_inputs_processor::PagedAttentionInputMetadata,
+    pipeline::KvCache,
+    utils::gguf_metadata::ContentMetadata,
+    utils::model_config as ModelConfig,
+    utils::progress::{new_multi_progress, NiceProgressBar},
+};
+
+// =============================================================================
+// Sparse Mixture of Experts
+// =============================================================================
+
+/// Sparse MoE block that routes tokens to top-k experts.
+///
+/// Unlike dense MLP where all parameters are used for every token,
+/// MoE selects a subset of experts per token, enabling larger model
+/// capacity with similar compute cost.
+struct SparseMoeBlock {
+    /// Router/gate that produces expert scores
+    gate: Arc<dyn QuantMethod>,
+    /// Expert MLPs
+    experts: Vec<Mlp>,
+    /// Number of experts to use per token (typically 2)
+    n_expert_used: usize,
+}
+
+impl SparseMoeBlock {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
+        let xs = xs.reshape(((), hidden_dim))?;
+
+        // Compute routing scores
+        let router_logits = MatMul.qmethod_matmul(&xs, &*self.gate)?;
+        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+        let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+
+        // Select top-k experts per token
+        let mut top_x = vec![vec![]; self.experts.len()];
+        let mut selected_rws = vec![vec![]; self.experts.len()];
+
+        for (row_idx, rw) in routing_weights.iter().enumerate() {
+            // Sort expert indices by routing weight (descending)
+            let mut dst = (0..rw.len() as u32).collect::<Vec<u32>>();
+            dst.sort_by(|&i, &j| rw[j as usize].total_cmp(&rw[i as usize]));
+
+            // Compute normalized routing weights for top-k
+            let mut sum_routing_weights = 0f32;
+            for &expert_idx in dst.iter().take(self.n_expert_used) {
+                let expert_idx = expert_idx as usize;
+                sum_routing_weights += rw[expert_idx];
+                top_x[expert_idx].push(row_idx as u32);
+            }
+            for &expert_idx in dst.iter().take(self.n_expert_used) {
+                let expert_idx = expert_idx as usize;
+                selected_rws[expert_idx].push(rw[expert_idx] / sum_routing_weights);
+            }
+        }
+
+        // Compute weighted expert outputs
+        let mut ys = xs.zeros_like()?;
+        for (expert_idx, expert) in self.experts.iter().enumerate() {
+            let top_x = &top_x[expert_idx];
+            if top_x.is_empty() {
+                continue;
+            }
+
+            let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
+            let selected_rws =
+                Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?.reshape(((), 1))?;
+
+            // Gather tokens for this expert
+            let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
+
+            // Expert forward pass
+            let current_hidden = expert.forward(&current_state)?;
+            let current_hidden = current_hidden.broadcast_mul(&selected_rws)?;
+
+            // Scatter-add back to output
+            ys = ys.index_add(&top_x, &current_hidden, 0)?;
+        }
+
+        ys.reshape((b_size, seq_len, hidden_dim))
+    }
+}
+
+// =============================================================================
+// Attention
+// =============================================================================
+
 struct Attention {
     q_proj: Arc<dyn QuantMethod>,
     k_proj: Arc<dyn QuantMethod>,
     v_proj: Arc<dyn QuantMethod>,
     o_proj: Arc<dyn QuantMethod>,
-    num_heads: usize,
-    num_kv_heads: usize,
+    n_head: usize,
+    n_kv_head: usize,
     head_dim: usize,
-    rotary_emb: Arc<RotaryEmbedding>,
+    rotary: Arc<RotaryEmbedding>,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
+    dtype: DType,
 }
 
 impl Attention {
-    fn new(
-        rotary_emb: Arc<RotaryEmbedding>,
-        cfg: &Config,
-        vb: ShardedVarBuilder,
-        paged_attn: Option<PagedAttention>,
-        comm: &Arc<mistralrs_quant::Comm>,
-    ) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let num_heads = cfg.num_attention_heads;
-        let num_kv_heads = cfg.num_key_value_heads;
-        let head_dim = hidden_sz / num_heads;
-        let q_proj = ColumnParallelLayer::new(
-            hidden_sz,
-            num_heads * head_dim,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("q_proj"),
-        )?;
-        let kv_shard = mistralrs_quant::compute_kv_shard(
-            cfg.num_key_value_heads,
-            cfg.hidden_size / cfg.num_attention_heads,
-            comm,
-        );
-        let k_proj = ColumnParallelLayer::new_with_shard(
-            hidden_sz,
-            num_kv_heads * head_dim,
-            &cfg.quantization_config,
-            false,
-            comm,
-            kv_shard,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = ColumnParallelLayer::new_with_shard(
-            hidden_sz,
-            num_kv_heads * head_dim,
-            &cfg.quantization_config,
-            false,
-            comm,
-            kv_shard,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = RowParallelLayer::new(
-            num_heads * head_dim,
-            hidden_sz,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("o_proj"),
-        )?;
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            num_heads: num_heads / comm.world_size(),
-            num_kv_heads: (num_kv_heads / comm.world_size()).max(1),
-            head_dim,
-            rotary_emb,
-            paged_attn,
-            sdpa_params: SdpaParams {
-                n_kv_groups: mistralrs_quant::compute_n_kv_groups(
-                    cfg.num_key_value_heads,
-                    cfg.num_attention_heads,
-                    comm,
-                ),
-                softcap: None,
-                softmax_scale: 1.0 / (head_dim as f32).sqrt(),
-                sliding_window: cfg.sliding_window,
-            },
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
-        xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        seqlen_offsets: &[usize],
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        let (b_sz, q_len, _) = xs.dims3()?;
+        let (b_sz, seq_len, _) = x.dims3()?;
 
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let mut q = MatMul.qmethod_matmul(&xs, &*self.q_proj)?;
-        let mut k = MatMul.qmethod_matmul(&xs, &*self.k_proj)?;
-        let mut v = MatMul.qmethod_matmul(&xs, &*self.v_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            q = q.to_dtype(original_dtype)?;
-            k = k.to_dtype(original_dtype)?;
-            v = v.to_dtype(original_dtype)?;
-        }
+        // QKV projections
+        let q = MatMul
+            .qmethod_matmul(x, &*self.q_proj)?
+            .to_dtype(self.dtype)?;
+        let k = MatMul
+            .qmethod_matmul(x, &*self.k_proj)?
+            .to_dtype(self.dtype)?;
+        let v = MatMul
+            .qmethod_matmul(x, &*self.v_proj)?
+            .to_dtype(self.dtype)?;
 
-        let (q, k, v) = if q_len != 1 {
-            let q = q
-                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v)
-        } else {
-            let q = q.reshape((b_sz, self.num_heads, q_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?;
-            (q, k, v)
-        };
+        // Reshape for multi-head attention
+        let q = reshape_for_attn(q, b_sz, seq_len, self.n_head, self.head_dim)?;
+        let k = reshape_for_attn(k, b_sz, seq_len, self.n_kv_head, self.head_dim)?;
+        let v = reshape_for_attn(v, b_sz, seq_len, self.n_kv_head, self.head_dim)?;
 
-        let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
+        // RoPE
+        let (q, k) = self.rotary.forward(&q, &k, position_offsets)?;
 
-        let mut attn_output = match &self.paged_attn {
-            Some(paged_attn) => match metadata {
-                Some(((key_cache, value_cache), input_metadata)) => paged_attn.forward(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(key_cache),
-                    Some(value_cache),
-                    input_metadata,
-                    &self.sdpa_params,
-                    Some(flash_params),
-                )?,
-                None => {
-                    // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
-                    // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
-                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    // Sanity check.
-                    assert!(attention_mask.is_some());
-                    paged_attn.forward(
-                        &q,
-                        &k,
-                        &v,
-                        attention_mask,
-                        None,
-                        None,
-                        &input_metadata,
-                        &self.sdpa_params,
-                        Some(flash_params),
-                    )?
-                }
-            },
-            None => {
-                let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
-            }
-        };
-
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            attn_output = attn_output.to_dtype(t)?;
-        }
-        attn_output = if attention_mask.is_some() {
-            attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?
-        } else {
-            attn_output.reshape((b_sz, q_len, ()))?
-        };
-        let mut res = MatMul.qmethod_matmul(&attn_output, &*self.o_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
-        Ok(res)
-    }
-}
-
-#[derive(Clone)]
-struct BlockSparseTop2MLP {
-    w1: Arc<dyn QuantMethod>,
-    w2: Arc<dyn QuantMethod>,
-    w3: Arc<dyn QuantMethod>,
-    act_fn: Activation,
-}
-
-impl BlockSparseTop2MLP {
-    fn new(cfg: &Config, vb: ShardedVarBuilder, comm: &Arc<mistralrs_quant::Comm>) -> Result<Self> {
-        let hidden_sz = cfg.hidden_size;
-        let intermediate_sz = cfg.intermediate_size;
-        let w1 = ColumnParallelLayer::new(
-            hidden_sz,
-            intermediate_sz,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("w1"),
+        // SDPA with cache
+        let y = sdpa_with_cache(
+            &q,
+            &k,
+            &v,
+            mask,
+            kv_cache,
+            self.paged_attn.as_ref(),
+            metadata,
+            &self.sdpa_params,
         )?;
-        let w2 = RowParallelLayer::new(
-            intermediate_sz,
-            hidden_sz,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("w2"),
-        )?;
-        let w3 = ColumnParallelLayer::new(
-            hidden_sz,
-            intermediate_sz,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("w3"),
-        )?;
-        Ok(Self {
-            w1,
-            w2,
-            w3,
-            act_fn: cfg.hidden_act,
-        })
+
+        // Reshape output and project
+        let y = reshape_attn_output(y, b_sz, seq_len, mask.is_some())?;
+        MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.o_proj)
     }
 }
 
-impl Module for BlockSparseTop2MLP {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.w1.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let w1_out = MatMul.qmethod_matmul(&xs, &*self.w1)?;
-        let w3_out = MatMul.qmethod_matmul(&xs, &*self.w3)?;
-        let activated = crate::ops::mul_and_act(&w1_out, &w3_out, self.act_fn)?;
-        let mut res = MatMul.qmethod_matmul(&activated, &*self.w2)?;
-        if self.w1.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
-        Ok(res)
-    }
-}
-
-#[derive(Clone)]
-struct SparseMoeBlock {
-    gate: Arc<dyn QuantMethod>,
-    experts: Vec<BlockSparseTop2MLP>,
-    num_experts_per_tok: usize,
-}
-
-impl SparseMoeBlock {
-    fn new(cfg: &Config, vb: ShardedVarBuilder, comm: &Arc<mistralrs_quant::Comm>) -> Result<Self> {
-        let gate = mistralrs_quant::linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_local_experts,
-            &cfg.quantization_config,
-            vb.pp("gate"),
-        )?;
-        let mut experts = Vec::with_capacity(cfg.num_local_experts);
-        let vb = vb.pp("experts");
-        for idx in 0..cfg.num_local_experts {
-            let expert = BlockSparseTop2MLP::new(cfg, vb.pp(idx), comm)?;
-            experts.push(expert)
-        }
-        Ok(SparseMoeBlock {
-            gate,
-            experts,
-            num_experts_per_tok: cfg.num_experts_per_tok,
-        })
-    }
-}
-
-impl Module for SparseMoeBlock {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-        let xs = xs.reshape(((), hidden_dim))?;
-
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let mut router_logits = MatMul.qmethod_matmul(&xs, &*self.gate)?;
-        if self.gate.quantized_act_type().is_some() {
-            router_logits = router_logits.to_dtype(original_dtype)?;
-        }
-
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
-
-        // In order to extract topk, we extract the data from the tensor and manipulate it
-        // directly. Maybe we will want to use some custom ops instead at some point.
-        let routing_weights = routing_weights.to_dtype(DType::F32)?.to_vec2::<f32>()?;
-
-        // routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        // top_x contains the row indexes to evaluate for each expert.
-        let mut top_x = vec![vec![]; self.experts.len()];
-        let mut selected_rws = vec![vec![]; self.experts.len()];
-        for (row_idx, rw) in routing_weights.iter().enumerate() {
-            let mut dst = (0..rw.len() as u32).collect::<Vec<u32>>();
-            dst.sort_by(|&i, &j| rw[j as usize].total_cmp(&rw[i as usize]));
-            let mut sum_routing_weights = 0f32;
-            for &expert_idx in dst.iter().take(self.num_experts_per_tok) {
-                let expert_idx = expert_idx as usize;
-                let routing_weight = rw[expert_idx];
-                sum_routing_weights += routing_weight;
-                top_x[expert_idx].push(row_idx as u32);
-            }
-            for &expert_idx in dst.iter().take(self.num_experts_per_tok) {
-                let expert_idx = expert_idx as usize;
-                let routing_weight = rw[expert_idx];
-                selected_rws[expert_idx].push(routing_weight / sum_routing_weights)
-            }
-        }
-
-        // routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        // expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-
-        let mut ys = xs.zeros_like()?;
-        for (expert_idx, expert_layer) in self.experts.iter().enumerate() {
-            let top_x = &top_x[expert_idx];
-            if top_x.is_empty() {
-                continue;
-            }
-            let top_x = Tensor::new(top_x.as_slice(), xs.device())?;
-            let selected_rws =
-                Tensor::new(selected_rws[expert_idx].as_slice(), xs.device())?.reshape(((), 1))?;
-            // Index the correct hidden states and compute the expert hidden state for
-            // the current expert. We need to make sure to multiply the output hidden
-            // states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            let current_state = xs.index_select(&top_x, 0)?.reshape(((), hidden_dim))?;
-            // current_hidden_states = expert_layer(current_state, routing_weights[top_x_list, idx_list, None])
-            let current_hidden_states = expert_layer.forward(&current_state)?;
-            let current_hidden_states = current_hidden_states.broadcast_mul(&selected_rws)?;
-            ys = ys.index_add(&top_x, &current_hidden_states, 0)?;
-        }
-
-        let ys = ys.reshape((b_size, seq_len, hidden_dim))?;
-        Ok(ys)
-    }
-}
+// =============================================================================
+// Decoder Layer
+// =============================================================================
 
 struct DecoderLayer {
-    self_attn: Attention,
-    block_sparse_moe: SparseMoeBlock,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    attn_norm: RmsNorm,
+    attn: Attention,
+    ffn_norm: RmsNorm,
+    moe: SparseMoeBlock,
 }
 
 impl DecoderLayer {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        rotary_emb: Arc<RotaryEmbedding>,
-        cfg: &Config,
-        vb: ShardedVarBuilder,
-        mapper: &dyn DeviceMapper,
-        layer_idx: usize,
-        loading_isq: bool,
-        paged_attn: Option<PagedAttention>,
-        comm: &Arc<mistralrs_quant::Comm>,
-    ) -> Result<Self> {
-        let self_attn = Attention::new(
-            rotary_emb,
-            cfg,
-            mapper.set_device(layer_idx, vb.pp("self_attn"), loading_isq),
-            paged_attn,
-            comm,
-        )?;
-        let block_sparse_moe = SparseMoeBlock::new(
-            cfg,
-            mapper.set_device(layer_idx, vb.pp("block_sparse_moe"), loading_isq),
-            comm,
-        )?;
-        let input_layernorm = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            mapper.set_device(layer_idx, vb.pp("input_layernorm"), false),
-        )?;
-        let post_attention_layernorm = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            mapper.set_device(layer_idx, vb.pp("post_attention_layernorm"), false),
-        )?;
-        Ok(Self {
-            self_attn,
-            block_sparse_moe,
-            input_layernorm,
-            post_attention_layernorm,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
-        xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        seqlen_offsets: &[usize],
+        x: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(
-            &xs,
-            attention_mask,
-            seqlen_offsets,
-            kv_cache,
-            metadata,
-            flash_params,
-        )?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs
-            .apply(&self.post_attention_layernorm)?
-            .apply(&self.block_sparse_moe)?
-            .to_dtype(residual.dtype())?;
-        residual + xs
+        // Pre-norm attention
+        let residual = &x;
+        let x = self.attn_norm.forward(&x)?;
+        let x = self.attn.forward(&x, mask, position_offsets, kv_cache, metadata)?;
+        let x = (x + residual)?;
+
+        // Pre-norm MoE
+        let residual = &x;
+        let x = self.ffn_norm.forward(&x)?;
+        let x = self.moe.forward(&x)?;
+        x + residual
     }
 }
 
-pub struct Model {
-    embed_tokens: candle_nn::Embedding,
+// =============================================================================
+// Mixtral Model
+// =============================================================================
+
+/// Mixtral model weights (Mixture of Experts).
+///
+/// Stateless - cache is passed in, not owned.
+pub struct Mixtral {
+    tok_embeddings: Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
-    lm_head: Arc<dyn QuantMethod>,
-    sliding_window: Option<usize>,
+    norm: Option<RmsNorm>,
+    output: Option<Arc<dyn QuantMethod>>,
     device: Device,
-    cache: EitherCache,
     max_seq_len: usize,
-    mapper: Box<dyn DeviceMapper + Send + Sync>,
-    cfg: ModelConfigMetadata,
+    num_layers: usize,
+    mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
+    dtype: DType,
 }
 
-impl Model {
-    pub fn new(
-        cfg: &Config,
-        vb: ShardedVarBuilder,
-        is_gptx: bool,
-        normal_loading_metadata: NormalLoadingMetadata,
-        attention_mechanism: AttentionImplementation,
-    ) -> Result<Self> {
-        if let Some(ref quant_cfg) = &cfg.quantization_config {
-            tracing::info!(
-                "Using {} quantization: {}.",
-                quant_cfg.name(),
-                quant_cfg.get_bits_name(&vb)
-            );
-        }
-        let mapper = normal_loading_metadata.mapper;
-        let vb_m = vb.pp("model");
+// =============================================================================
+// Model Trait Implementations
+// =============================================================================
 
-        let embed_tokens = layers::embedding(
-            cfg.vocab_size,
-            cfg.hidden_size,
-            mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
-            &cfg.quantization_config,
-        )?;
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
-        let mut ropes = HashMap::new();
-        for layer_idx in 0..cfg.num_hidden_layers {
-            let device = mapper
-                .device_for(layer_idx, false)
-                .unwrap_or(&normal_loading_metadata.real_device);
-            ropes.insert(
-                device.location(),
-                Arc::new(RotaryEmbedding::new(
-                    cfg.rope_theta as f32,
-                    head_dim,
-                    cfg.max_position_embeddings,
-                    device,
-                    is_gptx,
-                    vb_m.dtype(),
-                )?),
-            );
-        }
-        let vb_l = vb_m.pp("layers");
-        let layers: Vec<DecoderLayer> = NiceProgressBar::<_, 'b'>(
-            0..cfg.num_hidden_layers,
-            "Loading repeating layers",
-            &normal_loading_metadata.multi_progress,
-        )
-        .par_iter_if_isq(|layer_idx| {
-            let device = mapper
-                .device_for(layer_idx, false)
-                .unwrap_or(&normal_loading_metadata.real_device);
-            let rotary_emb = ropes
-                .get(&device.location())
-                .expect("No RoPE for device location!")
-                .clone();
-            let paged_attn = match &attention_mechanism {
-                AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => {
-                    Some(PagedAttention::new(head_dim, device, None)?)
-                }
-            };
-            let comm = mapper.get_comm_for(layer_idx)?;
-            DecoderLayer::new(
-                rotary_emb.clone(),
-                cfg,
-                vb_l.pp(layer_idx),
-                &*mapper,
-                layer_idx,
-                normal_loading_metadata.loading_isq,
-                paged_attn,
-                &comm,
-            )
-        })?;
-        let norm = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            mapper.set_nm_device(vb_m.pp("norm"), false),
-        )?;
-        let lm_head = if !cfg.tie_word_embeddings {
-            ReplicatedLayer::new(
-                cfg.hidden_size,
-                cfg.vocab_size,
-                &cfg.quantization_config,
-                false,
-                mapper.set_nm_device(vb.pp("lm_head"), normal_loading_metadata.loading_isq),
-            )?
-        } else {
-            ReplicatedLayer::from_linear(candle_nn::Linear::new(
-                mapper.cast_nm_device(
-                    embed_tokens.embeddings(),
-                    normal_loading_metadata.loading_isq,
-                )?,
-                None,
-            ))?
-        };
-        Ok(Self {
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-            sliding_window: cfg.sliding_window,
-            device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::new_sliding(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-                cfg.sliding_window,
-            )),
-            max_seq_len: cfg.max_position_embeddings,
-            cfg: ModelConfigMetadata {
-                max_seq_len: cfg.max_position_embeddings,
-                num_layers: cfg.num_hidden_layers,
-                hidden_size: cfg.hidden_size,
-                num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
-                num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
-                    .max(1),
-                sliding_window: cfg.sliding_window,
-                k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
-                v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
-            },
-            mapper,
-        })
-    }
-
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        seqlen_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids)?;
-        let cache = &mut self.cache.normal().0;
-        let attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            self.sliding_window,
-            xs.dtype(),
-            self.cfg.num_attn_heads,
-        )?;
-        // PagedAttention prompt chunking
-        let attention_mask = attention_mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-        for (i, layer) in self.layers.iter().enumerate() {
-            xs = self.mapper.map(xs, i)?;
-            xs = layer.forward(
-                &xs,
-                attention_mask
-                    .as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
-                seqlen_offsets,
-                &mut cache[i],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
-                flash_params,
-            )?;
-        }
-        let xs = xs.to_device(&self.device)?;
-        let mut xs = xs.apply(&self.norm)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        extract_logits(&MatMul.qmethod_matmul(&xs, &*self.lm_head)?, context_lens)
-    }
-}
-
-impl IsqModel for Model {
-    fn get_layers(
-        &mut self,
-    ) -> (
-        Vec<(&mut Arc<dyn QuantMethod>, Option<usize>)>,
-        &dyn DeviceMapper,
-    ) {
-        let mut tensors = Vec::new();
-        tensors.push((&mut self.lm_head, None));
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            tensors.push((&mut layer.self_attn.q_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.k_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.v_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.o_proj, Some(i)));
-            tensors.push((&mut layer.block_sparse_moe.gate, Some(i)));
-            for expert in &mut layer.block_sparse_moe.experts {
-                tensors.push((&mut expert.w1, Some(i)));
-                tensors.push((&mut expert.w2, Some(i)));
-                tensors.push((&mut expert.w3, Some(i)));
-            }
-        }
-        (tensors, &*self.mapper)
-    }
-
-    fn residual_tensors(&self) -> Vec<(String, Tensor)> {
-        let uvb = UnVarBuilder::new();
-
-        let uvb_m = uvb.pp("model");
-        uvb_m.pp("embed_tokens").add(&self.embed_tokens);
-        uvb_m.pp("norm").add(&self.norm);
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
-            uvb_l.pp("input_layernorm").add(&layer.input_layernorm);
-            uvb_l
-                .pp("post_attention_layernorm")
-                .add(&layer.post_attention_layernorm);
-        }
-
-        uvb.to_safetensors()
-    }
-}
-
-impl NormalModel for Model {
-    fn forward(
-        &self,
-        input_ids: &Tensor,
-        seqlen_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        _position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        self.forward(
-            input_ids,
-            seqlen_offsets,
-            context_lens,
-            metadata,
-            flash_params,
-        )
-    }
-    fn xlora_forward(
-        &self,
-        _input_ids: &Tensor,
-        _input_ids_full: &Tensor,
-        _seqlen_offsets: &[usize],
-        _seqlen_offsets_full: &[usize],
-        _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
-        _context_lens: Vec<(usize, usize)>,
-        _position_ids: Vec<usize>,
-        _flash_params: &FlashParams,
-        _flash_params_full: &FlashParams,
-    ) -> Result<Tensor> {
-        unimplemented!()
-    }
-    fn cache(&self) -> &EitherCache {
-        &self.cache
-    }
-    fn cache_mut(&mut self) -> &mut EitherCache {
-        &mut self.cache
-    }
+impl Model for Mixtral {
     fn device(&self) -> &Device {
         &self.device
     }
-    fn is_xlora(&self) -> bool {
-        false
+}
+
+impl TransformerModel for Mixtral {
+    fn num_layers(&self) -> usize {
+        self.num_layers
     }
+
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
     }
-    fn config(&self) -> &ModelConfigMetadata {
-        &self.cfg
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.tok_embeddings.forward(tokens)
+    }
+
+    fn transform(
+        &self,
+        mut hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        let position_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute causal mask
+        let mask = CausalMasker.make_causal_mask_as(
+            ctx.seq_len,
+            hidden.device(),
+            &position_offsets.as_slice() as &dyn PastKvLenCache,
+            self.dtype,
+        )?;
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Run through decoder layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(ref mapper) = self.mapper {
+                hidden = mapper.map(hidden, i)?;
+            }
+
+            let layer_metadata = ctx
+                .paged_attn
+                .as_ref()
+                .map(|pa| (pa.kv_cache[i].clone(), pa.metadata));
+
+            hidden = layer.forward(
+                hidden,
+                mask.as_ref(),
+                &position_offsets,
+                &mut cache[i],
+                layer_metadata,
+            )?;
+        }
+
+        Ok(hidden)
     }
 }
 
-impl AnyMoeBaseModelMixin for Model {}
+impl LanguageModel for Mixtral {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        match (&self.norm, &self.output) {
+            (Some(norm), Some(output)) => {
+                let x = norm.forward(&hidden)?;
+                MatMul.qmethod_matmul(&x.contiguous()?, &**output)
+            }
+            _ => {
+                // Pipeline parallelism: non-last stage returns hidden states
+                Ok(hidden)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// GGUF Loading
+// =============================================================================
+
+/// Mixtral GGUF metadata.
+struct MixtralProps {
+    n_expert: usize,
+    n_expert_used: usize,
+    head_count: usize,
+    head_count_kv: usize,
+    block_count: usize,
+    embedding_length: usize,
+    rope_dim: usize,
+    rms_norm_eps: f64,
+    max_seq_len: usize,
+    rope_freq_base: f32,
+    head_dim: usize,
+}
+
+impl MixtralProps {
+    fn from_metadata(metadata: &ContentMetadata) -> std::result::Result<Self, anyhow::Error> {
+        metadata.verify_arch("llama")?;
+
+        let required = [
+            "attention.head_count",
+            "attention.head_count_kv",
+            "block_count",
+            "embedding_length",
+            "rope.dimension_count",
+            "attention.layer_norm_rms_epsilon",
+        ];
+        metadata.has_required_keys(&required)?;
+
+        let embed_len = metadata.get_value::<u32>("embedding_length")? as usize;
+        let head_count = metadata.get_value::<u32>("attention.head_count")? as usize;
+
+        let head_dim = metadata
+            .get_value::<u32>("attention.key_length")
+            .ok()
+            .map(|x| x as usize)
+            .unwrap_or(embed_len / head_count);
+
+        let n_expert = metadata.get_value::<u32>("expert_count").ok().unwrap_or(0) as usize;
+        let n_expert_used = metadata
+            .get_value::<u32>("expert_used_count")
+            .ok()
+            .unwrap_or(0) as usize;
+
+        if n_expert <= 1 {
+            anyhow::bail!(
+                "Mixtral requires expert_count > 1, got {}. Use Llama for dense models.",
+                n_expert
+            );
+        }
+
+        Ok(Self {
+            n_expert,
+            n_expert_used,
+            head_count,
+            head_count_kv: metadata.get_value::<u32>("attention.head_count_kv")? as usize,
+            block_count: metadata.get_value::<u32>("block_count")? as usize,
+            embedding_length: embed_len,
+            rope_dim: metadata.get_value::<u32>("rope.dimension_count")? as usize,
+            rms_norm_eps: metadata.get_value::<f32>("attention.layer_norm_rms_epsilon")? as f64,
+            max_seq_len: metadata
+                .get_value::<u64>("context_length")
+                .ok()
+                .unwrap_or(4096) as usize,
+            rope_freq_base: metadata
+                .get_value::<f32>("rope.freq_base")
+                .ok()
+                .unwrap_or(10_000.0),
+            head_dim,
+        })
+    }
+}
+
+impl ModelConfig::FromGGUF for Mixtral {
+    fn from_gguf<R: std::io::Seek + std::io::Read>(
+        mut ct: Content<'_, R>,
+        device: &Device,
+        mapper: Box<dyn DeviceMapper + Send + Sync>,
+        attention_mechanism: AttentionImplementation,
+        dtype: DType,
+        layer_range: Option<std::ops::Range<usize>>,
+    ) -> Result<Self> {
+        // Parse metadata
+        let metadata = ContentMetadata {
+            path_prefix: "llama",
+            metadata: ct.get_metadata(),
+        };
+        let props = MixtralProps::from_metadata(&metadata)
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+        // Determine layer range for pipeline parallelism
+        let layer_range = layer_range.unwrap_or(0..props.block_count);
+        let layer_start = layer_range.start;
+        let layer_end = layer_range.end.min(props.block_count);
+
+        if layer_start > 0 || layer_end < props.block_count {
+            tracing::info!(
+                "Pipeline parallelism: loading Mixtral layers {}..{} of {} total",
+                layer_start,
+                layer_end,
+                props.block_count
+            );
+        }
+
+        // Load embeddings
+        let tok_embeddings = {
+            let weight = ct.tensor("token_embd.weight", device)?;
+            Embedding::new(weight.dequantize(device)?, props.embedding_length)
+        };
+
+        // PP: Only load norm and output for last stage
+        let is_last_stage = layer_end >= props.block_count;
+        let norm = if is_last_stage {
+            Some(RmsNorm::from_qtensor(
+                ct.tensor("output_norm.weight", device)?,
+                props.rms_norm_eps as f32,
+            )?)
+        } else {
+            None
+        };
+        let output = if is_last_stage {
+            Some(if ct.has_tensor("output.weight") {
+                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                    q_weight: Arc::new(ct.tensor("output.weight", device)?),
+                    b: None,
+                })?) as Arc<dyn QuantMethod>
+            } else {
+                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                    q_weight: Arc::new(ct.tensor("token_embd.weight", device)?),
+                    b: None,
+                })?) as Arc<dyn QuantMethod>
+            })
+        } else {
+            None
+        };
+
+        // Create RoPE embeddings per device
+        let mut ropes = HashMap::new();
+        for layer_idx in layer_start..layer_end {
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                ropes.entry(layer_device.location())
+            {
+                e.insert(Arc::new(RotaryEmbedding::new(
+                    props.rope_freq_base,
+                    props.rope_dim,
+                    props.max_seq_len,
+                    layer_device,
+                    false,
+                    dtype,
+                )?));
+            }
+        }
+
+        // Load decoder layers
+        let mut layers = Vec::with_capacity(layer_end - layer_start);
+
+        for layer_idx in NiceProgressBar::<_, 'b'>(
+            layer_start..layer_end,
+            "Loading Mixtral layers",
+            &new_multi_progress(),
+        ) {
+            let prefix = format!("blk.{layer_idx}");
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            let rotary = ropes
+                .get(&layer_device.location())
+                .expect("No RoPE for device")
+                .clone();
+
+            // Load attention weights
+            let q_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_q.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let k_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_k.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let v_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_v.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let o_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(
+                    ct.tensor(&format!("{prefix}.attn_output.weight"), layer_device)?,
+                ),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+
+            // Load MoE gate
+            let gate = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(
+                    ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), layer_device)?,
+                ),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+
+            // Load experts
+            let experts = load_experts(&mut ct, &prefix, &props, layer_device)?;
+
+            // Load norms
+            let attn_norm = RmsNorm::from_qtensor(
+                ct.tensor(&format!("{prefix}.attn_norm.weight"), layer_device)?,
+                props.rms_norm_eps as f32,
+            )?;
+            let ffn_norm = RmsNorm::from_qtensor(
+                ct.tensor(&format!("{prefix}.ffn_norm.weight"), layer_device)?,
+                props.rms_norm_eps as f32,
+            )?;
+
+            // Paged attention
+            let paged_attn = match &attention_mechanism {
+                AttentionImplementation::Eager => None,
+                AttentionImplementation::PagedAttention => {
+                    Some(PagedAttention::new(props.head_dim, layer_device, None)?)
+                }
+            };
+
+            layers.push(DecoderLayer {
+                attn_norm,
+                attn: Attention {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    n_head: props.head_count,
+                    n_kv_head: props.head_count_kv,
+                    head_dim: props.head_dim,
+                    rotary,
+                    paged_attn,
+                    sdpa_params: SdpaParams {
+                        n_kv_groups: props.head_count / props.head_count_kv,
+                        softcap: None,
+                        softmax_scale: 1.0 / (props.head_dim as f32).sqrt(),
+                        sliding_window: None,
+                    },
+                    dtype,
+                },
+                ffn_norm,
+                moe: SparseMoeBlock {
+                    gate,
+                    experts,
+                    n_expert_used: props.n_expert_used,
+                },
+            });
+        }
+
+        Ok(Self {
+            tok_embeddings,
+            layers,
+            norm,
+            output,
+            device: device.clone(),
+            max_seq_len: props.max_seq_len,
+            num_layers: props.block_count,
+            mapper: Some(mapper),
+            dtype,
+        })
+    }
+}
+
+/// Load expert MLPs from GGUF.
+///
+/// Supports both stacked experts (ffn_gate_exps) and individual experts (ffn_gate.{i}).
+fn load_experts<R: std::io::Seek + std::io::Read>(
+    ct: &mut Content<'_, R>,
+    prefix: &str,
+    props: &MixtralProps,
+    device: &Device,
+) -> Result<Vec<Mlp>> {
+    use candle_core::quantized::QTensor;
+
+    let mut experts = Vec::with_capacity(props.n_expert);
+
+    // Try stacked experts first, fall back to individual
+    match ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device) {
+        Ok(gate_exps) => {
+            let down_exps = ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?;
+            let up_exps = ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?;
+
+            let gate_chunks = gate_exps.dequantize(device)?.chunk(props.n_expert, 0)?;
+            let down_chunks = down_exps.dequantize(device)?.chunk(props.n_expert, 0)?;
+            let up_chunks = up_exps.dequantize(device)?.chunk(props.n_expert, 0)?;
+
+            let gate_type = gate_exps.dtype();
+            let down_type = down_exps.dtype();
+            let up_type = up_exps.dtype();
+
+            for ((gate, down), up) in gate_chunks
+                .into_iter()
+                .zip(down_chunks)
+                .zip(up_chunks)
+            {
+                experts.push(Mlp::from_weights(
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(QTensor::quantize(&gate, gate_type)?),
+                        b: None,
+                    })?),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(QTensor::quantize(&up, up_type)?),
+                        b: None,
+                    })?),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(QTensor::quantize(&down, down_type)?),
+                        b: None,
+                    })?),
+                    Activation::Silu,
+                ));
+            }
+        }
+        Err(_) => {
+            // Individual expert weights
+            for i in 0..props.n_expert {
+                let gate = ct.tensor(&format!("{prefix}.ffn_gate.{i}.weight"), device)?;
+                let down = ct.tensor(&format!("{prefix}.ffn_down.{i}.weight"), device)?;
+                let up = ct.tensor(&format!("{prefix}.ffn_up.{i}.weight"), device)?;
+
+                experts.push(Mlp::from_weights(
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(gate),
+                        b: None,
+                    })?),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(up),
+                        b: None,
+                    })?),
+                    Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(down),
+                        b: None,
+                    })?),
+                    Activation::Silu,
+                ));
+            }
+        }
+    }
+
+    Ok(experts)
+}

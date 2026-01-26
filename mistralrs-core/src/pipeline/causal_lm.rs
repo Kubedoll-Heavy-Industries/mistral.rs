@@ -25,7 +25,8 @@ use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;
 
 use crate::device_map::DeviceMapper;
-use crate::models::llama::LlamaModel as QLlama;
+use crate::models::llama::LlamaModel;
+use crate::models::mixtral::Mixtral;
 use crate::models::quantized_mistral3::ModelWeights as QMistral3;
 use crate::models::quantized_phi2::ModelWeights as QPhi2;
 use crate::models::quantized_phi3::ModelWeights as QPhi3;
@@ -50,7 +51,8 @@ use crate::sequence::Sequence;
 ///
 /// # Supported Architectures
 ///
-/// - `Llama` - LLaMA, LLaMA 2, LLaMA 3, Code Llama, etc.
+/// - `Llama` - LLaMA, LLaMA 2, LLaMA 3, Code Llama, etc. (dense models)
+/// - `Mixtral` - Mixtral, Llama-MoE (Mixture of Experts)
 /// - `Mistral3` - Mistral, Mistral Nemo
 /// - `Phi2` - Phi-2
 /// - `Phi3` - Phi-3, Phi-3.5
@@ -59,7 +61,8 @@ use crate::sequence::Sequence;
 /// - `Qwen3MoE` - Qwen 3 MoE
 /// - `Starcoder2` - StarCoder 2
 pub enum CausalLMPipeline {
-    Llama(TextPipeline<QLlama>),
+    Llama(TextPipeline<LlamaModel>),
+    Mixtral(TextPipeline<Mixtral>),
     Mistral3(TextPipeline<QMistral3>),
     Phi2(TextPipeline<QPhi2>),
     Phi3(TextPipeline<QPhi3>),
@@ -76,6 +79,7 @@ macro_rules! dispatch {
     ($self:expr, $p:ident => $body:expr) => {
         match $self {
             CausalLMPipeline::Llama($p) => $body,
+            CausalLMPipeline::Mixtral($p) => $body,
             CausalLMPipeline::Mistral3($p) => $body,
             CausalLMPipeline::Phi2($p) => $body,
             CausalLMPipeline::Phi3($p) => $body,
@@ -203,6 +207,7 @@ impl CausalLMPipeline {
     pub fn architecture(&self) -> &'static str {
         match self {
             Self::Llama(_) => "Llama",
+            Self::Mixtral(_) => "Mixtral",
             Self::Mistral3(_) => "Mistral3",
             Self::Phi2(_) => "Phi2",
             Self::Phi3(_) => "Phi3",

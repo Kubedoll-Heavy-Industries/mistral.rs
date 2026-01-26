@@ -1088,43 +1088,30 @@ pub struct MixtralLoader;
 impl NormalModelLoader for MixtralLoader {
     fn load(
         &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        normal_loading_metadata: NormalLoadingMetadata,
-        attention_mechanism: AttentionImplementation,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::mixtral::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(models::mixtral::Model::new(
-            &cfg,
-            vb,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            attention_mechanism,
-        )?))
+        anyhow::bail!(
+            "Mixtral safetensors loading is not supported. \
+             Please use GGUF format with CausalLMLoaderBuilder for Mixtral models."
+        )
     }
     fn load_xlora(
         &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::mixtral::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraMixtral::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
-        )?))
+        anyhow::bail!(
+            "Mixtral XLoRA/LoRA loading is not supported. \
+             Please use GGUF format with CausalLMLoaderBuilder for Mixtral models."
+        )
     }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)

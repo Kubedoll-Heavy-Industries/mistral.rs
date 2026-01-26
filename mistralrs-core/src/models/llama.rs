@@ -1,12 +1,15 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-//! Unified Llama model implementation.
+//! Llama model implementation.
 //!
 //! This module provides a generic `Llama<P>` struct parameterized by position encoding.
 //! Type aliases provide concrete model types:
 //!
 //! - `LlamaModel` = `Llama<RotaryEmbedding>` - Basic Llama (GGUF)
 //! - `Llama3Model` = `Llama<Llama3RotaryEmbedding>` - Llama 3 with rope scaling
+//!
+//! For MoE variants (Mixtral), see the `mixtral` module which uses a separate
+//! type to properly represent the different compute characteristics.
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module};
