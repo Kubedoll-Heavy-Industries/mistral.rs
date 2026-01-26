@@ -376,6 +376,174 @@ impl Attention for CausalAttention {
     }
 }
 
+// ============================================================================
+// Fused QKV Causal Attention (Phi3-style)
+// ============================================================================
+
+/// Causal attention with fused QKV projection (Phi3-style).
+///
+/// Unlike `CausalAttention` which has separate Q, K, V projections, this variant
+/// uses a single fused `qkv_proj` that outputs Q, K, V concatenated. The output
+/// is split in the forward pass.
+///
+/// Weight layout: `[hidden_size, n_heads * head_dim + 2 * n_kv_heads * head_dim]`
+/// Output order: Q (n_heads * head_dim), K (n_kv_heads * head_dim), V (n_kv_heads * head_dim)
+///
+/// # Example
+/// ```ignore
+/// let attn = FusedQkvCausalAttention::new(config, qkv_proj, o_proj, rope);
+/// let output = attn.forward(&hidden, mask, &mut cache, seqlen_offsets, paged_attn)?;
+/// ```
+pub struct FusedQkvCausalAttention {
+    /// Attention configuration (head counts, sliding window, etc.)
+    config: AttentionConfig,
+    /// Fused Q+K+V projection
+    qkv_proj: Arc<dyn QuantMethod>,
+    /// Output projection
+    o_proj: Arc<dyn QuantMethod>,
+    /// Position encoding (RoPE)
+    rope: Arc<dyn PositionEncoding>,
+    /// Optional Q/K normalization
+    qk_norm: Option<Arc<dyn QkNorm>>,
+    /// PagedAttention module (if using paged attention)
+    paged_attn: Option<PagedAttention>,
+    /// Target dtype for QKV after RoPE (for quantized models)
+    attn_dtype: Option<DType>,
+}
+
+impl FusedQkvCausalAttention {
+    /// Create a new fused QKV causal attention module.
+    pub fn new(
+        config: AttentionConfig,
+        qkv_proj: Arc<dyn QuantMethod>,
+        o_proj: Arc<dyn QuantMethod>,
+        rope: Arc<dyn PositionEncoding>,
+    ) -> Self {
+        Self {
+            config,
+            qkv_proj,
+            o_proj,
+            rope,
+            qk_norm: None,
+            paged_attn: None,
+            attn_dtype: None,
+        }
+    }
+
+    /// Add Q/K normalization.
+    pub fn with_qk_norm(mut self, qk_norm: Arc<dyn QkNorm>) -> Self {
+        self.qk_norm = Some(qk_norm);
+        self
+    }
+
+    /// Add paged attention support.
+    pub fn with_paged_attn(mut self, paged_attn: PagedAttention) -> Self {
+        self.paged_attn = Some(paged_attn);
+        self
+    }
+
+    /// Set target dtype for attention computation (for quantized models).
+    pub fn with_attn_dtype(mut self, dtype: DType) -> Self {
+        self.attn_dtype = Some(dtype);
+        self
+    }
+
+    /// Check if this attention uses paged attention.
+    pub fn has_paged_attn(&self) -> bool {
+        self.paged_attn.is_some()
+    }
+
+    /// Forward pass through the attention layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        hidden: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut KvCache,
+        seqlen_offsets: &[usize],
+        paged_metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        let (b_sz, seq_len, _) = hidden.dims3()?;
+        let cfg = &self.config;
+
+        // 1. Fused QKV projection
+        let qkv = self.qkv_proj.forward(hidden)?;
+
+        // 2. Split QKV output
+        // Layout: [batch, seq_len, n_heads * head_dim + 2 * n_kv_heads * head_dim]
+        let q_size = cfg.n_heads * cfg.head_dim;
+        let kv_size = cfg.n_kv_heads * cfg.head_dim;
+
+        let q = qkv.narrow(2, 0, q_size)?;
+        let k = qkv.narrow(2, q_size, kv_size)?;
+        let v = qkv.narrow(2, q_size + kv_size, kv_size)?;
+
+        // 3. Reshape for multi-head attention
+        let mut q = reshape_for_attn(q, b_sz, seq_len, cfg.n_heads, cfg.head_dim)?;
+        let mut k = reshape_for_attn(k, b_sz, seq_len, cfg.n_kv_heads, cfg.head_dim)?;
+        let v = reshape_for_attn(v, b_sz, seq_len, cfg.n_kv_heads, cfg.head_dim)?;
+
+        // 4. Optional Q/K normalization
+        if let Some(ref qk_norm) = self.qk_norm {
+            let q_flat = q.flatten(0, 2)?;
+            let k_flat = k.flatten(0, 2)?;
+            let q_normed = qk_norm.forward_q(&q_flat)?;
+            let k_normed = qk_norm.forward_k(&k_flat)?;
+            q = q_normed.reshape((b_sz, cfg.n_heads, seq_len, cfg.head_dim))?;
+            k = k_normed.reshape((b_sz, cfg.n_kv_heads, seq_len, cfg.head_dim))?;
+        }
+
+        // 5. Apply position encoding (RoPE)
+        let (q, k) = self.rope.forward(&q, &k, seqlen_offsets)?;
+
+        // 6. Optional dtype conversion (for quantized models)
+        let (q, k, v) = if let Some(dtype) = self.attn_dtype {
+            (q.to_dtype(dtype)?, k.to_dtype(dtype)?, v.to_dtype(dtype)?)
+        } else {
+            (q, k, v)
+        };
+
+        // 7. Scaled dot-product attention with cache
+        let sdpa_params = cfg.to_sdpa_params();
+        let y = sdpa_with_cache(
+            &q,
+            &k,
+            &v,
+            mask,
+            cache,
+            self.paged_attn.as_ref(),
+            paged_metadata,
+            &sdpa_params,
+        )?;
+
+        // 8. Reshape output and apply output projection
+        let y = reshape_attn_output(y, b_sz, seq_len, mask.is_some())?;
+        let y = if self.attn_dtype.is_some() {
+            y.to_dtype(hidden.dtype())?
+        } else {
+            y
+        };
+        self.o_proj.forward(&y)
+    }
+}
+
+impl Attention for FusedQkvCausalAttention {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        cache: &mut KvCache,
+        position_offsets: &[usize],
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        FusedQkvCausalAttention::forward(self, x, mask, cache, position_offsets, metadata)
+    }
+
+    fn has_paged_attn(&self) -> bool {
+        FusedQkvCausalAttention::has_paged_attn(self)
+    }
+}
+
 #[allow(unused)]
 pub(crate) use backends::{flash_attn, maybe_synchronize, naive_sdpa};
 

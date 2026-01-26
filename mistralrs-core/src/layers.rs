@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::attention::{
     reshape_attn_output, reshape_for_attn, sdpa_with_cache, Attention, AttentionConfig,
-    CausalAttention, PositionEncoding, QkNorm, RmsNormQkNorm, Sdpa, SdpaParams,
+    CausalAttention, FusedQkvCausalAttention, PositionEncoding, QkNorm, RmsNormQkNorm, Sdpa,
+    SdpaParams,
 };
 pub use crate::layers_masker::CausalMasker;
 pub use crate::layers_utils::repeat_kv;
@@ -128,6 +129,27 @@ where
     /// Check if this block has paged attention enabled.
     pub fn has_paged_attn(&self) -> bool {
         self.attention.has_paged_attn()
+    }
+}
+
+// Implement TransformerLayer trait for TransformerBlock.
+// This enables TransformerBlock to be used as the Layer associated type
+// in TransformerModel implementations.
+impl<N, A, F> crate::models::TransformerLayer for TransformerBlock<N, A, F>
+where
+    N: Module + Send + Sync,
+    A: Attention + Send + Sync,
+    F: FeedForward + Send + Sync,
+{
+    fn forward(
+        &self,
+        hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        cache: &mut KvCache,
+        paged_attn_meta: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        TransformerBlock::forward(self, hidden, mask, position_offsets, cache, paged_attn_meta)
     }
 }
 
@@ -3073,6 +3095,62 @@ impl FeedForward for NonGatedMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let hidden = MatMul.qmethod_matmul(xs, &*self.up)?;
         let hidden = self.act.forward(&hidden)?;
+        MatMul.qmethod_matmul(&hidden, &*self.down)
+    }
+}
+
+// ============================================================================
+// Fused Gated MLP (Phi3-style)
+// ============================================================================
+
+/// Fused gated MLP: gate_up (combined) → split → gate * activation(up) → down
+///
+/// Used by models like Phi3 that fuse gate and up projections into a single weight.
+/// The fused weight outputs gate and up concatenated, which are split in forward.
+///
+/// Weight layout: `[hidden_size, 2 * intermediate_size]`
+/// Output order: gate (intermediate_size), up (intermediate_size)
+pub struct FusedGatedMlp {
+    /// Fused gate + up projection
+    pub gate_up: Arc<dyn QuantMethod>,
+    /// Down projection
+    pub down: Arc<dyn QuantMethod>,
+    /// Activation function (applied to gate)
+    pub act: Activation,
+    /// Intermediate size (for splitting gate_up output)
+    pub intermediate_size: usize,
+}
+
+impl FusedGatedMlp {
+    /// Create from pre-loaded weight tensors (for GGUF models).
+    pub fn from_weights(
+        gate_up: Arc<dyn QuantMethod>,
+        down: Arc<dyn QuantMethod>,
+        act: Activation,
+        intermediate_size: usize,
+    ) -> Self {
+        Self {
+            gate_up,
+            down,
+            act,
+            intermediate_size,
+        }
+    }
+}
+
+impl FeedForward for FusedGatedMlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // 1. Fused gate+up projection
+        let gate_up = MatMul.qmethod_matmul(xs, &*self.gate_up)?;
+
+        // 2. Split into gate and up
+        let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
+        let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
+
+        // 3. Apply gated activation: gate * act(up)
+        let hidden = crate::ops::mul_and_act(&gate, &up, self.act)?;
+
+        // 4. Down projection
         MatMul.qmethod_matmul(&hidden, &*self.down)
     }
 }

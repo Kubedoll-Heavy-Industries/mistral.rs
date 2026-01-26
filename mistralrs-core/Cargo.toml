@@ -161,6 +161,7 @@ bindgen_cuda = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+serial_test = "3"
 
 [[bench]]
 name = "attention"

@@ -28,9 +28,16 @@ pub(crate) mod qwen3_moe;
 pub(crate) mod smollm3;
 pub(crate) mod starcoder2;
 
-use candle_core::{Device, Result, Tensor};
+use std::sync::Arc;
 
-use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
+use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_nn::Embedding;
+use mistralrs_quant::QuantMethod;
+
+use crate::device_map::DeviceMapper;
+use crate::layers::{CausalMasker, MatMul};
+use crate::layers_masker::PastKvLenCache;
+use crate::pipeline::text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata};
 use crate::pipeline::KvCache;
 
 /// Base trait for all models.
@@ -57,6 +64,15 @@ pub struct TransformContext<'a> {
     /// PagedAttention context, if using paged attention.
     /// None when using eager attention or during prefill without paging.
     pub paged_attn: Option<&'a PagedAttentionContext<'a>>,
+
+    /// Flash attention parameters, if using flash attention.
+    /// None when using standard SDPA.
+    pub flash_params: Option<&'a FlashParams>,
+
+    /// Explicit position IDs for each token in the sequence.
+    /// Some models (like Phi3) use explicit position IDs instead of deriving from offset.
+    /// When None, models should derive positions from `position_offset`.
+    pub position_ids: Option<&'a [usize]>,
 }
 
 /// PagedAttention-specific context for transform.
@@ -68,25 +84,45 @@ pub struct PagedAttentionContext<'a> {
     pub metadata: &'a PagedAttentionInputMetadata,
 }
 
+/// Trait for transformer layers (used as associated type bound).
+///
+/// Transformer layers take hidden states and produce transformed hidden states.
+/// This trait is implemented by `TransformerBlock<N, A, F>` and its type aliases.
+pub trait TransformerLayer: Send + Sync {
+    /// Forward pass through this layer.
+    fn forward(
+        &self,
+        hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        cache: &mut KvCache,
+        paged_attn_meta: Option<(
+            (Tensor, Tensor),
+            &PagedAttentionInputMetadata,
+        )>,
+    ) -> Result<Tensor>;
+}
+
+// =============================================================================
+// Object-Safe Base Traits (for dynamic dispatch via dyn LanguageModel)
+// =============================================================================
+
 /// Trait for transformer-based models.
 ///
-/// Extends `Model` with core transformer operations: embedding and layer-by-layer
-/// transformation. This trait is shared by all transformer architectures (language
-/// models, embedding models, vision encoders, etc.).
+/// This is the **object-safe** base trait used for dynamic dispatch in pipelines
+/// like `GGUFPipeline`. It defines the core operations that all transformer models
+/// must implement.
 ///
-/// # Capabilities
-/// - `embed`: tokens → hidden states
-/// - `transform`: hidden → hidden (through layers)
+/// # Design
 ///
-/// # Example: Embedding model
-/// ```ignore
-/// let hidden = model.embed(&tokens)?;
-/// let hidden = model.transform(hidden, &ctx)?;
-/// // Apply pooling for embeddings
-/// ```
+/// This trait is intentionally minimal and object-safe. Models implement the
+/// required methods directly. For models with standard structure, helper functions
+/// are available that can be called from the implementations.
 ///
-/// # Pipeline parallelism
-/// The pipeline (not the model) determines which methods to call based on its stage.
+/// # Related Traits
+///
+/// - `TransformerModelExt`: Extension trait with accessors and associated types
+///   for compile-time polymorphism. Use this with typed pipelines like `TextPipeline<M>`.
 pub trait TransformerModel: Model {
     /// Number of transformer layers in this model.
     fn num_layers(&self) -> usize;
@@ -104,23 +140,18 @@ pub trait TransformerModel: Model {
     ///
     /// Input: hidden states [batch, seq_len, hidden_dim]
     /// Output: hidden states [batch, seq_len, hidden_dim]
-    ///
-    /// The context provides position information for RoPE and optional paged attention metadata.
-    /// The cache is owned by the Pipeline and passed in - models are stateless.
-    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor>;
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor>;
 }
 
 /// Trait for language models (decoder-only transformers for text generation).
 ///
-/// Extends `TransformerModel` with the language modeling head (`lm_head`) that
-/// projects hidden states to vocabulary logits for next-token prediction.
-///
-/// # Example: Single-node inference
-/// ```ignore
-/// let hidden = model.embed(&tokens)?;
-/// let hidden = model.transform(hidden, &ctx)?;
-/// let logits = model.lm_head(hidden)?;
-/// ```
+/// This is the **object-safe** base trait that extends `TransformerModel` with
+/// the language modeling head for next-token prediction.
 ///
 /// # Pipeline parallelism
 /// The pipeline (not the model) determines which methods to call based on its stage:
@@ -135,6 +166,139 @@ pub trait LanguageModel: TransformerModel {
 }
 
 // =============================================================================
+// Extension Traits with Associated Types (for typed pipelines)
+// =============================================================================
+
+/// Extension trait providing accessors for transformer model components.
+///
+/// This trait is **not object-safe** due to associated types. It's used by typed
+/// pipelines like `TextPipeline<M>` where the concrete model type is known at
+/// compile time.
+///
+/// Models implementing this trait can use the helper functions for standard
+/// implementations of `TransformerModel` methods.
+pub trait TransformerModelExt: TransformerModel {
+    /// The transformer layer type for this model.
+    type Layer: TransformerLayer;
+
+    /// The output normalization type for this model.
+    type Norm: Module;
+
+    /// Access to token embeddings.
+    fn tok_embeddings(&self) -> &Embedding;
+
+    /// Access to transformer layers.
+    fn layers(&self) -> &[Self::Layer];
+
+    /// Access to output normalization layer.
+    fn output_norm(&self) -> &Self::Norm;
+
+    /// Access to device mapper (if any).
+    fn mapper(&self) -> Option<&dyn DeviceMapper>;
+
+    /// The dtype used for attention computation.
+    fn model_dtype(&self) -> DType;
+}
+
+/// Extension trait providing accessor for the output projection.
+///
+/// This trait is **not object-safe** due to the `TransformerModelExt` bound.
+/// Used by typed pipelines for models with standard LM head structure.
+pub trait LanguageModelExt: LanguageModel + TransformerModelExt {
+    /// Access to output projection weights.
+    fn output(&self) -> &Arc<dyn QuantMethod>;
+}
+
+// =============================================================================
+// Helper Functions for Standard Implementations
+// =============================================================================
+
+/// Standard implementation of `embed` for models with `TransformerModelExt`.
+///
+/// Simply forwards tokens through the token embeddings layer.
+pub fn standard_embed<M: TransformerModelExt + ?Sized>(model: &M, tokens: &Tensor) -> Result<Tensor> {
+    model.tok_embeddings().forward(tokens)
+}
+
+/// Standard implementation of `transform` for models with `TransformerModelExt`.
+///
+/// Creates a causal mask and runs through all transformer layers with device mapping.
+pub fn standard_transform<M: TransformerModelExt + ?Sized>(
+    model: &M,
+    hidden: Tensor,
+    ctx: &TransformContext,
+    cache: &mut [KvCache],
+) -> Result<Tensor> {
+    let seq_len = hidden.dim(1)?;
+    let start_offsets: Vec<usize> = vec![ctx.position_offset];
+
+    // Compute causal mask
+    let mask = CausalMasker.make_causal_mask_as(
+        seq_len,
+        hidden.device(),
+        &start_offsets.as_slice() as &dyn PastKvLenCache,
+        model.model_dtype(),
+    )?;
+
+    // Skip mask for non-first chunks in paged attention
+    let mask = mask.filter(|_| {
+        ctx.paged_attn
+            .as_ref()
+            .map(|pa| pa.metadata.is_first_prompt_chunk)
+            .unwrap_or(true)
+    });
+
+    // Run through layers
+    standard_run_layers(model, hidden, mask.as_ref(), &start_offsets, ctx, cache)
+}
+
+/// Standard implementation of layer iteration for models with `TransformerModelExt`.
+///
+/// Iterates through layers with device mapping and paged attention support.
+pub fn standard_run_layers<M: TransformerModelExt + ?Sized>(
+    model: &M,
+    mut hidden: Tensor,
+    mask: Option<&Tensor>,
+    position_offsets: &[usize],
+    ctx: &TransformContext,
+    cache: &mut [KvCache],
+) -> Result<Tensor> {
+    let metadata = ctx
+        .paged_attn
+        .as_ref()
+        .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
+
+    for (i, layer) in model.layers().iter().enumerate() {
+        // Apply device mapping if present
+        if let Some(mapper) = model.mapper() {
+            hidden = mapper.map(hidden, i)?;
+        }
+
+        let layer_metadata = metadata
+            .as_ref()
+            .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta));
+
+        hidden = layer.forward(
+            hidden,
+            mask,
+            position_offsets,
+            &mut cache[i],
+            layer_metadata,
+        )?;
+    }
+
+    Ok(hidden)
+}
+
+/// Standard implementation of `lm_head` for models with `LanguageModelExt`.
+///
+/// Applies output normalization then projects to vocabulary size.
+pub fn standard_lm_head<M: LanguageModelExt + ?Sized>(model: &M, hidden: Tensor) -> Result<Tensor> {
+    let x = model.output_norm().forward(&hidden)?;
+    MatMul.qmethod_matmul(&x.contiguous()?, &**model.output())
+}
+
+// =============================================================================
 // Unified Model Configuration Traits
 // =============================================================================
 //
@@ -143,21 +307,40 @@ pub trait LanguageModel: TransformerModel {
 // either source.
 
 use crate::layers::Activation;
+use mistralrs_quant::QuantizedConfig;
 
-/// Configuration trait for Llama-family models.
+/// Configuration trait for decoder-only language models.
+///
+/// This trait captures the hyperparameters common to all decoder-only transformers
+/// used for text generation: Llama, Mistral, Qwen, Phi, etc.
 ///
 /// Implemented by both JSON config (safetensors) and GGUF metadata, enabling
-/// a single `Llama` model to be constructed from either source.
+/// a single model implementation to be constructed from either source.
+///
+/// # What this captures
+///
+/// - **Decoder-only transformers** with causal attention
+/// - **RoPE positional encoding** (rope_theta)
+/// - **Pre-norm architecture** with RmsNorm (rms_norm_eps)
+/// - **Grouped-query attention** (num_kv_heads)
+/// - **Gated MLP** (intermediate_size, hidden_act)
+///
+/// # What this does NOT capture
+///
+/// - Encoder-decoder models (T5, BART)
+/// - Encoder-only models (BERT)
+/// - Vision/diffusion models
+/// - Models with different positional encoding (learned, ALiBi)
 ///
 /// # Example
 /// ```ignore
-/// // Works with JSON config
-/// let model = Llama::from_config(&json_config, vb)?;
-///
-/// // Works with GGUF metadata
-/// let model = Llama::from_config(&gguf_config, content)?;
+/// fn load_model<C: LanguageModelConfig>(cfg: &C, vb: VarBuilder) -> Result<impl LanguageModel> {
+///     let hidden_size = cfg.hidden_size();
+///     let num_layers = cfg.num_layers();
+///     // ... construct model using config accessors
+/// }
 /// ```
-pub trait LlamaConfig {
+pub trait LanguageModelConfig {
     /// Hidden dimension (embedding size).
     fn hidden_size(&self) -> usize;
 
@@ -226,4 +409,18 @@ pub trait LlamaConfig {
     fn num_experts_used(&self) -> usize {
         0
     }
+
+    /// Quantization configuration (for quantized models).
+    /// Returns None for full-precision models.
+    fn quantization_config(&self) -> Option<&QuantizedConfig> {
+        None
+    }
 }
+
+/// Deprecated alias for backwards compatibility.
+#[deprecated(since = "0.8.0", note = "Use LanguageModelConfig instead")]
+pub trait LlamaConfig: LanguageModelConfig {}
+
+// Blanket impl: anything implementing LanguageModelConfig also implements LlamaConfig
+#[allow(deprecated)]
+impl<T: LanguageModelConfig> LlamaConfig for T {}
