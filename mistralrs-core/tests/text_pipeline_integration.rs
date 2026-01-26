@@ -543,9 +543,24 @@ const MODEL_FAMILIES: &[ModelTestInfo] = &[
         expected_arch: "llama",
     },
     ModelTestInfo {
+        name: "Mixtral",
+        env_var: "TEST_MIXTRAL_MODEL",
+        expected_arch: "llama", // Mixtral uses Llama architecture tag in GGUF
+    },
+    ModelTestInfo {
+        name: "Qwen2",
+        env_var: "TEST_QWEN2_MODEL",
+        expected_arch: "qwen2",
+    },
+    ModelTestInfo {
         name: "Qwen3",
         env_var: "TEST_QWEN3_MODEL",
         expected_arch: "qwen3",
+    },
+    ModelTestInfo {
+        name: "Phi2",
+        env_var: "TEST_PHI2_MODEL",
+        expected_arch: "phi2",
     },
     ModelTestInfo {
         name: "Phi3",
@@ -638,9 +653,14 @@ fn run_model_family_test(info: &ModelTestInfo) -> bool {
     }
 }
 
+/// Helper to find a model family by name.
+fn find_model_family(name: &str) -> Option<&'static ModelTestInfo> {
+    MODEL_FAMILIES.iter().find(|info| info.name == name)
+}
+
 #[test]
 fn test_llama_family() {
-    let info = &MODEL_FAMILIES[0]; // Llama
+    let info = find_model_family("Llama").unwrap();
     if std::env::var(info.env_var).is_ok() {
         assert!(run_model_family_test(info), "Llama model test failed");
     } else {
@@ -649,8 +669,28 @@ fn test_llama_family() {
 }
 
 #[test]
+fn test_mixtral_family() {
+    let info = find_model_family("Mixtral").unwrap();
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Mixtral model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
+fn test_qwen2_family() {
+    let info = find_model_family("Qwen2").unwrap();
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Qwen2 model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
 fn test_qwen3_family() {
-    let info = &MODEL_FAMILIES[1]; // Qwen3
+    let info = find_model_family("Qwen3").unwrap();
     if std::env::var(info.env_var).is_ok() {
         assert!(run_model_family_test(info), "Qwen3 model test failed");
     } else {
@@ -659,8 +699,18 @@ fn test_qwen3_family() {
 }
 
 #[test]
+fn test_phi2_family() {
+    let info = find_model_family("Phi2").unwrap();
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Phi2 model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
 fn test_phi3_family() {
-    let info = &MODEL_FAMILIES[2]; // Phi3
+    let info = find_model_family("Phi3").unwrap();
     if std::env::var(info.env_var).is_ok() {
         assert!(run_model_family_test(info), "Phi3 model test failed");
     } else {
@@ -670,7 +720,7 @@ fn test_phi3_family() {
 
 #[test]
 fn test_mistral3_family() {
-    let info = &MODEL_FAMILIES[3]; // Mistral3
+    let info = find_model_family("Mistral3").unwrap();
     if std::env::var(info.env_var).is_ok() {
         assert!(run_model_family_test(info), "Mistral3 model test failed");
     } else {
@@ -680,7 +730,7 @@ fn test_mistral3_family() {
 
 #[test]
 fn test_starcoder2_family() {
-    let info = &MODEL_FAMILIES[4]; // Starcoder2
+    let info = find_model_family("Starcoder2").unwrap();
     if std::env::var(info.env_var).is_ok() {
         assert!(run_model_family_test(info), "Starcoder2 model test failed");
     } else {
