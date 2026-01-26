@@ -10,11 +10,11 @@ use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{
-    Activation, AttentionConfig, CausalAttention, CausalMasker, MatMul, Mlp, QRmsNorm,
+    Activation, AttentionConfig, CausalAttention, CausalMasker, MatMul, Mlp, RmsNorm,
     RmsNormQkNorm, RotaryEmbedding, TransformerBlock,
 };
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
@@ -28,15 +28,15 @@ const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
 /// A transformer block for Qwen3 using pre-norm architecture.
 ///
 /// Uses the generic `TransformerBlock` with:
-/// - `QRmsNorm` for normalization (quantized RMS norm)
+/// - `RmsNorm` for normalization (quantized RMS norm)
 /// - `CausalAttention` for attention (with QK norm and RoPE)
 /// - `Mlp` for feed-forward (SiLU-gated MLP)
-type Qwen3Block = TransformerBlock<QRmsNorm, CausalAttention, Mlp>;
+type Qwen3Block = TransformerBlock<RmsNorm, CausalAttention, Mlp>;
 
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<Qwen3Block>,
-    norm: QRmsNorm,
+    norm: RmsNorm,
     output: Arc<dyn QuantMethod>,
     pub device: Device,
     pub max_seq_len: usize,
@@ -169,7 +169,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
+        let norm = RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
         let output = if !ct.has_tensor("output.weight") {
             ct.tensor("token_embd.weight", device)?
         } else {
@@ -254,11 +254,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
             );
 
             // Qwen3 Q/K normalization (per-head RMSNorm)
-            let q_norm = QRmsNorm::new(
+            let q_norm = RmsNorm::from_qtensor(
                 ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
-            let k_norm = QRmsNorm::new(
+            let k_norm = RmsNorm::from_qtensor(
                 ct.tensor(&format!("{prefix}.attn_k_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
@@ -266,11 +266,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 Arc::new(RmsNormQkNorm::new(q_norm, k_norm));
 
             // Layer norms
-            let attention_norm = QRmsNorm::new(
+            let attention_norm = RmsNorm::from_qtensor(
                 ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
-            let ffn_norm = QRmsNorm::new(
+            let ffn_norm = RmsNorm::from_qtensor(
                 ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
@@ -423,7 +423,9 @@ impl TransformerModel for ModelWeights {
             .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
         self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         let x = self.norm.forward(&hidden)?;
         MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)

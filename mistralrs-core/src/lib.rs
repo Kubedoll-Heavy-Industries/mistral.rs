@@ -1,4 +1,7 @@
 #![deny(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(deprecated)] // Allow deprecated types during migration to typed loaders
+#![allow(dead_code)] // Allow unused code during architecture migration
+
 use candle_core::Device;
 use engine::Engine;
 pub use engine::{
@@ -90,6 +93,7 @@ pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
 pub use sequence::StopReason;
 pub use device_map::{
     DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, LayerDeviceMapper,
+    SingleDeviceMapper,
 };
 pub use gguf::{GGUFArchitecture, GGUF_MULTI_FILE_DELIMITER};
 pub use mistralrs_audio::AudioInput;
@@ -101,24 +105,28 @@ pub use mistralrs_mcp::{
 };
 pub use mistralrs_quant::{IsqType, MULTI_LORA_DELIMITER};
 pub use paged_attention::{
-    MemoryGpuConfig, ModelConfigLike, ModelConfigMetadata, PagedAttentionConfig, PagedCacheType,
+    AttentionImplementation, MemoryGpuConfig, ModelConfigLike, ModelConfigMetadata,
+    PagedAttentionConfig, PagedCacheType,
 };
+#[allow(deprecated)] // Re-exports deprecated types for backward compatibility during migration
 pub use pipeline::{
-    chat_template::ChatTemplate, estimate_kv_cache_bytes, parse_isq_value, AdapterPaths,
-    AnyMoeLoader, AnyMoePipeline, AutoDeviceMapParams, AutoEmbeddingLoader, AutoLoader,
-    AutoLoaderBuilder, AutoNormalLoader, AutoVisionLoader, DeviceMappedModelLoader,
-    DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType,
-    EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths,
-    EmbeddingSpecificConfig, GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader,
-    GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, HookContainer, Idefics2Loader,
-    ActivationResult, IsqOrganization, LayerActivation, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader,
-    LocalModelPaths, LoraAdapterPaths, MistralLoader, MixtralLoader, Modalities, ModelKind,
-    ModelPaths, MultimodalPromptPrefixer, NonMappedSubModel, NormalLoaderType,
-    Phi2Loader, Phi3Loader, Phi3VLoader, PipelineHook,
-    SafetensorsLoader, SafetensorsLoaderBuilder, SafetensorsConfig,
-    Qwen2Loader, SpeculativeConfig, SpeculativeLoader, SpeculativePipeline, SpeechLoader,
-    SpeechPipeline, Starcoder2Loader, SupportedModality, TokenSource, VisionLoader,
-    VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
+    chat_template::ChatTemplate, estimate_kv_cache_bytes, load_text_pipeline, parse_isq_value,
+    ActivationResult, AdapterPaths, AnyMoeLoader, AnyMoePipeline, AutoDeviceMapParams,
+    AutoEmbeddingLoader, AutoLoader, AutoLoaderBuilder, AutoNormalLoader, AutoVisionLoader,
+    CacheManagerMixin, CausalLMLoader, CausalLMLoaderBuilder, CausalLMPipeline,
+    DeviceMappedModelLoader, DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder,
+    DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingLoaderType,
+    EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader,
+    GgufContentConfig, GgufLoader, GgufMetadata, HookContainer, Idefics2Loader, IsqOrganization,
+    LLaVALoader, LLaVANextLoader, LayerActivation, LlamaLoader, Loader, LocalModelPaths,
+    LoraAdapterPaths, MetadataMixin, MistralLoader, MixtralLoader, Modalities, ModelKind,
+    ModelPaths, MultimodalPromptPrefixer, NonMappedSubModel, NormalLoaderType, Phi2Loader,
+    Phi3Loader, Phi3VLoader, PipelineHook, Qwen2Loader, SafetensorsConfig, SafetensorsLoader,
+    SafetensorsLoaderBuilder, SpeculativeConfig, SpeculativeLoader, SpeculativePipeline,
+    SpeechLoader, SpeechPipeline, Starcoder2Loader, SupportedModality, TextPipeline, TokenSource,
+    VisionLoader, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
+    UQFF_MULTI_FILE_DELIMITER,
 };
 // Backwards compatibility re-exports (deprecated)
 #[allow(deprecated)]

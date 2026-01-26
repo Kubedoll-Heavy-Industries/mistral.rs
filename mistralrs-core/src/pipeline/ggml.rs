@@ -11,7 +11,7 @@ use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::DeviceMapper;
 use crate::kv_cache::{FullCacheManager, NormalCache};
 use crate::lora::Ordering;
-use crate::models::{TransformContext, TransformerModel};
+use crate::models::{LanguageModel, TransformContext, TransformerModel};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::{get_chat_template, Modalities, SupportedModality};

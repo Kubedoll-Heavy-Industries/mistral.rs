@@ -222,38 +222,51 @@ impl GgufModelBuilder {
     }
 
     pub async fn build(self) -> anyhow::Result<Model> {
-        let config = GGUFSpecificConfig {
-            topology: self.topology,
-            layer_range: None,
-        };
-
         if self.with_logging {
             initialize_logging();
         }
 
-        let loader = GGUFLoaderBuilder::new(
-            self.chat_template,
-            self.tok_model_id,
-            self.model_id,
-            self.files,
-            config,
-            self.no_kv_cache,
-            self.jinja_explicit,
-        )
-        .build();
+        // Build typed loader using CausalLMLoaderBuilder
+        let filenames: Vec<&str> = self.files.iter().map(|s| s.as_str()).collect();
+        let mut builder = CausalLMLoaderBuilder::from_hf(&self.model_id, &filenames)
+            .with_device(self.device.clone().unwrap_or(best_device(self.force_cpu)?))
+            .with_device_map(
+                self.device_mapping
+                    .clone()
+                    .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
+            )
+            .with_token_source(self.token_source.clone())
+            .with_no_kv_cache(self.no_kv_cache);
 
-        // Load, into a Pipeline
-        let pipeline = loader.load_model_from_hf(
-            self.hf_revision,
-            self.token_source,
-            &ModelDType::Auto,
-            &self.device.unwrap_or(best_device(self.force_cpu).unwrap()),
-            !self.with_logging,
-            self.device_mapping
-                .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
-            None,
-            self.paged_attn_cfg,
-        )?;
+        if !self.with_logging {
+            builder = builder.silent();
+        }
+
+        if let Some(ref revision) = self.hf_revision {
+            builder = builder.with_revision(revision.clone());
+        }
+
+        if let Some(ref chat_template) = self.chat_template {
+            builder = builder.with_chat_template(chat_template.clone());
+        }
+
+        if let Some(ref tok_model_id) = self.tok_model_id {
+            builder = builder.with_tok_model_id(tok_model_id.clone());
+        }
+
+        if let Some(ref topology) = self.topology {
+            builder = builder.with_topology(topology.clone());
+        }
+
+        if let Some(ref jinja_explicit) = self.jinja_explicit {
+            builder = builder.with_jinja_explicit(jinja_explicit.clone());
+        }
+
+        if let Some(ref paged_attn_cfg) = self.paged_attn_cfg {
+            builder = builder.with_paged_attention(paged_attn_cfg.clone());
+        }
+
+        let pipeline = builder.build_async()?;
 
         let scheduler_method = match self.paged_attn_cfg {
             Some(_) => {

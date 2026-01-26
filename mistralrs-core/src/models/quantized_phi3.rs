@@ -6,7 +6,7 @@ use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{CausalMasker, MatMul, RmsNorm, Sdpa};
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::layers_masker::PastKvLenCache;
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -391,6 +391,7 @@ impl ModelWeights {
     /// Run transformer layers on activations.
     /// Consumes: activations [batch, seq_len, hidden_dim], tokens
     /// Produces: activations [batch, seq_len, hidden_dim]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_layers(
         &self,
         input_ids: &Tensor,
@@ -468,6 +469,7 @@ impl ModelWeights {
     /// * `metadata` - PagedAttention metadata if enabled
     /// * `request_id` - UUID for distributed tracing
     /// * `cache` - KV cache for attention layers
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -577,7 +579,9 @@ impl TransformerModel for ModelWeights {
 
         Ok(hidden)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         self.apply_lm_head(hidden)
     }

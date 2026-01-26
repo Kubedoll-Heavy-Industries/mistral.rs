@@ -1,3 +1,5 @@
+#![allow(deprecated)] // Uses deprecated mixin traits during migration
+
 use crate::{
     distributed,
     pipeline::{
@@ -325,6 +327,7 @@ impl Engine {
                     self.replicate_request_to_daemons(&Request::Terminate);
                     break 'lp;
                 }
+                #[allow(clippy::large_enum_variant)]
                 enum WaitEvent {
                     Request(Option<Request>),
                     Wake,

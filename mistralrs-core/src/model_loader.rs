@@ -1,3 +1,6 @@
+// Allow deprecated types during migration - XLora/Lora variants still use GGUFLoaderBuilder
+#![allow(deprecated)]
+
 use std::{
     fs::{self, File},
     path::PathBuf,
@@ -9,10 +12,10 @@ use mistralrs_quant::MULTI_LORA_DELIMITER;
 use crate::{
     get_toml_selected_model_dtype,
     pipeline::{
-        AutoLoaderBuilder, DiffusionLoaderBuilder, GGMLLoaderBuilder, GGMLSpecificConfig,
-        GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig, GGUFLoaderBuilder,
-        GGUFSpecificConfig, SafetensorsLoaderBuilder, SafetensorsConfig, RerankLoader,
-        VisionLoaderBuilder, VisionSpecificConfig,
+        AutoLoaderBuilder, CausalLMLoader, DiffusionLoaderBuilder, GGMLLoaderBuilder,
+        GGMLSpecificConfig, GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig,
+        GGUFLoaderBuilder, GGUFSpecificConfig, RerankLoader, SafetensorsConfig,
+        SafetensorsLoaderBuilder, VisionLoaderBuilder, VisionSpecificConfig,
     },
     toml_selector::get_toml_selected_model_device_map_params,
     AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig, Loader, ModelDType,
@@ -530,22 +533,36 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             quantized_filename,
             topology,
             ..
-        } => GGUFLoaderBuilder::new(
-            args.chat_template,
-            tok_model_id,
-            quantized_model_id,
-            quantized_filename
-                .split(GGUF_MULTI_FILE_DELIMITER)
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>(),
-            GGUFSpecificConfig {
-                topology: Topology::from_option_path(topology)?,
-                layer_range: args.layer_range.clone(),
-            },
-            args.no_kv_cache,
-            args.jinja_explicit,
-        )
-        .build(),
+        } => {
+            // Use CausalLMLoader for plain GGUF models
+            let mut loader = CausalLMLoader::new(
+                quantized_model_id,
+                quantized_filename
+                    .split(GGUF_MULTI_FILE_DELIMITER)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>(),
+                args.chat_template,
+                args.no_kv_cache,
+            );
+
+            if let Some(tok_id) = tok_model_id {
+                loader = loader.with_tok_model_id(tok_id);
+            }
+
+            if let Some(ref range) = args.layer_range {
+                loader = loader.with_layer_range(range.clone());
+            }
+
+            if let Some(topology) = Topology::from_option_path(topology)? {
+                loader = loader.with_topology(topology);
+            }
+
+            if let Some(jinja_path) = args.jinja_explicit {
+                loader = loader.with_jinja_explicit(jinja_path);
+            }
+
+            Box::new(loader)
+        }
         ModelSelected::XLoraGGUF {
             tok_model_id,
             quantized_model_id,

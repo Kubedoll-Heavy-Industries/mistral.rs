@@ -10,9 +10,9 @@ use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
@@ -41,11 +41,11 @@ struct LayerWeights {
     attention_wk: Arc<dyn QuantMethod>,
     attention_wv: Arc<dyn QuantMethod>,
     attention_wo: Arc<dyn QuantMethod>,
-    attention_norm: QRmsNorm,
-    q_norm: Option<QRmsNorm>,
-    k_norm: Option<QRmsNorm>,
+    attention_norm: RmsNorm,
+    q_norm: Option<RmsNorm>,
+    k_norm: Option<RmsNorm>,
     mlp: Mlp,
-    ffn_norm: QRmsNorm,
+    ffn_norm: RmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -146,7 +146,7 @@ impl LayerWeights {
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
-    norm: QRmsNorm,
+    norm: RmsNorm,
     output: Arc<dyn QuantMethod>,
     pub device: Device,
     pub max_seq_len: usize,
@@ -283,7 +283,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
+        let norm = RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
         let output = if !ct.has_tensor("output.weight") {
             ct.tensor("token_embd.weight", device)?
         } else {
@@ -379,8 +379,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
             let (q_norm, k_norm) = match (q_norm, k_norm) {
                 (Ok(q), Ok(k)) => {
-                    let q_norm = QRmsNorm::new(q, rms_norm_eps)?;
-                    let k_norm = QRmsNorm::new(k, rms_norm_eps)?;
+                    let q_norm = RmsNorm::from_qtensor(q, rms_norm_eps)?;
+                    let k_norm = RmsNorm::from_qtensor(k, rms_norm_eps)?;
                     (Some(q_norm), Some(k_norm))
                 }
                 _ => (None, None),
@@ -411,11 +411,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     q_weight: Arc::new(attention_wo),
                     b: None,
                 })?),
-                attention_norm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
+                attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 q_norm,
                 k_norm,
                 mlp,
-                ffn_norm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
+                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
@@ -556,7 +556,9 @@ impl TransformerModel for ModelWeights {
             .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
         self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         let x = self.norm.forward(&hidden)?;
         MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)

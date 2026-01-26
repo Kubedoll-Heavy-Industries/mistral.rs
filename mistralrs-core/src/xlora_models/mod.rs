@@ -1,3 +1,6 @@
+// Allow deprecated traits during migration - XLora models use NormalModel and AnyMoeBaseModelMixin
+#![allow(deprecated)]
+
 mod classifier;
 mod config;
 mod gemma;

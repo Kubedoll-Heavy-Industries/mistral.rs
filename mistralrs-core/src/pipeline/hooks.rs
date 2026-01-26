@@ -17,9 +17,11 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub enum ActivationResult {
     /// Got activation data to process - continue with forward pass.
+    ///
     /// The tensor shape encodes the phase:
-    /// - seq_len > 1: Prefill phase (accumulate in cache, no logits)
-    /// - seq_len == 1: Decode phase (process and return logits)
+    ///   - seq_len > 1: Prefill phase (accumulate in cache, no logits)
+    ///   - seq_len == 1: Decode phase (process and return logits)
+    ///
     /// Position is derived from cache length (stream cursor model):
     /// `position = starting_position + cache.len()`
     Data {

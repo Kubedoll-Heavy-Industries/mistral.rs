@@ -1,3 +1,5 @@
+#![allow(deprecated)] // Uses deprecated mixin traits during migration
+
 use std::any::Any;
 
 use candle_core::Tensor;

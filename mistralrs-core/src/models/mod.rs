@@ -1,3 +1,6 @@
+// Allow deprecated traits during migration to new trait hierarchy
+#![allow(deprecated)]
+
 pub(crate) mod deepseek2;
 pub(crate) mod deepseek3;
 pub(crate) mod gemma;
@@ -65,28 +68,25 @@ pub struct PagedAttentionContext<'a> {
     pub metadata: &'a PagedAttentionInputMetadata,
 }
 
-/// Trait for transformer-based language models.
+/// Trait for transformer-based models.
 ///
-/// Extends `Model` with transformer-specific operations. Models define capabilities
-/// as pure functions over tensors. Pipelines decide what to call based on their
-/// stage configuration.
+/// Extends `Model` with core transformer operations: embedding and layer-by-layer
+/// transformation. This trait is shared by all transformer architectures (language
+/// models, embedding models, vision encoders, etc.).
 ///
 /// # Capabilities
 /// - `embed`: tokens → hidden states
 /// - `transform`: hidden → hidden (through layers)
-/// - `lm_head`: hidden → logits
 ///
-/// # Example: Single-node inference
+/// # Example: Embedding model
 /// ```ignore
 /// let hidden = model.embed(&tokens)?;
 /// let hidden = model.transform(hidden, &ctx)?;
-/// let logits = model.lm_head(hidden)?;
+/// // Apply pooling for embeddings
 /// ```
 ///
 /// # Pipeline parallelism
-/// The pipeline (not the model) determines which methods to call based on its stage:
-/// - HEAD: `embed()` → `transform()` → send activation
-/// - TAIL: receive → `transform()` → `lm_head()`
+/// The pipeline (not the model) determines which methods to call based on its stage.
 pub trait TransformerModel: Model {
     /// Number of transformer layers in this model.
     fn num_layers(&self) -> usize;
@@ -108,10 +108,122 @@ pub trait TransformerModel: Model {
     /// The context provides position information for RoPE and optional paged attention metadata.
     /// The cache is owned by the Pipeline and passed in - models are stateless.
     fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor>;
+}
 
+/// Trait for language models (decoder-only transformers for text generation).
+///
+/// Extends `TransformerModel` with the language modeling head (`lm_head`) that
+/// projects hidden states to vocabulary logits for next-token prediction.
+///
+/// # Example: Single-node inference
+/// ```ignore
+/// let hidden = model.embed(&tokens)?;
+/// let hidden = model.transform(hidden, &ctx)?;
+/// let logits = model.lm_head(hidden)?;
+/// ```
+///
+/// # Pipeline parallelism
+/// The pipeline (not the model) determines which methods to call based on its stage:
+/// - HEAD: `embed()` → `transform()` → send activation
+/// - TAIL: receive → `transform()` → `lm_head()`
+pub trait LanguageModel: TransformerModel {
     /// Project hidden states to vocabulary logits.
     ///
     /// Input: hidden states [batch, seq_len, hidden_dim]
     /// Output: logits [batch, seq_len, vocab_size]
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor>;
+}
+
+// =============================================================================
+// Unified Model Configuration Traits
+// =============================================================================
+//
+// These traits abstract over configuration sources (JSON config.json vs GGUF
+// metadata), enabling a single model implementation to be constructed from
+// either source.
+
+use crate::layers::Activation;
+
+/// Configuration trait for Llama-family models.
+///
+/// Implemented by both JSON config (safetensors) and GGUF metadata, enabling
+/// a single `Llama` model to be constructed from either source.
+///
+/// # Example
+/// ```ignore
+/// // Works with JSON config
+/// let model = Llama::from_config(&json_config, vb)?;
+///
+/// // Works with GGUF metadata
+/// let model = Llama::from_config(&gguf_config, content)?;
+/// ```
+pub trait LlamaConfig {
+    /// Hidden dimension (embedding size).
+    fn hidden_size(&self) -> usize;
+
+    /// Feed-forward intermediate dimension.
+    /// Note: GGUF loading infers this from weight shapes; used by safetensors loading.
+    #[allow(dead_code)]
+    fn intermediate_size(&self) -> usize;
+
+    /// Number of transformer layers.
+    fn num_layers(&self) -> usize;
+
+    /// Number of attention heads.
+    fn num_attention_heads(&self) -> usize;
+
+    /// Number of key-value heads (for GQA/MQA).
+    fn num_key_value_heads(&self) -> usize;
+
+    /// Vocabulary size.
+    /// Note: GGUF loading infers this from embedding weights; used by safetensors loading.
+    #[allow(dead_code)]
+    fn vocab_size(&self) -> usize;
+
+    /// RMS normalization epsilon.
+    fn rms_norm_eps(&self) -> f64;
+
+    /// RoPE theta (frequency base).
+    fn rope_theta(&self) -> f32;
+
+    /// Maximum sequence length.
+    fn max_seq_len(&self) -> usize;
+
+    /// Activation function for MLP.
+    fn hidden_act(&self) -> Activation {
+        Activation::Silu
+    }
+
+    /// Whether to tie input/output embeddings.
+    /// Note: GGUF loading checks weight existence; used by safetensors loading.
+    #[allow(dead_code)]
+    fn tie_word_embeddings(&self) -> bool {
+        false
+    }
+
+    /// Head dimension (derived).
+    fn head_dim(&self) -> usize {
+        self.hidden_size() / self.num_attention_heads()
+    }
+
+    /// RoPE dimension (usually same as head_dim).
+    fn rope_dim(&self) -> usize {
+        self.head_dim()
+    }
+
+    // MoE configuration (optional)
+
+    /// Number of experts (0 for non-MoE models).
+    /// Note: MoE support not yet implemented in unified Llama.
+    #[allow(dead_code)]
+    fn num_experts(&self) -> usize {
+        0
+    }
+
+    /// Number of experts used per token.
+    /// Note: MoE support not yet implemented in unified Llama.
+    #[allow(dead_code)]
+    fn num_experts_used(&self) -> usize {
+        0
+    }
 }

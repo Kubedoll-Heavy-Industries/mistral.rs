@@ -13,26 +13,36 @@ use mistralrs_quant::{NonZeroOp, ShardedVarBuilder};
 use vision::{Idefics3Connector, Idefics3VisionTransformer};
 
 use crate::{
-    amoe::{AnyMoeBaseModelMixin, MlpLayer},
+    amoe::AnyMoeBaseModelMixin,
     device_map::DeviceMapper,
-    models::llama::Llama,
+    models::{llama::Llama3Model, Model, TransformerModel},
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, NormalLoadingMetadata, NormalModel, VisionModel,
+        EitherCache, IsqModel, NormalCache, NormalLoadingMetadata, VisionModel,
     },
     utils::unvarbuilder::UnVarBuilder,
-    AnyMoeConfig, AnyMoeExpertType,
 };
 
+/// Idefics3 vision-language model.
+///
+/// TODO(migration): This model needs migration to the new stateless architecture.
+/// Currently disabled pending proper cache ownership migration.
+#[deprecated(
+    since = "0.8.0",
+    note = "Idefics3 is pending migration to the new stateless model architecture. \
+            The model should own its cache rather than delegating to the text model."
+)]
 pub struct Idefics3Model {
-    text_model: Llama,
+    text_model: Llama3Model,
+    cache: EitherCache,
     connector: Idefics3Connector,
     vision: Idefics3VisionTransformer,
     config: Idefics3Config,
     dtype: DType,
 }
 
+#[allow(deprecated)]
 impl Idefics3Model {
     pub fn new(
         cfg: &Idefics3Config,
@@ -52,7 +62,7 @@ impl Idefics3Model {
             vb_m.pp("vision_model")
                 .set_device(normal_loading_metadata.real_device.clone()),
         )?;
-        let text_model = Llama::new_inner(
+        let text_model = Llama3Model::new_inner(
             &cfg.text_config,
             vb_m.pp("text_model"),
             vb.pp("lm_head"),
@@ -60,8 +70,14 @@ impl Idefics3Model {
             normal_loading_metadata,
             attention_mechanism,
         )?;
+        // Create cache owned by this model (not the text model)
+        let cache = EitherCache::Normal(NormalCache::new(
+            cfg.text_config.num_hidden_layers,
+            cfg.text_config.max_position_embeddings,
+        ));
         Ok(Self {
             text_model,
+            cache,
             connector,
             vision,
             config: cfg.clone(),
@@ -193,6 +209,13 @@ impl Idefics3Model {
             self.text_model.get_input_embeddings(input_ids)?
         };
 
+        // Get mutable cache from self
+        let mut cache_guard = match &self.cache {
+            EitherCache::Normal(c) => c.lock().unwrap(),
+            EitherCache::Full(_) => unreachable!("Idefics3 doesn't support FullCache"),
+            EitherCache::Hybrid(_) => unreachable!("Idefics3 doesn't support HybridCache"),
+        };
+
         self.text_model.forward_embeds(
             input_ids,
             input_embeds,
@@ -200,6 +223,7 @@ impl Idefics3Model {
             context_lens,
             metadata,
             flash_params,
+            &mut cache_guard.0,
         )
     }
 }
@@ -235,36 +259,9 @@ impl IsqModel for Idefics3Model {
     }
 }
 
-// AnyMoE is forwarded to the base model
-impl AnyMoeBaseModelMixin for Idefics3Model {
-    fn get_mlps(&self) -> Vec<&dyn MlpLayer> {
-        self.text_model.get_mlps()
-    }
-    fn get_mlps_mut(&mut self) -> Vec<&mut Box<dyn MlpLayer>> {
-        self.text_model.get_mlps_mut()
-    }
-    fn create_anymoe_layers(
-        &mut self,
-        additional_vbs: Vec<ShardedVarBuilder>,
-        config: AnyMoeConfig,
-        (prefix, mlp): (String, String),
-        layers: Vec<usize>,
-        expert_type: AnyMoeExpertType,
-        gate_vb: Option<ShardedVarBuilder>,
-    ) -> Result<()> {
-        self.text_model.create_anymoe_layers(
-            additional_vbs,
-            config,
-            (prefix, mlp),
-            layers,
-            expert_type,
-            gate_vb,
-        )
-    }
-    fn amoe_supported(&self) -> bool {
-        true
-    }
-}
+// AnyMoE not supported - deprecated mixin pattern
+#[allow(deprecated)]
+impl AnyMoeBaseModelMixin for Idefics3Model {}
 
 impl VisionModel for Idefics3Model {
     fn forward(
@@ -292,16 +289,16 @@ impl VisionModel for Idefics3Model {
         )
     }
     fn cache(&self) -> &EitherCache {
-        self.text_model.cache()
+        &self.cache
     }
     fn cache_mut(&mut self) -> &mut EitherCache {
-        self.text_model.cache_mut()
+        &mut self.cache
     }
     fn device(&self) -> &Device {
-        self.text_model.device()
+        Model::device(&self.text_model)
     }
     fn max_seq_len(&self) -> usize {
-        self.text_model.max_seq_len()
+        TransformerModel::max_seq_len(&self.text_model)
     }
     fn config(&self) -> &ModelConfigMetadata {
         self.text_model.config()

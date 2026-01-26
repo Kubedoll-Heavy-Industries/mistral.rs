@@ -326,6 +326,7 @@ pub struct WebSearchOptions {
 #[derive(Clone, Serialize, Deserialize)]
 /// Discriminated union of all request types to the Engine.
 /// Each variant wraps an InferenceRequest<I, R> with appropriate input/output types.
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     /// Normal inference request (HTTP API)
     Normal(Box<NormalRequest>),

@@ -323,6 +323,22 @@ impl RmsNorm {
         Ok(Self { eps, weight: w })
     }
 
+    /// Create from a quantized tensor (dequantizes the weight).
+    ///
+    /// This is the unified constructor for GGUF models, replacing `QRmsNorm::new()`.
+    pub fn from_qtensor(scale: QTensor, eps: f32) -> Result<Self> {
+        let weight = scale.dequantize(&scale.device())?;
+        Ok(Self {
+            eps: eps as f64,
+            weight,
+        })
+    }
+
+    /// Create directly from a weight tensor and epsilon.
+    pub fn from_weight(weight: Tensor, eps: f64) -> Self {
+        Self { eps, weight }
+    }
+
     /// Gemma uses weight + 1.0
     pub fn new_gemma(size: usize, eps: f64, vb: ShardedVarBuilder) -> Result<Self> {
         let w = vb.get(size, "weight")?;
@@ -397,12 +413,21 @@ impl Module for F32RmsNorm {
     }
 }
 
+/// RMS normalization for quantized models.
+///
+/// **Deprecated**: Use `RmsNorm::from_qtensor()` instead. `QRmsNorm` and `RmsNorm`
+/// are structurally identical - this type exists only for backwards compatibility.
+#[deprecated(
+    since = "0.8.0",
+    note = "Use RmsNorm::from_qtensor() instead. QRmsNorm and RmsNorm are identical."
+)]
 #[derive(Debug, Clone)]
 pub struct QRmsNorm {
     eps: f64,
     weight: Tensor,
 }
 
+#[allow(deprecated)]
 impl QRmsNorm {
     pub fn new(scale: QTensor, eps: f32) -> Result<Self> {
         let scale = scale.dequantize(&scale.device())?;
@@ -415,8 +440,14 @@ impl QRmsNorm {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
     }
+
+    /// Convert to unified `RmsNorm` type.
+    pub fn into_rms_norm(self) -> RmsNorm {
+        RmsNorm::from_weight(self.weight, self.eps)
+    }
 }
 
+#[allow(deprecated)]
 impl Module for QRmsNorm {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         QRmsNorm::forward(self, xs)

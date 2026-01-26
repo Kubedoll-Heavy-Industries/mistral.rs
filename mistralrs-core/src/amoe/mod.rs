@@ -22,6 +22,12 @@ use crate::{
 };
 
 /// Implemented by the base model of an AnyMoe.
+#[deprecated(
+    since = "0.8.0",
+    note = "Mixin pattern is Pythonic, not Rustic. Use composition or optional capability traits instead. \
+            Models should not be forced to implement MoE support. Use a separate `MoeCapable` trait \
+            that only MoE-supporting models implement."
+)]
 pub trait AnyMoeBaseModelMixin {
     fn get_vars(&self) -> Vec<Vec<Var>> {
         self.get_mlps()

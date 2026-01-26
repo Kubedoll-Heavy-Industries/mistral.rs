@@ -1,3 +1,5 @@
+#![allow(deprecated)] // Uses MetadataMixin during migration
+
 use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use bm25::{Embedder, EmbedderBuilder, Language, ScoredDocument, Scorer};
@@ -15,6 +17,7 @@ use crate::{
 
 use super::Engine;
 
+#[allow(clippy::type_complexity)]
 fn chat_op_fields_mut(
     op: &mut InferenceOperation,
 ) -> (

@@ -1,3 +1,6 @@
+// Token IDs fit in u32; conversion is safe
+#![allow(clippy::cast_possible_truncation)]
+
 use std::sync::Arc;
 
 use candle_core::{DType, Result, Tensor};

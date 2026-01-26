@@ -186,6 +186,28 @@ pub trait FromGGUF {
         Self: Sized;
 }
 
+/// Trait for loading models from safetensors format.
+///
+/// This enables unified model implementations that can be loaded from
+/// either GGUF (via `FromGGUF`) or safetensors (via `FromSafetensors`).
+#[allow(dead_code)] // Future: will be implemented by unified model structs
+pub trait FromSafetensors {
+    /// Configuration type for this model (e.g., LlamaConfig JSON struct)
+    type Config;
+
+    fn from_safetensors(
+        cfg: &Self::Config,
+        vb: ShardedVarBuilder,
+        device: &candle_core::Device,
+        mapper: Box<dyn DeviceMapper + Send + Sync>,
+        attention_mechanism: AttentionImplementation,
+        dtype: DType,
+        layer_range: Option<std::ops::Range<usize>>,
+    ) -> Result<Self, candle_core::Error>
+    where
+        Self: Sized;
+}
+
 // Extended variants:
 pub trait FromAdapterGGML {
     #[allow(clippy::too_many_arguments)]

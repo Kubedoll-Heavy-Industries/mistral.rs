@@ -1,5 +1,8 @@
+// Allow deprecated types during migration
+#![allow(deprecated)]
+
 pub(crate) mod debug;
-pub(crate) mod gguf_metadata;
+pub mod gguf_metadata;
 pub(crate) mod memory_usage;
 pub(crate) mod model_config;
 pub(crate) mod normal;

@@ -89,9 +89,7 @@ impl DeviceMapSetting {
             }) => {
                 if let Some(topology) = topology {
                     if topology.layers.iter().all(|x| x.is_none()) {
-                        return Ok(Box::new(DummyDeviceMapper {
-                            nm_device: device.clone(),
-                        }));
+                        return Ok(Box::new(SingleDeviceMapper::new(device.clone())));
                     } else {
                         let layers = topology
                             .layers
@@ -125,9 +123,7 @@ impl DeviceMapSetting {
                         .sum::<usize>()
                         .clamp(0, model_layers)
                 } else {
-                    return Ok(Box::new(DummyDeviceMapper {
-                        nm_device: device.clone(),
-                    }));
+                    return Ok(Box::new(SingleDeviceMapper::new(device.clone())));
                 };
                 // How many host (cpu) layers, defaulting to automatically filling the rest.
                 // If n_device_layers > model_layers, n_host_layers = 0
@@ -334,12 +330,23 @@ impl DeviceMapper for LayerDeviceMapper {
     }
 }
 
+/// Device mapper that places all tensors on a single device.
+///
+/// Use this for single-GPU inference or when all layers of a pipeline
+/// parallelism stage should reside on one device.
 #[derive(Debug)]
-pub struct DummyDeviceMapper {
-    pub(crate) nm_device: Device,
+pub struct SingleDeviceMapper {
+    nm_device: Device,
 }
 
-impl DeviceMapper for DummyDeviceMapper {
+impl SingleDeviceMapper {
+    /// Create a mapper that places all tensors on the given device.
+    pub fn new(device: Device) -> Self {
+        Self { nm_device: device }
+    }
+}
+
+impl DeviceMapper for SingleDeviceMapper {
     fn map(&self, input: Tensor, _: usize) -> Result<Tensor> {
         Ok(input)
     }

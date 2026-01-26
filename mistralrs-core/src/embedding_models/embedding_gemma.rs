@@ -1,4 +1,5 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(deprecated)] // Uses AnyMoeBaseModelMixin during migration
 
 use std::{collections::HashMap, sync::Arc};
 

@@ -15,7 +15,7 @@ use crate::layers::{
     RotaryEmbedding, TransformerBlock,
 };
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
@@ -329,7 +329,9 @@ impl TransformerModel for ModelWeights {
             .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
         self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         let x = self.output_norm.forward(&hidden)?;
         MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)

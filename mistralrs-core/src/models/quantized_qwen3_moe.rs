@@ -6,9 +6,9 @@ use std::sync::Arc;
 use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::ops::{TopKLastDimOp, TopKOutput};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -100,11 +100,11 @@ struct LayerWeights {
     attention_wk: Arc<dyn QuantMethod>,
     attention_wv: Arc<dyn QuantMethod>,
     attention_wo: Arc<dyn QuantMethod>,
-    attention_norm: QRmsNorm,
-    q_norm: QRmsNorm,
-    k_norm: QRmsNorm,
+    attention_norm: RmsNorm,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
     mlp: MoeOrMlp,
-    ffn_norm: QRmsNorm,
+    ffn_norm: RmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -200,7 +200,7 @@ pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
     /// Final norm layer (None for non-last pipeline stages)
-    norm: Option<QRmsNorm>,
+    norm: Option<RmsNorm>,
     /// Output/LM head layer (None for non-last pipeline stages)
     output: Option<Arc<dyn QuantMethod>>,
     pub device: Device,
@@ -358,7 +358,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         // PP: Only load norm and output (LM head) for last stage
         let is_last_stage = layer_end >= total_layers;
         let norm = if is_last_stage {
-            Some(QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
+            Some(RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
         } else {
             None
         };
@@ -459,11 +459,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
             };
 
             // Qwen3 always has q_norm and k_norm
-            let q_norm = QRmsNorm::new(
+            let q_norm = RmsNorm::from_qtensor(
                 ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
-            let k_norm = QRmsNorm::new(
+            let k_norm = RmsNorm::from_qtensor(
                 ct.tensor(&format!("{prefix}.attn_k_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
@@ -493,11 +493,11 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     q_weight: Arc::new(attention_wo),
                     b: None,
                 })?),
-                attention_norm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
+                attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 q_norm,
                 k_norm,
                 mlp,
-                ffn_norm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
+                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
@@ -621,7 +621,9 @@ impl TransformerModel for ModelWeights {
             .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
         self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         // Move to model device and apply final norm
         let hidden = hidden.to_device(&self.device)?;

@@ -246,7 +246,7 @@ impl Loader for GGUFEmbeddingLoader {
         // Extract max_seq_len from metadata before content is consumed
         let max_seq_len = content
             .get_metadata()
-            .get(&format!("{}.context_length", arch.to_string()))
+            .get(&format!("{arch}.context_length"))
             .and_then(|v| v.to_u32().ok())
             .unwrap_or(8192) as usize;
 

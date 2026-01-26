@@ -22,6 +22,7 @@ impl GgufLoraModelBuilder {
         }
     }
 
+    #[allow(deprecated)] // Uses GGUFLoaderBuilder internally; LoRA migration pending
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = GGUFSpecificConfig {
             topology: self.gguf_model.topology,

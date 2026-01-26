@@ -4,6 +4,9 @@
 //!
 //! For the canonical transformer model trait, see [`crate::models::TransformerModel`].
 
+// Allow dead code - work-in-progress for unified transformer model traits
+#![allow(dead_code)]
+
 use candle_core::{DType, Device, Result, Tensor};
 
 use crate::layers_masker::CausalMasker;

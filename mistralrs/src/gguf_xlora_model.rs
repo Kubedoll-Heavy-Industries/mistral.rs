@@ -29,6 +29,7 @@ impl GgufXLoraModelBuilder {
         self
     }
 
+    #[allow(deprecated)] // Uses GGUFLoaderBuilder internally; XLora migration pending
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = GGUFSpecificConfig {
             topology: self.gguf_model.topology,

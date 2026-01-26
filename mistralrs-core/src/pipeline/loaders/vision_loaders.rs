@@ -4967,16 +4967,14 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
 
         // Apply matformer slicing if configured
         let text_cfg = if let Some(matformer_cfg) = matformer_config {
-            use crate::device_map::DummyDeviceMapper;
+            use crate::device_map::SingleDeviceMapper;
             use crate::vision_models::gemma3n::text::handle_matformer_slicing;
 
-            let dummy_mapper = DummyDeviceMapper {
-                nm_device: Device::Cpu,
-            };
+            let mapper = SingleDeviceMapper::new(Device::Cpu);
             let (adjusted_cfg, _, _, _, _) = handle_matformer_slicing(
                 &cfg.text_config,
                 &Some(matformer_cfg.clone()),
-                &dummy_mapper,
+                &mapper,
             )?;
             adjusted_cfg
         } else {
@@ -5354,16 +5352,14 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
         let (text_cfg, _layer_rename_map, _layers_skipped) = if let Some(matformer_cfg) =
             matformer_config
         {
-            use crate::device_map::DummyDeviceMapper;
+            use crate::device_map::SingleDeviceMapper;
             use crate::vision_models::gemma3n::text::handle_matformer_slicing;
 
-            let dummy_mapper = DummyDeviceMapper {
-                nm_device: Device::Cpu,
-            };
+            let mapper = SingleDeviceMapper::new(Device::Cpu);
             let (adjusted_cfg, _, _, layer_rename_map, layers_skipped) = handle_matformer_slicing(
                 &cfg.text_config,
                 &Some(matformer_cfg.clone()),
-                &dummy_mapper,
+                &mapper,
             )?;
             (adjusted_cfg, layer_rename_map, layers_skipped)
         } else {

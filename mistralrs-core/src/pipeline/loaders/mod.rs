@@ -1,9 +1,16 @@
 pub mod auto_device_map;
 mod diffusion_loaders;
 mod embedding_loaders;
+mod gguf_metadata;
 mod normal_loaders;
 mod vision_loaders;
 pub use auto_device_map::{estimate_kv_cache_bytes, AutoDeviceMapParams, NonMappedSubModel};
+pub use gguf_metadata::{
+    load_text_pipeline, CausalLMLoader, CausalLMLoaderBuilder, GgufLoader, GgufMetadata,
+    LoaderMetadata, MetadataLoader,
+};
+// Re-export ContentConfig for memory estimation (from utils, through this module)
+pub use crate::utils::gguf_metadata::ContentConfig as GgufContentConfig;
 
 use std::{
     fmt::{self, Debug},

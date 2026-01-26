@@ -17,7 +17,7 @@ use crate::layers::MatMul;
 use crate::layers::Sdpa;
 use crate::layers::{CausalMasker, QLinear};
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::AttentionImplementation;
 use crate::paged_attention::PagedAttention;
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -462,7 +462,9 @@ impl TransformerModel for ModelWeights {
             .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
         self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         // Move to model device and apply final norm
         let hidden = hidden.to_device(&self.device)?;

@@ -17,7 +17,7 @@ use tqdm::Iter;
 use tracing::info;
 
 use crate::device_map::DeviceMapper;
-use crate::layers::{CausalMasker, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMasker, RmsNorm, RotaryEmbedding, Sdpa};
 use crate::pipeline::{extract_logits, Cache, EitherCache};
 
 use super::classifier::XLoraClassifier;
@@ -172,9 +172,9 @@ struct LayerWeights {
     attention_wk: QLoraLinear,
     attention_wv: QLoraLinear,
     attention_wo: QLoraLinear,
-    attention_norm: QRmsNorm,
+    attention_norm: RmsNorm,
     mlp_or_moe: MlpOrMoe,
-    ffn_norm: QRmsNorm,
+    ffn_norm: RmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -255,7 +255,7 @@ impl LayerWeights {
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
-    norm: QRmsNorm,
+    norm: RmsNorm,
     output: QLoraLinear,
     pub device: Device,
     pub cache: EitherCache,
@@ -287,7 +287,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
         )?;
         let tok_embeddings = ct.remove("tok_embeddings.weight")?;
         let tok_embeddings = tok_embeddings.dequantize(&ct.device)?;
-        let norm = QRmsNorm::new(ct.remove("norm.weight")?, 1e-5)?;
+        let norm = RmsNorm::from_qtensor(ct.remove("norm.weight")?, 1e-5)?;
         let output = ct.remove("output.weight")?;
         let mut layers = Vec::with_capacity(ct.hparams.n_layer as usize);
         let mut count = 0;
@@ -385,9 +385,9 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                     &mut count,
                     preload_adapters,
                 )?,
-                attention_norm: QRmsNorm::new(attention_norm, 1e-5)?,
+                attention_norm: RmsNorm::from_qtensor(attention_norm, 1e-5)?,
                 mlp_or_moe,
-                ffn_norm: QRmsNorm::new(ffn_norm, 1e-5)?,
+                ffn_norm: RmsNorm::from_qtensor(ffn_norm, 1e-5)?,
                 n_head: ct.hparams.n_head as usize,
                 n_kv_head: ct.hparams.n_head as usize / gqa,
                 head_dim: (ct.hparams.n_embd / ct.hparams.n_head) as usize,
@@ -495,6 +495,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
             rope_freq_base,
             key_length,
             value_length,
+            ..  // feed_forward_length, vocab_size - used via LlamaConfig trait
         } = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
 
         let head_dim = key_length;
@@ -506,7 +507,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
 
         let qtok_embeddings = ct.tensor("token_embd.weight", device)?;
         let tok_embeddings = qtok_embeddings.dequantize(device)?;
-        let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
+        let norm = RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
         let output = if !ct.has_tensor("output.weight") {
             ct.tensor("token_embd.weight", device)?
         } else {
@@ -686,9 +687,9 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                     &mut count,
                     preload_adapters,
                 )?,
-                attention_norm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
+                attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 mlp_or_moe,
-                ffn_norm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
+                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim: embedding_length / head_count,

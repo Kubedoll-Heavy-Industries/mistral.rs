@@ -1,36 +1,64 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use candle_core::{Device, Result, Tensor};
+//! Unified Llama model implementation.
+//!
+//! This module provides a generic `Llama<P>` struct parameterized by position encoding.
+//! Type aliases provide concrete model types:
+//!
+//! - `LlamaModel` = `Llama<RotaryEmbedding>` - Basic Llama (GGUF)
+//! - `Llama3Model` = `Llama<Llama3RotaryEmbedding>` - Llama 3 with rope scaling
+
+use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use mistralrs_quant::{
-    ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
-    ShardedVarBuilder,
+    ColumnParallelLayer, GgufMatMul, QuantMethod, QuantMethodConfig, QuantizedConfig,
+    ReplicatedLayer, RowParallelLayer, ShardedVarBuilder,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    amoe::{AnyMoeBaseModelMixin, AnyMoeConfig, AnyMoeExpertType, MlpLayer, MoeMlp},
-    attention::SdpaParams,
+    amoe::MlpLayer,
+    attention::{PositionEncoding, SdpaParams},
     device_map::DeviceMapper,
-    get_delta_from_lora_ab,
+    gguf::Content,
     layers::{
         embedding, Activation, CausalMasker, Llama3RopeConfig, Llama3RotaryEmbedding, MatMul, Mlp,
-        RmsNorm, Sdpa,
+        RmsNorm, RotaryEmbedding, Sdpa,
     },
     layers_masker::PastKvLenCache,
-    models::TransformContext,
+    models::{LanguageModel, LlamaConfig, Model, TransformContext, TransformerModel},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
-        extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
+        IsqModel, KvCache, NormalLoadingMetadata,
     },
     serde_default_fn,
-    utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
+    utils::{
+        gguf_metadata::ContentMetadata,
+        model_config as ModelConfig,
+        progress::NiceProgressBar,
+        unvarbuilder::UnVarBuilder,
+    },
 };
 
+use super::quantized_llama::PropsGGUF;
+
 serde_default_fn!(bool, word_emb_default, false);
+
+// =============================================================================
+// Type Aliases for Concrete Model Types
+// =============================================================================
+
+/// Basic Llama model (Llama 2, etc.) - uses standard rotary embeddings.
+pub type LlamaModel = Llama<RotaryEmbedding>;
+
+/// Llama 3 model - uses Llama3 rotary embeddings with rope scaling support.
+pub type Llama3Model = Llama<Llama3RotaryEmbedding>;
+
+// =============================================================================
+// Configuration
+// =============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
@@ -50,7 +78,57 @@ pub struct Config {
     pub tie_word_embeddings: bool,
 }
 
-struct CausalSelfAttention {
+impl LlamaConfig for Config {
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    fn intermediate_size(&self) -> usize {
+        self.intermediate_size
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+
+    fn num_attention_heads(&self) -> usize {
+        self.num_attention_heads
+    }
+
+    fn num_key_value_heads(&self) -> usize {
+        self.num_key_value_heads
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
+    }
+
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_position_embeddings
+    }
+
+    fn hidden_act(&self) -> Activation {
+        self.hidden_act
+    }
+
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+}
+
+// =============================================================================
+// Attention (Generic over Position Encoding)
+// =============================================================================
+
+struct CausalSelfAttention<P: PositionEncoding> {
     q_proj: Arc<dyn QuantMethod>,
     k_proj: Arc<dyn QuantMethod>,
     v_proj: Arc<dyn QuantMethod>,
@@ -58,13 +136,12 @@ struct CausalSelfAttention {
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
-    rotary_emb: Arc<Llama3RotaryEmbedding>,
-    max_seq_len: usize,
+    rotary_emb: Arc<P>,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
 }
 
-impl CausalSelfAttention {
+impl<P: PositionEncoding> CausalSelfAttention<P> {
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -125,10 +202,7 @@ impl CausalSelfAttention {
                     Some(flash_params),
                 )?,
                 None => {
-                    // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
-                    // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
                     let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    // Sanity check.
                     assert!(attention_mask.is_some());
                     paged_attn.forward(
                         &q,
@@ -171,89 +245,20 @@ impl CausalSelfAttention {
         }
         Ok(res)
     }
-
-    fn load(
-        vb: ShardedVarBuilder,
-        cfg: &Config,
-        rope: Arc<Llama3RotaryEmbedding>,
-        paged_attn: Option<PagedAttention>,
-        comm: &Arc<mistralrs_quant::Comm>,
-    ) -> Result<Self> {
-        let size_in = cfg.hidden_size;
-        let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
-        let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = ColumnParallelLayer::new(
-            size_in,
-            size_q,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("q_proj"),
-        )?;
-        let kv_shard = mistralrs_quant::compute_kv_shard(
-            cfg.num_key_value_heads,
-            cfg.hidden_size / cfg.num_attention_heads,
-            comm,
-        );
-        let k_proj = ColumnParallelLayer::new_with_shard(
-            size_in,
-            size_kv,
-            &cfg.quantization_config,
-            false,
-            comm,
-            kv_shard,
-            vb.pp("k_proj"),
-        )?;
-        let v_proj = ColumnParallelLayer::new_with_shard(
-            size_in,
-            size_kv,
-            &cfg.quantization_config,
-            false,
-            comm,
-            kv_shard,
-            vb.pp("v_proj"),
-        )?;
-        let o_proj = RowParallelLayer::new(
-            size_q,
-            size_in,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("o_proj"),
-        )?;
-        Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            num_attention_heads: cfg.num_attention_heads / comm.world_size(),
-            num_key_value_heads: (cfg.num_key_value_heads / comm.world_size()).max(1),
-            head_dim: cfg.hidden_size / cfg.num_attention_heads,
-            rotary_emb: rope,
-            max_seq_len: cfg.max_position_embeddings,
-            paged_attn,
-            sdpa_params: SdpaParams {
-                n_kv_groups: mistralrs_quant::compute_n_kv_groups(
-                    cfg.num_key_value_heads,
-                    cfg.num_attention_heads,
-                    comm,
-                ),
-                softcap: None,
-                softmax_scale: 1.0 / ((cfg.hidden_size / cfg.num_attention_heads) as f32).sqrt(),
-                sliding_window: None,
-            },
-        })
-    }
 }
 
-struct Block {
+// =============================================================================
+// Transformer Block (Generic over Position Encoding)
+// =============================================================================
+
+struct Block<P: PositionEncoding> {
     rms_1: RmsNorm,
-    attn: CausalSelfAttention,
+    attn: CausalSelfAttention<P>,
     rms_2: RmsNorm,
     mlp: Box<dyn MlpLayer>,
 }
 
-impl Block {
+impl<P: PositionEncoding> Block<P> {
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -278,64 +283,393 @@ impl Block {
         let x = (self.mlp.forward(&self.rms_2.forward(&x)?)? + residual)?;
         Ok(x)
     }
+}
 
+// =============================================================================
+// Llama Model (Generic over Position Encoding)
+// =============================================================================
+
+/// Generic Llama model parameterized by position encoding type.
+///
+/// Use the type aliases for concrete models:
+/// - `LlamaModel` for basic Llama (GGUF)
+/// - `Llama3Model` for Llama 3 with rope scaling
+pub struct Llama<P: PositionEncoding> {
+    wte: Embedding,
+    blocks: Vec<Block<P>>,
+    ln_f: Option<RmsNorm>,
+    lm_head: Option<Arc<dyn QuantMethod>>,
+    device: Device,
+    mapper: Box<dyn DeviceMapper + Send + Sync>,
+    cfg: ModelConfigMetadata,
+    num_layers: usize,
+    max_seq_len: usize,
+}
+
+// =============================================================================
+// Core Model Traits (Generic implementations)
+// =============================================================================
+
+impl<P: PositionEncoding + Send + Sync> Model for Llama<P> {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl<P: PositionEncoding + Send + Sync> TransformerModel for Llama<P> {
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.wte.forward(tokens)
+    }
+
+    fn transform(&self, mut hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+        let start_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute mask using position offsets
+        let mask = CausalMasker.make_causal_mask_as(
+            ctx.seq_len,
+            hidden.device(),
+            &start_offsets.as_slice() as &dyn PastKvLenCache,
+            hidden.dtype(),
+        )?;
+        // PagedAttention prompt chunking filter
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Build FlashParams for this transform
+        let flash_params = FlashParams {
+            max_q: ctx.seq_len as u32,
+            max_k: (ctx.position_offset + ctx.seq_len) as u32,
+            cumulative_seqlens_q: std::collections::HashMap::new(),
+            cumulative_seqlens_k: std::collections::HashMap::new(),
+            causal: true,
+        };
+
+        // Run through transformer blocks
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            hidden = self.mapper.map(hidden, block_idx)?;
+            hidden = block.forward(
+                &hidden,
+                &mask.clone().map(|m| m.to_device(hidden.device()).unwrap()),
+                &start_offsets,
+                &mut cache[block_idx],
+                ctx.paged_attn
+                    .as_ref()
+                    .map(|pa| (pa.kv_cache[block_idx].clone(), pa.metadata)),
+                &flash_params,
+            )?;
+        }
+
+        Ok(hidden)
+    }
+}
+
+impl<P: PositionEncoding + Send + Sync> LanguageModel for Llama<P> {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        let x = hidden.to_device(&self.device)?;
+        let ln_f = self.ln_f.as_ref().expect("lm_head called but no final norm (non-tail stage?)");
+        let lm_head = self.lm_head.as_ref().expect("lm_head called but no lm_head (non-tail stage?)");
+
+        let mut x = ln_f.forward(&x)?;
+        if let Some(t) = lm_head.quantized_act_type() {
+            x = x.to_dtype(t)?;
+        }
+        MatMul.qmethod_matmul(&x, &**lm_head)
+    }
+}
+
+// =============================================================================
+// Helper methods
+// =============================================================================
+
+impl<P: PositionEncoding + Send + Sync> Llama<P> {
+    pub fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.wte.forward(input_ids)
+    }
+
+    /// Forward pass starting from pre-computed embeddings.
+    ///
+    /// Used by vision-language models where embeddings are modified (e.g., image features merged).
+    /// Cache is passed in - the model is stateless.
     #[allow(clippy::too_many_arguments)]
-    fn load(
-        vb: ShardedVarBuilder,
-        cfg: &Config,
-        mapper: &dyn DeviceMapper,
-        layer_idx: usize,
-        loading_isq: bool,
-        rope: Arc<Llama3RotaryEmbedding>,
-        paged_attn: Option<PagedAttention>,
-        comm: &Arc<mistralrs_quant::Comm>,
+    pub fn forward_embeds(
+        &self,
+        _input_ids: &Tensor, // For compatibility, not used
+        input_embeds: Tensor,
+        seqlen_offsets: &[usize],
+        _context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        _flash_params: &FlashParams,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        // Build transform context
+        let seq_len = input_embeds.dim(1)?;
+        let position_offset = seqlen_offsets.first().copied().unwrap_or(0);
+
+        let paged_attn_ctx = metadata.map(|(kv_cache, meta)| {
+            crate::models::PagedAttentionContext {
+                kv_cache,
+                metadata: meta,
+            }
+        });
+
+        let ctx = TransformContext {
+            seq_len,
+            position_offset,
+            paged_attn: paged_attn_ctx.as_ref(),
+        };
+
+        // Transform through layers
+        let hidden = self.transform(input_embeds, &ctx, cache)?;
+
+        // Apply lm_head
+        self.lm_head(hidden)
+    }
+
+    /// Get MLP layers for ISQ/AnyMoE.
+    pub fn get_mlps(&self) -> Vec<&dyn MlpLayer> {
+        self.blocks.iter().map(|b| &*b.mlp as &dyn MlpLayer).collect()
+    }
+
+    /// Get mutable MLP layers for AnyMoE.
+    pub fn get_mlps_mut(&mut self) -> Vec<&mut Box<dyn MlpLayer>> {
+        self.blocks.iter_mut().map(|b| &mut b.mlp).collect()
+    }
+
+    pub fn residual_tensors_m(&self, uvb_m: UnVarBuilder) -> Vec<(String, Tensor)> {
+        uvb_m.pp("embed_tokens").add(&self.wte);
+        if let Some(ref ln_f) = self.ln_f {
+            uvb_m.pp("norm").add(ln_f);
+        }
+
+        for (layer_idx, layer) in self.blocks.iter().enumerate() {
+            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
+            uvb_l.pp("input_layernorm").add(&layer.rms_1);
+            uvb_l.pp("post_attention_layernorm").add(&layer.rms_2);
+        }
+
+        uvb_m.to_safetensors()
+    }
+
+    /// Get model config metadata.
+    pub fn config(&self) -> &ModelConfigMetadata {
+        &self.cfg
+    }
+}
+
+// =============================================================================
+// Loading from GGUF (LlamaModel = Llama<RotaryEmbedding>)
+// =============================================================================
+
+impl ModelConfig::FromGGUF for LlamaModel {
+    fn from_gguf<R: std::io::Seek + std::io::Read>(
+        mut ct: Content<'_, R>,
+        device: &Device,
+        mapper: Box<dyn DeviceMapper + Send + Sync>,
+        attention_mechanism: AttentionImplementation,
+        dtype: DType,
+        layer_range: Option<std::ops::Range<usize>>,
     ) -> Result<Self> {
-        let attn = CausalSelfAttention::load(
-            mapper.set_device(layer_idx, vb.pp("self_attn"), loading_isq),
-            cfg,
-            rope,
-            paged_attn,
-            comm,
-        )?;
-        let mlp = Mlp::new(
-            mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
-            cfg.hidden_size,
-            cfg.intermediate_size,
-            &cfg.quantization_config,
-            cfg.hidden_act,
-            comm,
-        )?;
-        let rms_1 = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            mapper.set_device(layer_idx, vb.pp("input_layernorm"), false),
-        )?;
-        let rms_2 = RmsNorm::new(
-            cfg.hidden_size,
-            cfg.rms_norm_eps,
-            mapper.set_device(layer_idx, vb.pp("post_attention_layernorm"), false),
-        )?;
+        // Extract configuration from GGUF metadata
+        let metadata = ContentMetadata {
+            path_prefix: "llama",
+            metadata: ct.get_metadata(),
+        };
+        let props = PropsGGUF::try_from(metadata).or_else(|err| candle_core::bail!("{err}"))?;
+
+        // Determine layer range for pipeline parallelism
+        let total_layers = props.num_layers();
+        let layer_range = layer_range.unwrap_or(0..total_layers);
+        let layer_start = layer_range.start;
+        let layer_end = layer_range.end.min(total_layers);
+        let is_last_stage = layer_end >= total_layers;
+
+        if layer_start > 0 || layer_end < total_layers {
+            tracing::info!(
+                "Pipeline parallelism: loading layers {}..{} of {} total",
+                layer_start,
+                layer_end,
+                total_layers
+            );
+        }
+
+        // Load embeddings
+        let embed_weight = ct.tensor("token_embd.weight", device)?;
+        let wte = Embedding::new(
+            embed_weight.dequantize(device)?,
+            props.hidden_size(),
+        );
+
+        // Load final norm and LM head only for last stage
+        let ln_f = if is_last_stage {
+            Some(RmsNorm::from_qtensor(
+                ct.tensor("output_norm.weight", device)?,
+                props.rms_norm_eps() as f32,
+            )?)
+        } else {
+            None
+        };
+
+        let lm_head = if is_last_stage {
+            let weight = if ct.has_tensor("output.weight") {
+                ct.tensor("output.weight", device)?
+            } else {
+                // Tied embeddings
+                ct.tensor("token_embd.weight", device)?
+            };
+            Some(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(weight),
+                b: None,
+            })?) as Arc<dyn QuantMethod>)
+        } else {
+            None
+        };
+
+        // Create rotary embeddings for each device
+        let head_dim = props.head_dim();
+        let mut rotary_embeddings: HashMap<_, Arc<RotaryEmbedding>> = HashMap::new();
+        for layer_idx in layer_start..layer_end {
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+            rotary_embeddings.entry(layer_device.location()).or_insert_with(|| {
+                Arc::new(RotaryEmbedding::new_partial(
+                    props.rope_theta(),
+                    props.rope_dim(),
+                    props.max_seq_len(),
+                    layer_device,
+                    false,
+                    dtype,
+                ).expect("Failed to create rotary embedding"))
+            });
+        }
+
+        // Load transformer layers
+        let mut blocks = Vec::with_capacity(layer_end - layer_start);
+
+        for layer_idx in layer_start..layer_end {
+            let prefix = format!("blk.{layer_idx}");
+            let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
+
+            let rotary = rotary_embeddings
+                .get(&layer_device.location())
+                .expect("Missing rotary embedding for device")
+                .clone();
+
+            // Load attention weights
+            let q_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_q.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let k_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_k.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let v_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_v.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let o_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.attn_output.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+
+            // Load MLP weights
+            let gate_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_gate.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let up_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_up.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+            let down_proj = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+                q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_down.weight"), layer_device)?),
+                b: None,
+            })?) as Arc<dyn QuantMethod>;
+
+            // Load layer norms
+            let rms_1 = RmsNorm::from_qtensor(
+                ct.tensor(&format!("{prefix}.attn_norm.weight"), layer_device)?,
+                props.rms_norm_eps() as f32,
+            )?;
+            let rms_2 = RmsNorm::from_qtensor(
+                ct.tensor(&format!("{prefix}.ffn_norm.weight"), layer_device)?,
+                props.rms_norm_eps() as f32,
+            )?;
+
+            // Create paged attention if needed
+            let paged_attn = match attention_mechanism {
+                AttentionImplementation::Eager => None,
+                AttentionImplementation::PagedAttention => {
+                    Some(PagedAttention::new(head_dim, layer_device, None)?)
+                }
+            };
+
+            // Create MLP
+            let mlp = Mlp::from_weights(gate_proj, up_proj, down_proj, props.hidden_act());
+
+            blocks.push(Block {
+                rms_1,
+                attn: CausalSelfAttention {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    num_attention_heads: props.num_attention_heads(),
+                    num_key_value_heads: props.num_key_value_heads(),
+                    head_dim,
+                    rotary_emb: rotary,
+                    paged_attn,
+                    sdpa_params: SdpaParams {
+                        n_kv_groups: props.num_attention_heads() / props.num_key_value_heads(),
+                        softcap: None,
+                        softmax_scale: 1.0 / (head_dim as f32).sqrt(),
+                        sliding_window: None,
+                    },
+                },
+                rms_2,
+                mlp: Box::new(mlp),
+            });
+        }
+
         Ok(Self {
-            rms_1,
-            attn,
-            rms_2,
-            mlp: Box::new(mlp),
+            wte,
+            blocks,
+            ln_f,
+            lm_head,
+            device: device.clone(),
+            mapper,
+            cfg: ModelConfigMetadata {
+                max_seq_len: props.max_seq_len(),
+                num_layers: total_layers,
+                hidden_size: props.hidden_size(),
+                num_kv_heads: props.num_key_value_heads(),
+                num_attn_heads: props.num_attention_heads(),
+                sliding_window: None,
+                k_head_dim: head_dim,
+                v_head_dim: head_dim,
+            },
+            num_layers: total_layers,
+            max_seq_len: props.max_seq_len(),
         })
     }
 }
 
-pub struct Llama {
-    wte: Embedding,
-    blocks: Vec<Block>,
-    ln_f: RmsNorm,
-    lm_head: Arc<dyn QuantMethod>,
-    kv_cache: crate::pipeline::EitherCache,
-    device: Device,
-    mapper: Box<dyn DeviceMapper + Send + Sync>,
-    cfg: ModelConfigMetadata,
-}
+// =============================================================================
+// Loading from Safetensors (Llama3Model = Llama<Llama3RotaryEmbedding>)
+// =============================================================================
 
-impl Llama {
+impl Llama3Model {
     pub fn new(
         cfg: &Config,
         vb: ShardedVarBuilder,
@@ -398,20 +732,19 @@ impl Llama {
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
-        let mut ropes = HashMap::new();
+        let mut ropes: HashMap<_, Arc<Llama3RotaryEmbedding>> = HashMap::new();
         for i in 0..cfg.num_hidden_layers {
             let device = mapper
                 .device_for(i, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
-            ropes.insert(
-                device.location(),
+            ropes.entry(device.location()).or_insert_with(|| {
                 Arc::new(Llama3RotaryEmbedding::new_llama3(
                     vb_m.dtype(),
                     cfg,
                     device,
                     is_gptx,
-                )?),
-            );
+                ).expect("Failed to create Llama3 rotary embedding"))
+            });
         }
         let blocks: Vec<_> = NiceProgressBar::<_, 'b'>(
             0..cfg.num_hidden_layers,
@@ -433,27 +766,107 @@ impl Llama {
                 }
             };
             let comm = mapper.get_comm_for(i)?;
-            Block::load(
-                vb_m.pp(format!("layers.{i}")),
-                cfg,
-                &*mapper,
-                i,
-                normal_loading_metadata.loading_isq,
-                rotary_emb,
-                paged_attn,
+
+            // Load attention
+            let vb_attn = mapper.set_device(i, vb_m.pp(format!("layers.{i}.self_attn")), normal_loading_metadata.loading_isq);
+            let size_in = cfg.hidden_size;
+            let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
+            let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
+            let q_proj = ColumnParallelLayer::new(
+                size_in,
+                size_q,
+                &cfg.quantization_config,
+                false,
                 &comm,
-            )
+                vb_attn.pp("q_proj"),
+            )?;
+            let kv_shard = mistralrs_quant::compute_kv_shard(
+                cfg.num_key_value_heads,
+                cfg.hidden_size / cfg.num_attention_heads,
+                &comm,
+            );
+            let k_proj = ColumnParallelLayer::new_with_shard(
+                size_in,
+                size_kv,
+                &cfg.quantization_config,
+                false,
+                &comm,
+                kv_shard,
+                vb_attn.pp("k_proj"),
+            )?;
+            let v_proj = ColumnParallelLayer::new_with_shard(
+                size_in,
+                size_kv,
+                &cfg.quantization_config,
+                false,
+                &comm,
+                kv_shard,
+                vb_attn.pp("v_proj"),
+            )?;
+            let o_proj = RowParallelLayer::new(
+                size_q,
+                size_in,
+                &cfg.quantization_config,
+                false,
+                &comm,
+                vb_attn.pp("o_proj"),
+            )?;
+
+            // Load MLP
+            let mlp = Mlp::new(
+                mapper.set_device(i, vb_m.pp(format!("layers.{i}.mlp")), normal_loading_metadata.loading_isq),
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                &cfg.quantization_config,
+                cfg.hidden_act,
+                &comm,
+            )?;
+
+            // Load layer norms
+            let rms_1 = RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                mapper.set_device(i, vb_m.pp(format!("layers.{i}.input_layernorm")), false),
+            )?;
+            let rms_2 = RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                mapper.set_device(i, vb_m.pp(format!("layers.{i}.post_attention_layernorm")), false),
+            )?;
+
+            Ok(Block {
+                rms_1,
+                attn: CausalSelfAttention {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                    o_proj,
+                    num_attention_heads: cfg.num_attention_heads / comm.world_size(),
+                    num_key_value_heads: (cfg.num_key_value_heads / comm.world_size()).max(1),
+                    head_dim,
+                    rotary_emb,
+                    paged_attn,
+                    sdpa_params: SdpaParams {
+                        n_kv_groups: mistralrs_quant::compute_n_kv_groups(
+                            cfg.num_key_value_heads,
+                            cfg.num_attention_heads,
+                            &comm,
+                        ),
+                        softcap: None,
+                        softmax_scale: 1.0 / (head_dim as f32).sqrt(),
+                        sliding_window: None,
+                    },
+                },
+                rms_2,
+                mlp: Box::new(mlp),
+            })
         })?;
 
         Ok(Self {
             wte,
             blocks,
-            ln_f,
-            lm_head,
-            kv_cache: EitherCache::Normal(NormalCache::new(
-                cfg.num_hidden_layers,
-                cfg.max_position_embeddings,
-            )),
+            ln_f: Some(ln_f),
+            lm_head: Some(lm_head),
             device: normal_loading_metadata.real_device,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
@@ -467,120 +880,17 @@ impl Llama {
                 v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             },
             mapper,
+            num_layers: cfg.num_hidden_layers,
+            max_seq_len: cfg.max_position_embeddings,
         })
-    }
-
-    pub fn get_input_embeddings(&self, input_ids: &Tensor) -> Result<Tensor> {
-        self.wte.forward(input_ids)
-    }
-
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        seqlen_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        self.forward_embeds(
-            input_ids,
-            self.wte.forward(input_ids)?,
-            seqlen_offsets,
-            context_lens,
-            metadata,
-            flash_params,
-        )
-    }
-
-    /// Run transformer layers on input activations (embeddings or received from previous stage).
-    /// Returns hidden states WITHOUT applying lm_head (for pipeline parallelism).
-    pub fn forward_layers(
-        &self,
-        input_ids: &Tensor,
-        mut x: Tensor,
-        seqlen_offsets: &[usize],
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        let cache = &mut self.kv_cache.normal().0;
-        let mask = CausalMasker.make_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            x.dtype(),
-            self.blocks[0].attn.num_attention_heads,
-        )?;
-        // PagedAttention prompt chunking
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            x = self.mapper.map(x, block_idx)?;
-            x = block.forward(
-                &x,
-                &mask.clone().map(|m| m.to_device(x.device()).unwrap()),
-                seqlen_offsets,
-                &mut cache[block_idx],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), *metadata)),
-                flash_params,
-            )?;
-        }
-        Ok(x)
-    }
-
-    /// Apply final layer norm and lm_head projection.
-    /// Used by last pipeline stage to convert hidden states to logits.
-    pub fn apply_lm_head(
-        &self,
-        x: Tensor,
-        context_lens: Vec<(usize, usize)>,
-    ) -> Result<Tensor> {
-        let x = x.to_device(&self.device)?;
-        let mut x = self.ln_f.forward(&x)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let xs = MatMul.qmethod_matmul(&x, &*self.lm_head)?;
-        extract_logits(&xs, context_lens)
-    }
-
-    /// Full forward pass: embeddings → layers → lm_head.
-    /// For single-stage (non-distributed) inference.
-    pub fn forward_embeds(
-        &self,
-        input_ids: &Tensor,
-        input_embeds: Tensor,
-        seqlen_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        let x = self.forward_layers(input_ids, input_embeds, seqlen_offsets, metadata, flash_params)?;
-        self.apply_lm_head(x, context_lens)
-    }
-
-    pub fn residual_tensors_m(&self, uvb_m: UnVarBuilder) -> Vec<(String, Tensor)> {
-        uvb_m.pp("embed_tokens").add(&self.wte);
-        uvb_m.pp("norm").add(&self.ln_f);
-
-        for (layer_idx, layer) in self.blocks.iter().enumerate() {
-            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
-            uvb_l.pp("input_layernorm").add(&layer.rms_1);
-            uvb_l.pp("post_attention_layernorm").add(&layer.rms_2);
-        }
-
-        uvb_m.to_safetensors()
     }
 }
 
-impl IsqModel for Llama {
+// =============================================================================
+// ISQ Support
+// =============================================================================
+
+impl<P: PositionEncoding + Send + Sync> IsqModel for Llama<P> {
     fn get_layers(
         &mut self,
     ) -> (
@@ -588,7 +898,9 @@ impl IsqModel for Llama {
         &dyn DeviceMapper,
     ) {
         let mut tensors = Vec::new();
-        tensors.push((&mut self.lm_head, None));
+        if let Some(ref mut lm_head) = self.lm_head {
+            tensors.push((lm_head, None));
+        }
         for (i, layer) in self.blocks.iter_mut().enumerate() {
             tensors.push((&mut layer.attn.q_proj, Some(i)));
             tensors.push((&mut layer.attn.k_proj, Some(i)));
@@ -612,10 +924,11 @@ impl IsqModel for Llama {
     }
 
     fn imatrix_names(&self) -> candle_core::Result<Vec<Option<String>>> {
-        // NOTE: dependant on the exact implementation in get_layers!
         let mut names = Vec::new();
-        // lm_head
-        names.push(None);
+        // lm_head (if present)
+        if self.lm_head.is_some() {
+            names.push(None);
+        }
         for i in 0..self.blocks.len() {
             names.push(Some(format!("blk.{i}.attn_q.weight")));
             names.push(Some(format!("blk.{i}.attn_k.weight")));
@@ -626,239 +939,5 @@ impl IsqModel for Llama {
             names.push(Some(format!("blk.{i}.ffn_down.weight")));
         }
         Ok(names)
-    }
-}
-
-impl NormalModel for Llama {
-    fn forward(
-        &self,
-        input_ids: &Tensor,
-        seqlen_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        _position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        self.forward(
-            input_ids,
-            seqlen_offsets,
-            context_lens,
-            metadata,
-            flash_params,
-        )
-    }
-    fn xlora_forward(
-        &self,
-        _input_ids: &Tensor,
-        _input_ids_full: &Tensor,
-        _seqlen_offsets: &[usize],
-        _seqlen_offsets_full: &[usize],
-        _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
-        _context_lens: Vec<(usize, usize)>,
-        _position_ids: Vec<usize>,
-        _flash_params: &FlashParams,
-        _flash_params_full: &FlashParams,
-    ) -> Result<Tensor> {
-        unimplemented!()
-    }
-    fn cache(&self) -> &crate::pipeline::EitherCache {
-        &self.kv_cache
-    }
-    fn cache_mut(&mut self) -> &mut crate::pipeline::EitherCache {
-        &mut self.kv_cache
-    }
-    fn device(&self) -> &Device {
-        &self.device
-    }
-    fn is_xlora(&self) -> bool {
-        false
-    }
-    fn max_seq_len(&self) -> usize {
-        self.blocks[0].attn.max_seq_len
-    }
-    fn config(&self) -> &ModelConfigMetadata {
-        &self.cfg
-    }
-
-    // === TransformerModel methods for pipeline parallelism ===
-
-    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
-        self.get_input_embeddings(tokens)
-    }
-
-    fn transform(&self, mut hidden: Tensor, ctx: &TransformContext) -> Result<Tensor> {
-        let cache = &mut self.kv_cache.normal().0;
-        let start_offsets: Vec<usize> = vec![ctx.position_offset];
-
-        // Compute mask using position offsets
-        let mask = CausalMasker.make_causal_mask_as(
-            ctx.seq_len,
-            hidden.device(),
-            &start_offsets.as_slice() as &dyn PastKvLenCache,
-            hidden.dtype(),
-        )?;
-        // PagedAttention prompt chunking filter
-        let mask = mask.filter(|_| {
-            ctx.paged_attn
-                .as_ref()
-                .map(|pa| pa.metadata.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-
-        // Build FlashParams for this transform (minimal for PP)
-        let flash_params = FlashParams {
-            max_q: ctx.seq_len as u32,
-            max_k: (ctx.position_offset + ctx.seq_len) as u32,
-            cumulative_seqlens_q: std::collections::HashMap::new(),
-            cumulative_seqlens_k: std::collections::HashMap::new(),
-            causal: true,
-        };
-
-        // Run through transformer blocks
-        for (block_idx, block) in self.blocks.iter().enumerate() {
-            hidden = self.mapper.map(hidden, block_idx)?;
-            hidden = block.forward(
-                &hidden,
-                &mask.clone().map(|m| m.to_device(hidden.device()).unwrap()),
-                &start_offsets,
-                &mut cache[block_idx],
-                ctx.paged_attn
-                    .as_ref()
-                    .map(|pa| (pa.kv_cache[block_idx].clone(), pa.metadata)),
-                &flash_params,
-            )?;
-        }
-
-        Ok(hidden)
-    }
-
-    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
-        let x = hidden.to_device(&self.device)?;
-        let mut x = self.ln_f.forward(&x)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        MatMul.qmethod_matmul(&x, &*self.lm_head)
-    }
-}
-
-impl AnyMoeBaseModelMixin for Llama {
-    fn get_mlps(&self) -> Vec<&dyn MlpLayer> {
-        let mut mlps = Vec::new();
-        for layer in &self.blocks {
-            mlps.push(&*layer.mlp);
-        }
-        mlps
-    }
-    fn get_mlps_mut(&mut self) -> Vec<&mut Box<dyn MlpLayer>> {
-        let mut mlps = Vec::new();
-        for layer in &mut self.blocks {
-            mlps.push(&mut layer.mlp);
-        }
-        mlps
-    }
-    fn create_anymoe_layers(
-        &mut self,
-        additional_vbs: Vec<ShardedVarBuilder>,
-        config: AnyMoeConfig,
-        (prefix, mlp): (String, String),
-        mut layers: Vec<usize>,
-        expert_type: AnyMoeExpertType,
-        gate_vb: Option<ShardedVarBuilder>,
-    ) -> Result<()> {
-        let mut experts: Vec<Vec<Box<dyn MlpLayer>>> = Vec::new();
-        if layers.is_empty() {
-            layers = (0..self.blocks.len()).collect::<Vec<_>>();
-        }
-        for _ in 0..layers.len() {
-            experts.push(Vec::new());
-        }
-        for vb in additional_vbs {
-            let vb = vb.pp(&prefix);
-            for (layer, row) in experts.iter_mut().enumerate() {
-                if !layers.contains(&layer) {
-                    continue;
-                }
-
-                let intermediate_size = self.blocks[layer].mlp.get_params()[1];
-                let hidden_size = self.blocks[layer].mlp.get_params()[0];
-                match expert_type {
-                    AnyMoeExpertType::FineTuned => {
-                        let (dtype, device) = self.blocks[layer].mlp.dtype_device();
-                        row.push(Box::new(Mlp::replicate(
-                            self.blocks[layer].mlp.get_params(),
-                            vb.pp(layer).pp(&mlp).set_dtype(dtype).set_device(device),
-                            self.blocks[layer].mlp.hidden_act(),
-                            &self.mapper.get_comm_for(layer)?,
-                        )?));
-                    }
-                    AnyMoeExpertType::LoraAdapter {
-                        rank,
-                        alpha,
-                        ref target_modules,
-                    } => {
-                        let vb_mlp = vb.pp(layer).pp(&mlp);
-
-                        let c_fc1_delta = if target_modules.contains(&"c_fc1".to_string()) {
-                            Some(get_delta_from_lora_ab!(
-                                vb_mlp,
-                                rank,
-                                alpha,
-                                (hidden_size, intermediate_size),
-                                "c_fc1"
-                            ))
-                        } else {
-                            None
-                        };
-                        let c_fc2_delta = if target_modules.contains(&"c_fc2".to_string()) {
-                            Some(get_delta_from_lora_ab!(
-                                vb_mlp,
-                                rank,
-                                alpha,
-                                (hidden_size, intermediate_size),
-                                "c_fc2"
-                            ))
-                        } else {
-                            None
-                        };
-                        let c_proj_delta = if target_modules.contains(&"c_proj".to_string()) {
-                            Some(get_delta_from_lora_ab!(
-                                vb_mlp,
-                                rank,
-                                alpha,
-                                (intermediate_size, hidden_size),
-                                "c_proj"
-                            ))
-                        } else {
-                            None
-                        };
-
-                        row.push(self.blocks[layer].mlp.new_added_delta(vec![
-                            c_fc1_delta,
-                            c_fc2_delta,
-                            c_proj_delta,
-                        ])?);
-                    }
-                }
-            }
-        }
-        for (layer, expert) in layers.into_iter().zip(experts) {
-            let mut experts_all = vec![self.blocks[layer].mlp.clone()];
-            experts_all.extend(expert);
-            let (dtype, device) = self.blocks[layer].mlp.dtype_device();
-            self.blocks[layer].mlp = Box::new(MoeMlp::new(
-                experts_all,
-                config.clone(),
-                dtype,
-                &device,
-                layer,
-                gate_vb.as_ref(),
-            )?);
-        }
-        Ok(())
-    }
-    fn amoe_supported(&self) -> bool {
-        true
     }
 }

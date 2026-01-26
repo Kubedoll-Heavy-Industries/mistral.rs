@@ -1,8 +1,11 @@
+#![allow(deprecated)] // Uses deprecated mixin traits during migration
+
 use crate::{
     pipeline::{ForwardInputsResult, NormalCache, RerankInputs},
     prefix_cacher::MatchingCache,
     request::{
-        DetokenizeRequest, InferenceOperation, NormalRequest, PipelineContinueRequest, TokenizeRequest,
+        DetokenizeRequest, InferenceOperation, NormalRequest, PipelineContinueRequest,
+        TokenizeRequest,
     },
     sequence::{SeqStepType, SequenceRecognizer, SequenceState},
     tools::{ToolCallingMatcher, ToolChoice},

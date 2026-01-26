@@ -1,3 +1,5 @@
+#![allow(deprecated)] // Uses deprecated loader types during migration
+
 use std::{fs::File, path::PathBuf, str::FromStr};
 
 use mistralrs_quant::MULTI_LORA_DELIMITER;
@@ -8,7 +10,7 @@ use crate::{
     pipeline::{EmbeddingLoaderType, IsqOrganization},
     AnyMoeLoader, AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader,
-    ModelDType, SafetensorsLoaderBuilder, NormalLoaderType, SafetensorsConfig, SpeculativeConfig,
+    ModelDType, NormalLoaderType, SafetensorsConfig, SafetensorsLoaderBuilder, SpeculativeConfig,
     SpeculativeLoader, Topology, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
     GGUF_MULTI_FILE_DELIMITER, UQFF_MULTI_FILE_DELIMITER,
 };

@@ -1,3 +1,5 @@
+#![allow(deprecated)] // Uses deprecated mixin traits during migration
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use candle_core::{Result, Tensor, D};

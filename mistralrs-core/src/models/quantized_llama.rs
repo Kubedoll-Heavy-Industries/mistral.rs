@@ -1,4 +1,5 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(deprecated)] // Uses deprecated traits during migration
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,10 +15,10 @@ use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{
     reshape_attn_output, reshape_for_attn, sdpa_with_cache, Activation, CausalMasker, MatMul, Mlp,
-    QRmsNorm, RotaryEmbedding,
+    RmsNorm, RotaryEmbedding,
 };
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
@@ -111,9 +112,9 @@ struct LayerWeights {
     attention_wk: Arc<dyn QuantMethod>,
     attention_wv: Arc<dyn QuantMethod>,
     attention_wo: Arc<dyn QuantMethod>,
-    attention_norm: QRmsNorm,
+    attention_norm: RmsNorm,
     mlp_or_moe: MlpOrMoe,
-    ffn_norm: QRmsNorm,
+    ffn_norm: RmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -171,11 +172,15 @@ impl LayerWeights {
     }
 }
 
+#[deprecated(
+    since = "0.8.0",
+    note = "Use the unified Llama model instead. ModelWeights is a legacy GGUF-specific type."
+)]
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
     /// Final norm layer (None for non-last pipeline stages)
-    norm: Option<QRmsNorm>,
+    norm: Option<RmsNorm>,
     /// Output/LM head layer (None for non-last pipeline stages)
     output: Option<Arc<dyn QuantMethod>>,
     pub device: Device,
@@ -197,7 +202,7 @@ impl ModelConfig::FromGGML for ModelWeights {
         )?;
         let tok_embeddings = ct.remove("tok_embeddings.weight")?;
         let tok_embeddings = tok_embeddings.dequantize(&ct.device)?;
-        let norm = QRmsNorm::new(ct.remove("norm.weight")?, 1e-5)?;
+        let norm = RmsNorm::from_qtensor(ct.remove("norm.weight")?, 1e-5)?;
         let output = ct.remove("output.weight")?;
         let mut layers = Vec::with_capacity(ct.hparams.n_layer as usize);
         for layer_idx in NiceProgressBar::<_, 'b'>(
@@ -250,9 +255,9 @@ impl ModelConfig::FromGGML for ModelWeights {
                     q_weight: Arc::new(attention_wo),
                     b: None,
                 })?),
-                attention_norm: QRmsNorm::new(attention_norm, 1e-5)?,
+                attention_norm: RmsNorm::from_qtensor(attention_norm, 1e-5)?,
                 mlp_or_moe,
-                ffn_norm: QRmsNorm::new(ffn_norm, 1e-5)?,
+                ffn_norm: RmsNorm::from_qtensor(ffn_norm, 1e-5)?,
                 n_head: ct.hparams.n_head as usize,
                 n_kv_head: ct.hparams.n_head as usize / gqa,
                 head_dim: (ct.hparams.n_embd / ct.hparams.n_head) as usize,
@@ -293,6 +298,8 @@ pub(crate) struct PropsGGUF {
     pub head_count_kv: usize,
     pub block_count: usize,
     pub embedding_length: usize,
+    pub feed_forward_length: usize,
+    pub vocab_size: usize,
     pub rope_dim: usize,
     pub rms_norm_eps: f32,
     pub max_seq_len: usize,
@@ -329,6 +336,24 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             head_count_kv: c.get_value::<u32>("attention.head_count_kv")? as usize,
             block_count: c.get_value::<u32>("block_count")? as usize,
             embedding_length: embed_len,
+            // feed_forward_length may not be present - default to 4x hidden (common ratio)
+            feed_forward_length: c
+                .get_value::<u32>("feed_forward_length")
+                .ok()
+                .map(|x| x as usize)
+                .unwrap_or(embed_len * 4),
+            // vocab_size: first try {arch}.vocab_size, then fall back to tokenizer tokens array length
+            vocab_size: c
+                .get_value::<u32>("vocab_size")
+                .ok()
+                .map(|x| x as usize)
+                .or_else(|| {
+                    c.metadata.get("tokenizer.ggml.tokens").and_then(|v| match v {
+                        candle_core::quantized::gguf_file::Value::Array(arr) => Some(arr.len()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(32000), // Common default for Llama
             rope_dim: c.get_value::<u32>("rope.dimension_count")? as usize,
             // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
             rms_norm_eps: c.get_value("attention.layer_norm_rms_epsilon")?,
@@ -353,6 +378,58 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
     }
 }
 
+use crate::models::LlamaConfig;
+
+impl LlamaConfig for PropsGGUF {
+    fn hidden_size(&self) -> usize {
+        self.embedding_length
+    }
+
+    fn intermediate_size(&self) -> usize {
+        self.feed_forward_length
+    }
+
+    fn num_layers(&self) -> usize {
+        self.block_count
+    }
+
+    fn num_attention_heads(&self) -> usize {
+        self.head_count
+    }
+
+    fn num_key_value_heads(&self) -> usize {
+        self.head_count_kv
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps as f64
+    }
+
+    fn rope_theta(&self) -> f32 {
+        self.rope_freq_base
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn rope_dim(&self) -> usize {
+        self.rope_dim
+    }
+
+    fn num_experts(&self) -> usize {
+        self.n_expert
+    }
+
+    fn num_experts_used(&self) -> usize {
+        self.n_expert_used
+    }
+}
+
 impl ModelConfig::FromGGUF for ModelWeights {
     fn from_gguf<R: std::io::Seek + std::io::Read>(
         mut ct: Content<'_, R>,
@@ -374,6 +451,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
             head_count_kv,
             block_count,
             embedding_length,
+            feed_forward_length: _,  // Used via LlamaConfig trait
+            vocab_size: _,           // Used via LlamaConfig trait
             rope_dim,
             rms_norm_eps,
             max_seq_len,
@@ -404,7 +483,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         // PP: Only load norm and output (LM head) for last stage
         let is_last_stage = layer_end >= total_layers;
         let norm = if is_last_stage {
-            Some(QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
+            Some(RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
         } else {
             None
         };
@@ -590,9 +669,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     q_weight: Arc::new(attention_wo),
                     b: None,
                 })?),
-                attention_norm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
+                attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
                 mlp_or_moe,
-                ffn_norm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
+                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
                 head_dim,
@@ -713,7 +792,9 @@ impl TransformerModel for ModelWeights {
             .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
         self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         // Move to model device and apply final norm
         let hidden = hidden.to_device(&self.device)?;

@@ -21,9 +21,9 @@ use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, Sdpa};
+use crate::layers::{CausalMasker, MatMul, RmsNorm, Sdpa};
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
@@ -304,9 +304,9 @@ struct LayerWeights {
     attention_wk: Arc<dyn QuantMethod>,
     attention_wv: Arc<dyn QuantMethod>,
     attention_wo: Arc<dyn QuantMethod>,
-    attention_norm: QRmsNorm,
+    attention_norm: RmsNorm,
     mlp: Mlp,
-    ffn_norm: QRmsNorm,
+    ffn_norm: RmsNorm,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
@@ -396,7 +396,7 @@ pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<LayerWeights>,
     /// Final norm layer (None for non-last pipeline stages)
-    norm: Option<QRmsNorm>,
+    norm: Option<RmsNorm>,
     /// Output/LM head layer (None for non-last pipeline stages)
     output: Option<Arc<dyn QuantMethod>>,
     pub device: Device,
@@ -540,7 +540,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         // PP: Only load norm and output (LM head) for last stage
         let is_last_stage = layer_end >= total_layers;
         let norm = if is_last_stage {
-            Some(QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
+            Some(RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
         } else {
             None
         };
@@ -578,6 +578,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         // Only create RoPE embeddings for loaded layers
         let mscale_coefficient = attn_temperature_scale.unwrap_or(0.1);
         let mut ropes = HashMap::new();
+        #[allow(clippy::map_entry)] // Complex construction logic; entry API would be awkward
         for layer_idx in layer_start..layer_end {
             let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
             if !ropes.contains_key(&layer_device.location()) {
@@ -640,9 +641,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let feed_forward_w3 = ct.tensor(&format!("{prefix}.ffn_up.weight"), layer_device)?;
 
             let attention_norm =
-                QRmsNorm::new(ct.tensor(&format!("{prefix}.attn_norm.weight"), layer_device)?, rms_norm_eps)?;
+                RmsNorm::from_qtensor(ct.tensor(&format!("{prefix}.attn_norm.weight"), layer_device)?, rms_norm_eps)?;
             let ffn_norm =
-                QRmsNorm::new(ct.tensor(&format!("{prefix}.ffn_norm.weight"), layer_device)?, rms_norm_eps)?;
+                RmsNorm::from_qtensor(ct.tensor(&format!("{prefix}.ffn_norm.weight"), layer_device)?, rms_norm_eps)?;
 
             let paged_attn = match &attention_mechanism {
                 AttentionImplementation::Eager => None,
@@ -807,7 +808,9 @@ impl TransformerModel for ModelWeights {
             .map(|pa| (pa.kv_cache.as_slice(), pa.metadata));
         self.run_layers(hidden, mask.as_ref(), &start_offsets, meta_ref, cache)
     }
+}
 
+impl LanguageModel for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         // Move to model device and apply final norm
         let hidden = hidden.to_device(&self.device)?;

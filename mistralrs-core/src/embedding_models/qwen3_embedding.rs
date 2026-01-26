@@ -1,4 +1,5 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(deprecated)] // Uses AnyMoeBaseModelMixin during migration
 
 /// Mistral LLM, https://github.com/mistralai/mistral-src
 use candle_core::{Device, Module, Result, Tensor};

@@ -9,7 +9,7 @@ use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
     MetadataMixin, ModelCategory, PreProcessingMixin,
 };
-use crate::models::{PagedAttentionContext, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
 use crate::pipeline::hooks::ActivationResult;
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
@@ -69,11 +69,11 @@ use tracing::{info, warn};
 /// Model variant: either a TransformerModel (unified path) or XLora (legacy two-pass).
 ///
 /// This replaces the old 10-variant enum with a simpler structure:
-/// - TransformerModel implementations use dynamic dispatch (Box<dyn>)
+/// - LanguageModel implementations use dynamic dispatch (Box<dyn>)
 /// - XLora models stay concrete until we create an XLoraModel trait
 enum ModelVariant {
-    /// Models implementing TransformerModel (stateless, unified forward path)
-    Transformer(Box<dyn TransformerModel + Send + Sync>),
+    /// Models implementing LanguageModel (stateless, unified forward path)
+    Transformer(Box<dyn LanguageModel + Send + Sync>),
     /// XLora Llama (two-pass inference, owns cache)
     XLoraLlama(XLoraQLlama),
     /// XLora Phi3 (two-pass inference, owns cache)
@@ -81,10 +81,10 @@ enum ModelVariant {
 }
 
 impl ModelVariant {
-    /// Get this model as a TransformerModel trait object, if it implements the trait.
+    /// Get this model as a LanguageModel trait object, if it implements the trait.
     ///
-    /// Returns Some for TransformerModel, None for XLora models (which need two-pass inference).
-    fn as_transformer_model(&self) -> Option<&dyn TransformerModel> {
+    /// Returns Some for LanguageModel, None for XLora models (which need two-pass inference).
+    fn as_language_model(&self) -> Option<&dyn LanguageModel> {
         match self {
             ModelVariant::Transformer(model) => Some(&**model),
             ModelVariant::XLoraLlama(_) | ModelVariant::XLoraPhi3(_) => None,
@@ -120,6 +120,16 @@ impl ModelVariant {
 }
 
 
+/// Pipeline for GGUF models using runtime polymorphism.
+///
+/// For better type safety and monomorphized hot paths, use `TextPipeline<M>`
+/// with typed loaders instead.
+#[deprecated(
+    since = "0.8.0",
+    note = "Use TextPipeline<M> with typed loaders (e.g., CausalLMLoader) instead. \
+            GGUFPipeline uses runtime polymorphism; TextPipeline provides \
+            compile-time type safety and monomorphized inference paths."
+)]
 pub struct GGUFPipeline {
     model: ModelVariant,
     tokenizer: Arc<Tokenizer>,
@@ -152,7 +162,7 @@ pub struct GGUFPipeline {
 /// (avoids borrow checker conflicts with &mut self).
 #[allow(clippy::too_many_arguments)]
 fn forward_transformer(
-    model: &dyn TransformerModel,
+    model: &dyn LanguageModel,
     cache: &mut [crate::kv_cache::KvCache],
     hook: Option<&HookContainer>,
     input_ids: &Tensor,
@@ -161,8 +171,8 @@ fn forward_transformer(
     paged_attn_meta: Option<(Vec<(Tensor, Tensor)>, &crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata)>,
     request_id: uuid::Uuid,
 ) -> candle_core::Result<ForwardInputsResult> {
-    let has_embedding = hook.as_ref().map_or(true, |h| h.is_first_stage());
-    let has_lm_head = hook.as_ref().map_or(true, |h| h.is_last_stage());
+    let has_embedding = hook.as_ref().is_none_or(|h| h.is_first_stage());
+    let has_lm_head = hook.as_ref().is_none_or(|h| h.is_last_stage());
 
     // Step 1: Get hidden states (embed OR receive from previous stage)
     let hidden = if has_embedding {
@@ -241,6 +251,17 @@ fn forward_transformer(
 }
 
 /// Loader for a GGUF model.
+///
+/// This loader uses runtime polymorphism for model dispatch. For better type safety
+/// and monomorphized hot paths, use typed loaders instead:
+/// - `CausalLMLoader` for text generation models
+/// - (Future: `EmbeddingLoader`, `VisionLoader`, etc.)
+#[deprecated(
+    since = "0.8.0",
+    note = "Use typed loaders instead: CausalLMLoader for text models. \
+            GGUFLoader uses runtime polymorphism; typed loaders provide \
+            compile-time type safety and monomorphized inference paths."
+)]
 pub struct GGUFLoader {
     model_id: Option<String>,
     quantized_model_id: String,
@@ -258,6 +279,11 @@ pub struct GGUFLoader {
 
 #[derive(Clone, Default)]
 /// Config for a GGUF loader.
+#[deprecated(
+    since = "0.8.0",
+    note = "Use typed loader builders instead (e.g., CausalLMLoaderBuilder). \
+            Configuration is passed directly to typed loaders."
+)]
 pub struct GGUFSpecificConfig {
     pub topology: Option<Topology>,
     /// Layer range for pipeline parallelism.
@@ -267,6 +293,11 @@ pub struct GGUFSpecificConfig {
 
 #[derive(Default)]
 /// A builder for a GGUF loader.
+#[deprecated(
+    since = "0.8.0",
+    note = "Use typed loader builders instead: CausalLMLoaderBuilder for text models. \
+            Typed builders provide better ergonomics and type safety."
+)]
 pub struct GGUFLoaderBuilder {
     model_id: Option<String>,
     quantized_model_id: String,
@@ -281,6 +312,7 @@ pub struct GGUFLoaderBuilder {
     jinja_explicit: Option<String>,
 }
 
+#[allow(deprecated)]
 impl GGUFLoaderBuilder {
     /// Create a loader builder for a GGUF model. `tok_model_id` is the model ID where you can find a
     /// `tokenizer_config.json` file. If the `chat_template` is specified, then it will be treated as a
@@ -375,6 +407,7 @@ impl GGUFLoaderBuilder {
     }
 }
 
+#[allow(deprecated)]
 impl GGUFLoader {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -418,6 +451,7 @@ impl GGUFLoader {
     }
 }
 
+#[allow(deprecated)]
 impl Loader for GGUFLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn load_model_from_hf(
@@ -881,6 +915,7 @@ impl Loader for GGUFLoader {
     }
 }
 
+#[allow(deprecated)]
 impl PreProcessingMixin for GGUFPipeline {
     fn get_chat_template(&self) -> Option<Arc<ChatTemplate>> {
         Some(self.chat_template.clone())
@@ -890,6 +925,7 @@ impl PreProcessingMixin for GGUFPipeline {
     }
 }
 
+#[allow(deprecated)]
 impl IsqPipelineMixin for GGUFPipeline {
     fn re_isq_model(&mut self, _dtype: IsqType) -> Result<()> {
         anyhow::bail!(
@@ -898,6 +934,7 @@ impl IsqPipelineMixin for GGUFPipeline {
     }
 }
 
+#[allow(deprecated)]
 impl CacheManagerMixin for GGUFPipeline {
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
         if matches!(self.cache(), EitherCache::Full(_)) {
@@ -939,6 +976,7 @@ impl CacheManagerMixin for GGUFPipeline {
     }
 }
 
+#[allow(deprecated)]
 impl MetadataMixin for GGUFPipeline {
     fn device(&self) -> Device {
         self.model.device().clone()
@@ -963,6 +1001,7 @@ impl MetadataMixin for GGUFPipeline {
     }
 }
 
+#[allow(deprecated)]
 #[async_trait::async_trait]
 impl Pipeline for GGUFPipeline {
     fn get_hook(&self) -> Option<&crate::pipeline::HookContainer> {
@@ -1013,9 +1052,9 @@ impl Pipeline for GGUFPipeline {
         };
         // Models implementing TransformerModel use the unified forward path.
         // Check BEFORE the match to avoid borrow conflicts.
-        if self.model.as_transformer_model().is_some() {
+        if self.model.as_language_model().is_some() {
             // Safe to unwrap: we just checked it's Some
-            let model = self.model.as_transformer_model().unwrap();
+            let model = self.model.as_language_model().unwrap();
             let cache = &mut self.cache.normal().0;
             let hook = self.hook.as_ref();
             return forward_transformer(
@@ -1087,4 +1126,5 @@ impl Pipeline for GGUFPipeline {
 }
 
 // TODO
+#[allow(deprecated)]
 impl AnyMoePipelineMixin for GGUFPipeline {}

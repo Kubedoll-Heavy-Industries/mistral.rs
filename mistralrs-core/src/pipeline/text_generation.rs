@@ -1,7 +1,7 @@
 //! Unified text generation pipeline.
 //!
 //! This pipeline handles autoregressive text generation for any model that implements
-//! `TransformerModel`, regardless of serialization format (GGUF, safetensors, ONNX).
+//! `LanguageModel`, regardless of serialization format (GGUF, safetensors, ONNX).
 //!
 //! # Design
 //!
@@ -20,6 +20,9 @@
 //! - **TAIL**: has lm_head → receive, transform, lm_head
 //! - **FULL**: all weights → embed, transform, lm_head (single node)
 
+// Allow dead code - this module is work-in-progress for unified pipeline architecture
+#![allow(dead_code)]
+
 use std::any::Any;
 use std::sync::Arc;
 
@@ -28,7 +31,7 @@ use tokenizers::Tokenizer;
 
 use crate::device_map::DeviceMapper;
 use crate::kv_cache::{FullCacheManager, NormalCacheManager};
-use crate::models::{PagedAttentionContext, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
 use crate::paged_attention::ModelConfigMetadata;
 use crate::pipeline::hooks::{ActivationResult, HookContainer};
 use crate::pipeline::{
@@ -59,8 +62,8 @@ pub enum StageOutput {
 
 /// Configuration that's immutable after loading.
 pub struct PipelineConfig {
-    /// The transformer model (weights + architecture).
-    pub model: Arc<dyn TransformerModel + Send + Sync>,
+    /// The language model (weights + architecture).
+    pub model: Arc<dyn LanguageModel + Send + Sync>,
     /// Tokenizer for encoding/decoding text.
     pub tokenizer: Arc<Tokenizer>,
     /// Model identifier (e.g., "meta-llama/Llama-3-8B").
@@ -208,7 +211,7 @@ impl TextGenerationPipeline {
     }
 
     /// Access the model.
-    pub fn model(&self) -> &Arc<dyn TransformerModel + Send + Sync> {
+    pub fn model(&self) -> &Arc<dyn LanguageModel + Send + Sync> {
         &self.config.model
     }
 

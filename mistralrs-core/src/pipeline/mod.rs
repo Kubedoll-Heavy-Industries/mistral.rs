@@ -1,5 +1,9 @@
+// Allow deprecated types during migration to typed loaders and trait composition
+#![allow(deprecated)]
+
 mod amoe;
 mod auto;
+pub mod causal_lm;
 pub mod chat_template;
 mod diffusion;
 mod embedding;
@@ -21,6 +25,7 @@ mod response;
 mod sampling;
 mod speculative;
 mod speech;
+pub mod text;
 pub mod text_generation;
 mod vision;
 
@@ -49,15 +54,16 @@ pub(crate) use isq::IsqModelLoader;
 pub use isq::{parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER};
 use llguidance::toktrie::TokEnv;
 pub use loaders::{
-    estimate_kv_cache_bytes, AdapterKind, AutoDeviceMapParams, AutoEmbeddingLoader,
-    AutoNormalLoader, AutoVisionLoader, DeepSeekV2Loader, DeepSeekV3Loader,
+    estimate_kv_cache_bytes, load_text_pipeline, AdapterKind, AutoDeviceMapParams,
+    CausalLMLoader, CausalLMLoaderBuilder, AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader,
+    DeepSeekV2Loader, DeepSeekV3Loader,
     DeviceMappedModelLoader, DiffusionLoaderType, DiffusionModel, DiffusionModelLoader,
     EmbeddingGemmaLoader, EmbeddingLoaderType, EmbeddingModel, EmbeddingModelLoader,
     EmbeddingModelPaths, EmbeddingModule, EmbeddingModulePaths, EmbeddingModuleType, FluxLoader,
-    GLM4Loader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader, GptOssLoader,
-    GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
-    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader,
-    MixtralLoader, ModelKind, ModelPaths, NonMappedSubModel, NormalLoaderType,
+    GgufContentConfig, GgufLoader, GgufMetadata, GLM4Loader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader,
+    GptOssLoader, GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
+    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader,
+    MistralLoader, MixtralLoader, ModelKind, ModelPaths, NonMappedSubModel, NormalLoaderType,
     NormalLoadingMetadata, NormalModel, NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader,
     Phi3_5MoELoader, Phi4MMLoader, PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader,
     Qwen2_5VLLoader, Qwen3EmbeddingLoader, Qwen3Loader, Qwen3MoELoader, Qwen3VLLoader,
@@ -85,6 +91,8 @@ use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 pub use vision::{VisionLoader, VisionLoaderBuilder, VisionSpecificConfig};
 pub use hooks::{ActivationResult, HookContainer, LayerActivation, PipelineHook};
+pub use text::TextPipeline;
+pub use causal_lm::CausalLMPipeline;
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, Var};
@@ -161,6 +169,10 @@ pub enum CacheInstruction {
     Nothing,
 }
 
+#[deprecated(
+    since = "0.8.0",
+    note = "Mixin pattern is Pythonic, not Rustic. These methods belong on Pipeline directly or via composition."
+)]
 pub trait PreProcessingMixin: MetadataMixin {
     fn get_processor(&self) -> Arc<dyn Processor> {
         Arc::new(BasicProcessor)
@@ -170,10 +182,18 @@ pub trait PreProcessingMixin: MetadataMixin {
     fn get_input_processor_config(&self) -> Option<Arc<dyn Any>>;
 }
 
+#[deprecated(
+    since = "0.8.0",
+    note = "Mixin pattern is Pythonic, not Rustic. These methods belong on Pipeline directly or via composition."
+)]
 pub trait IsqPipelineMixin {
     fn re_isq_model(&mut self, dtype: IsqType) -> Result<()>;
 }
 
+#[deprecated(
+    since = "0.8.0",
+    note = "Mixin pattern is Pythonic, not Rustic. These methods belong on Pipeline directly or via composition."
+)]
 pub trait CacheManagerMixin {
     /// Clone the cache FROM the sequences' cache TO the model cache. Only called for completion seqs.
     /// It is not a guarantee that this will be called for each completion step.
@@ -197,6 +217,10 @@ pub trait CacheManagerMixin {
     }
 }
 
+#[deprecated(
+    since = "0.8.0",
+    note = "Mixin pattern is Pythonic, not Rustic. These methods belong on Pipeline directly or via composition."
+)]
 pub trait MetadataMixin {
     fn device(&self) -> Device;
     /// Only None if it doesnt make sense for the model
@@ -208,6 +232,10 @@ pub trait MetadataMixin {
 }
 
 /// Implemented by the base model of an AnyMoe.
+#[deprecated(
+    since = "0.8.0",
+    note = "Mixin pattern is Pythonic, not Rustic. Use a separate optional `MoeCapable` trait instead."
+)]
 pub trait AnyMoePipelineMixin {
     /// Get vars for each gating layer
     fn amoe_layer_vars(&self) -> Vec<Vec<Var>> {

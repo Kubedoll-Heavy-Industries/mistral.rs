@@ -40,6 +40,11 @@ use crate::{
 
 use super::{AutoDeviceMapParams, DeviceMappedModelLoader};
 
+#[deprecated(
+    since = "0.8.0",
+    note = "Use TransformerModel + LanguageModel traits instead. NormalModel bundles cache with model, \
+            but cache belongs to the pipeline. Models should be stateless."
+)]
 pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     #[allow(clippy::too_many_arguments)]
     fn forward(
@@ -881,25 +886,29 @@ impl DeviceMappedModelLoader for GemmaLoader {
 /// [`NormalLoader`] for a Llama model.
 ///
 /// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+#[deprecated(
+    since = "0.8.0",
+    note = "Llama safetensors loading via NormalModel is deprecated. Use GGUF format with CausalLMLoader instead. \
+            The new Llama model is stateless and incompatible with NormalModel's cache-bundled design."
+)]
 pub struct LlamaLoader;
 
 impl NormalModelLoader for LlamaLoader {
     fn load(
         &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        normal_loading_metadata: NormalLoadingMetadata,
-        attention_mechanism: AttentionImplementation,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::llama::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(models::llama::Llama::new(
-            &cfg,
-            vb,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            attention_mechanism,
-        )?))
+        // TODO(migration): Llama safetensors loading needs migration to TextPipeline<Llama3Model>.
+        // The new Llama model is stateless and incompatible with NormalModel's cache-bundled design.
+        // For now, use GGUF format with CausalLMLoader instead.
+        anyhow::bail!(
+            "Llama safetensors loading via NormalModel is deprecated. \
+             Use GGUF format with CausalLMLoader instead, or wait for safetensors loader migration. \
+             See: pipeline/loaders/gguf_metadata.rs for CausalLMLoader."
+        )
     }
     fn load_xlora(
         &self,
