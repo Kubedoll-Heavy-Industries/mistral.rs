@@ -43,7 +43,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Result};
-use candle_nn::Embedding;
+use candle_nn::{Embedding, LayerNorm};
 use mistralrs_quant::QuantMethod;
 
 use crate::attention::{AttentionConfig, CausalAttention, PositionEncoding, QkNorm};
@@ -86,6 +86,9 @@ pub struct TransformerConfig {
     // Optional features
     pub tie_word_embeddings: bool,
     pub sliding_window: Option<usize>,
+    /// Whether to load optional biases for Q/K/V attention projections (Qwen2-style).
+    /// When true, `load_linear_with_optional_bias` is used for Q/K/V projections.
+    pub use_attention_bias: bool,
 }
 
 /// Default fallback for models that don't specify context_length
@@ -118,6 +121,7 @@ impl TransformerConfig {
             hidden_act: Activation::Silu,
             tie_word_embeddings: false,
             sliding_window: None,
+            use_attention_bias: false,
         }
     }
 
@@ -219,6 +223,7 @@ impl TransformerConfig {
             hidden_act: Activation::Silu, // Most models use SiLU/Swish
             tie_word_embeddings: false,
             sliding_window: None,
+            use_attention_bias: false,
         })
     }
 
@@ -246,6 +251,12 @@ impl TransformerConfig {
         self.sliding_window = Some(window);
         self
     }
+
+    /// Enable optional attention biases for Q/K/V projections (Qwen2-style).
+    pub fn with_attention_bias(mut self) -> Self {
+        self.use_attention_bias = true;
+        self
+    }
 }
 
 // ============================================================================
@@ -261,6 +272,16 @@ pub trait WeightSource {
     /// Load a linear layer weight as quantized method.
     fn load_linear(&mut self, name: &str, device: &Device) -> Result<Arc<dyn QuantMethod>>;
 
+    /// Load a linear layer with an optional bias tensor.
+    ///
+    /// Bias tensor name is derived by replacing `.weight` suffix with `.bias`.
+    /// If the bias tensor exists, it will be dequantized and included in the result.
+    fn load_linear_with_optional_bias(
+        &mut self,
+        weight_name: &str,
+        device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>>;
+
     /// Load an embedding layer.
     fn load_embedding(
         &mut self,
@@ -272,6 +293,12 @@ pub trait WeightSource {
 
     /// Load an RMS normalization layer.
     fn load_rms_norm(&mut self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm>;
+
+    /// Load a LayerNorm layer (weight and bias).
+    ///
+    /// Loads `{base_name}.weight` and `{base_name}.bias`, dequantizes both,
+    /// and creates a `candle_nn::LayerNorm` with the given epsilon.
+    fn load_layer_norm(&mut self, base_name: &str, eps: f64, device: &Device) -> Result<LayerNorm>;
 
     /// Check if a tensor exists.
     fn has_tensor(&self, name: &str) -> bool;
@@ -308,6 +335,28 @@ impl<R: std::io::Seek + std::io::Read> WeightSource for GgufWeightSource<'_, '_,
         })?))
     }
 
+    fn load_linear_with_optional_bias(
+        &mut self,
+        weight_name: &str,
+        device: &Device,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        let qtensor = self.content.tensor(weight_name, device)?;
+
+        // Derive bias name by replacing `.weight` suffix with `.bias`
+        let bias_name = weight_name.replace(".weight", ".bias");
+        let bias = if self.content.has_tensor(&bias_name) {
+            let bias_qtensor = self.content.tensor(&bias_name, device)?;
+            Some(bias_qtensor.dequantize(device)?)
+        } else {
+            None
+        };
+
+        Ok(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
+            q_weight: Arc::new(qtensor),
+            b: bias,
+        })?))
+    }
+
     fn load_embedding(
         &mut self,
         name: &str,
@@ -324,6 +373,19 @@ impl<R: std::io::Seek + std::io::Read> WeightSource for GgufWeightSource<'_, '_,
     fn load_rms_norm(&mut self, name: &str, eps: f64, device: &Device) -> Result<RmsNorm> {
         let qtensor = self.content.tensor(name, device)?;
         RmsNorm::from_qtensor(qtensor, eps as f32)
+    }
+
+    fn load_layer_norm(&mut self, base_name: &str, eps: f64, device: &Device) -> Result<LayerNorm> {
+        let weight_name = format!("{base_name}.weight");
+        let bias_name = format!("{base_name}.bias");
+
+        let weight_qtensor = self.content.tensor(&weight_name, device)?;
+        let bias_qtensor = self.content.tensor(&bias_name, device)?;
+
+        let weight = weight_qtensor.dequantize(device)?;
+        let bias = bias_qtensor.dequantize(device)?;
+
+        Ok(LayerNorm::new(weight, bias, eps))
     }
 
     fn has_tensor(&self, name: &str) -> bool {
@@ -632,6 +694,26 @@ impl GgufNaming {
     pub fn attn_k_norm(&self, layer_idx: usize) -> String {
         format!("blk.{layer_idx}.attn_k_norm.weight")
     }
+
+    /// Starcoder2-specific: attention Q bias tensor name
+    pub fn attn_q_bias(&self, layer_idx: usize) -> String {
+        format!("blk.{layer_idx}.attn_q.bias")
+    }
+
+    /// Starcoder2-specific: attention K bias tensor name
+    pub fn attn_k_bias(&self, layer_idx: usize) -> String {
+        format!("blk.{layer_idx}.attn_k.bias")
+    }
+
+    /// Starcoder2-specific: attention V bias tensor name
+    pub fn attn_v_bias(&self, layer_idx: usize) -> String {
+        format!("blk.{layer_idx}.attn_v.bias")
+    }
+
+    /// Starcoder2-specific: attention output bias tensor name
+    pub fn attn_output_bias(&self, layer_idx: usize) -> String {
+        format!("blk.{layer_idx}.attn_output.bias")
+    }
 }
 
 /// Safetensors (HuggingFace) tensor naming convention.
@@ -797,9 +879,20 @@ where
             .clone();
 
         // Load layer weights
-        let q_proj = weights.load_linear(&naming.attn_q(layer_idx), layer_device)?;
-        let k_proj = weights.load_linear(&naming.attn_k(layer_idx), layer_device)?;
-        let v_proj = weights.load_linear(&naming.attn_v(layer_idx), layer_device)?;
+        // Use optional bias loading for Q/K/V if enabled (Qwen2-style)
+        let (q_proj, k_proj, v_proj) = if config.use_attention_bias {
+            (
+                weights.load_linear_with_optional_bias(&naming.attn_q(layer_idx), layer_device)?,
+                weights.load_linear_with_optional_bias(&naming.attn_k(layer_idx), layer_device)?,
+                weights.load_linear_with_optional_bias(&naming.attn_v(layer_idx), layer_device)?,
+            )
+        } else {
+            (
+                weights.load_linear(&naming.attn_q(layer_idx), layer_device)?,
+                weights.load_linear(&naming.attn_k(layer_idx), layer_device)?,
+                weights.load_linear(&naming.attn_v(layer_idx), layer_device)?,
+            )
+        };
         let o_proj = weights.load_linear(&naming.attn_output(layer_idx), layer_device)?;
         let gate_proj = weights.load_linear(&naming.ffn_gate(layer_idx), layer_device)?;
         let up_proj = weights.load_linear(&naming.ffn_up(layer_idx), layer_device)?;
