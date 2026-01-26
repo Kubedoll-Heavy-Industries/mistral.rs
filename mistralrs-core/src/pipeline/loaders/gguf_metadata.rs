@@ -1275,14 +1275,16 @@ impl CausalLMLoaderBuilder {
         // Note: BOS/EOS tokens are typically embedded in the tokenizer or chat template
         let eos_tokens = calculate_eos_tokens(&chat_template, None, &tokenizer);
 
-        // Build model ID from source
-        let model_id = match &self.source {
+        // Build model ID from source.
+        // For HuggingFace models, prefer tok_model_id if specified (matches GGUFPipeline behavior).
+        // This is important for pipeline parallelism where the model ID is used as the engine key.
+        let model_id = self.tok_model_id.clone().unwrap_or_else(|| match &self.source {
             ModelSource::Local(paths) => paths
                 .first()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
             ModelSource::HuggingFace { repo_id, .. } => repo_id.clone(),
-        };
+        });
 
         // Build metadata
         let num_hidden_layers = model.num_layers();
