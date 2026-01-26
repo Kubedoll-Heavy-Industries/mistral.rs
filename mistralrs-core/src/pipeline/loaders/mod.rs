@@ -3,11 +3,20 @@ mod diffusion_loaders;
 mod embedding_loaders;
 mod gguf_metadata;
 mod normal_loaders;
+mod transformer_builder;
 mod vision_loaders;
 pub use auto_device_map::{estimate_kv_cache_bytes, AutoDeviceMapParams, NonMappedSubModel};
 pub use gguf_metadata::{
     load_text_pipeline, CausalLMLoader, CausalLMLoaderBuilder, GgufLoader, GgufMetadata,
     LoaderMetadata, MetadataLoader,
+};
+// Re-exports for generic transformer loading infrastructure.
+// Some are not yet used but will be when other models migrate to this infrastructure.
+#[allow(unused_imports)]
+pub use transformer_builder::{
+    load_transformer_layers, GgufNaming, GgufWeightSource, LayerConfig, LayerCustomizerContext,
+    SafetensorsNaming, StandardTransformerBlock, TensorNaming, TransformerConfig,
+    TransformerLayerBuilder, WeightSource,
 };
 // Re-export ContentConfig for memory estimation (from utils, through this module)
 pub use crate::utils::gguf_metadata::ContentConfig as GgufContentConfig;

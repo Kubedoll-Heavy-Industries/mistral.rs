@@ -510,3 +510,208 @@ fn test_causal_lm_loader_from_hf() {
         assert!(!name.is_empty());
     });
 }
+
+// =============================================================================
+// Parameterized Model Family Tests
+// =============================================================================
+//
+// These tests allow testing different model families by setting environment
+// variables. Use for comprehensive e2e validation across architectures.
+//
+// Environment variables:
+// - TEST_LLAMA_MODEL: Path to a Llama GGUF model
+// - TEST_QWEN3_MODEL: Path to a Qwen3 GGUF model
+// - TEST_PHI3_MODEL: Path to a Phi3 GGUF model
+// - TEST_MISTRAL3_MODEL: Path to a Mistral3 GGUF model
+// - TEST_STARCODER2_MODEL: Path to a Starcoder2 GGUF model
+//
+// Example usage:
+//   TEST_LLAMA_MODEL=/path/to/llama.gguf cargo test --test text_pipeline_integration test_llama_family
+//   TEST_QWEN3_MODEL=/path/to/qwen3.gguf TEST_LLAMA_MODEL=/path/to/llama.gguf cargo test --test text_pipeline_integration test_all_model_families
+
+/// Test model info for parameterized tests.
+struct ModelTestInfo {
+    name: &'static str,
+    env_var: &'static str,
+    expected_arch: &'static str,
+}
+
+const MODEL_FAMILIES: &[ModelTestInfo] = &[
+    ModelTestInfo {
+        name: "Llama",
+        env_var: "TEST_LLAMA_MODEL",
+        expected_arch: "llama",
+    },
+    ModelTestInfo {
+        name: "Qwen3",
+        env_var: "TEST_QWEN3_MODEL",
+        expected_arch: "qwen3",
+    },
+    ModelTestInfo {
+        name: "Phi3",
+        env_var: "TEST_PHI3_MODEL",
+        expected_arch: "phi3",
+    },
+    ModelTestInfo {
+        name: "Mistral3",
+        env_var: "TEST_MISTRAL3_MODEL",
+        expected_arch: "mistral3",
+    },
+    ModelTestInfo {
+        name: "Starcoder2",
+        env_var: "TEST_STARCODER2_MODEL",
+        expected_arch: "starcoder2",
+    },
+];
+
+/// Run load test for a specific model family.
+fn run_model_family_test(info: &ModelTestInfo) -> bool {
+    let model_path = match std::env::var(info.env_var) {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => {
+            println!(
+                "Skipping {} test: {} not set",
+                info.name, info.env_var
+            );
+            return false;
+        }
+    };
+
+    if !model_path.exists() {
+        println!(
+            "Skipping {} test: path {:?} does not exist",
+            info.name, model_path
+        );
+        return false;
+    }
+
+    println!("\n=== Testing {} model: {:?} ===", info.name, model_path);
+
+    // Verify architecture
+    let loader = GgufLoader::open(&[&model_path]).expect("Failed to open GGUF");
+    let arch = format!("{:?}", loader.gguf_architecture()).to_lowercase();
+    println!("Detected architecture: {}", arch);
+
+    if !arch.contains(info.expected_arch) {
+        println!(
+            "Warning: Expected architecture containing '{}', got '{}'",
+            info.expected_arch, arch
+        );
+    }
+
+    // Load pipeline
+    let device = Device::Cpu;
+    let pipeline = load_text_pipeline(
+        &[&model_path],
+        &device,
+        AttentionImplementation::Eager,
+        DType::F32,
+        None,
+        None,
+    );
+
+    match pipeline {
+        Ok(pipeline) => {
+            println!("Successfully loaded {} pipeline: {}", info.name, pipeline.name());
+
+            // Test tokenizer
+            if let Some(tokenizer) = pipeline.tokenizer() {
+                let test_text = format!("Hello from {} model!", info.name);
+                match tokenizer.encode(test_text.as_str(), false) {
+                    Ok(encoding) => {
+                        println!("Tokenized '{}' -> {} tokens", test_text, encoding.len());
+                    }
+                    Err(e) => {
+                        println!("Warning: Failed to encode text: {}", e);
+                    }
+                }
+            }
+
+            println!("=== {} test PASSED ===\n", info.name);
+            true
+        }
+        Err(e) => {
+            println!("Failed to load {} pipeline: {}", info.name, e);
+            println!("=== {} test FAILED ===\n", info.name);
+            false
+        }
+    }
+}
+
+#[test]
+fn test_llama_family() {
+    let info = &MODEL_FAMILIES[0]; // Llama
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Llama model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
+fn test_qwen3_family() {
+    let info = &MODEL_FAMILIES[1]; // Qwen3
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Qwen3 model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
+fn test_phi3_family() {
+    let info = &MODEL_FAMILIES[2]; // Phi3
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Phi3 model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
+fn test_mistral3_family() {
+    let info = &MODEL_FAMILIES[3]; // Mistral3
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Mistral3 model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
+fn test_starcoder2_family() {
+    let info = &MODEL_FAMILIES[4]; // Starcoder2
+    if std::env::var(info.env_var).is_ok() {
+        assert!(run_model_family_test(info), "Starcoder2 model test failed");
+    } else {
+        println!("Set {} to run this test", info.env_var);
+    }
+}
+
+#[test]
+fn test_all_model_families() {
+    println!("\n=== Testing All Available Model Families ===\n");
+
+    let mut tested = 0;
+    let mut passed = 0;
+
+    for info in MODEL_FAMILIES {
+        if std::env::var(info.env_var).is_ok() {
+            tested += 1;
+            if run_model_family_test(info) {
+                passed += 1;
+            }
+        }
+    }
+
+    println!("\n=== Summary: {}/{} model families passed ===", passed, tested);
+
+    if tested == 0 {
+        println!("No model family environment variables set. Set one or more of:");
+        for info in MODEL_FAMILIES {
+            println!("  {}=/path/to/{}.gguf", info.env_var, info.name.to_lowercase());
+        }
+    } else {
+        assert_eq!(passed, tested, "Some model families failed");
+    }
+}

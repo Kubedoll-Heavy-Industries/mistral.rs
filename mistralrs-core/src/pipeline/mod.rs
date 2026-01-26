@@ -14,7 +14,7 @@ pub mod hooks;
 mod inputs_processor;
 mod isq;
 pub(crate) mod llg;
-mod loaders;
+pub mod loaders;
 mod macros;
 pub mod model_traits;
 mod safetensors;
