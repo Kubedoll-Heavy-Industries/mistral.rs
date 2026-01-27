@@ -48,7 +48,7 @@ use mistralrs_quant::{QuantMethod, QuantizedConfig, ShardedVarBuilder};
 
 use crate::attention::{AttentionConfig, CausalAttention, PositionEncoding, QkNorm};
 use crate::device_map::DeviceMapper;
-use crate::layers::{Activation, Mlp, RmsNorm, RotaryEmbedding, TransformerBlock};
+use crate::layers::{Activation, FeedForward, Mlp, RmsNorm, RotaryEmbedding, TransformerBlock};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 
@@ -752,6 +752,62 @@ impl TransformerLayerBuilder {
         // Assemble layer
         Ok(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp))
     }
+
+    /// Build the transformer layer with a custom feed-forward network.
+    ///
+    /// This allows using MoE layers or other custom FFN implementations instead
+    /// of the standard MLP. The caller is responsible for constructing the FFN
+    /// (e.g., loading MoE expert weights).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Load MoE weights and construct the MoE layer
+    /// let moe = MoE::<SoftmaxTopK>::new(&moe_config, vb, device, comm, loading_isq)?;
+    ///
+    /// // Build the layer with MoE instead of MLP
+    /// let layer = builder.build_with_ffn(moe)?;
+    /// ```
+    pub fn build_with_ffn<F: FeedForward>(
+        self,
+        ffn: F,
+    ) -> Result<TransformerBlock<RmsNorm, CausalAttention, F>> {
+        let q_proj = self.q_proj.ok_or_else(|| candle_core::Error::Msg("q_proj not set".into()))?;
+        let k_proj = self.k_proj.ok_or_else(|| candle_core::Error::Msg("k_proj not set".into()))?;
+        let v_proj = self.v_proj.ok_or_else(|| candle_core::Error::Msg("v_proj not set".into()))?;
+        let o_proj = self.o_proj.ok_or_else(|| candle_core::Error::Msg("o_proj not set".into()))?;
+        let attn_norm = self.attn_norm.ok_or_else(|| candle_core::Error::Msg("attn_norm not set".into()))?;
+        let ffn_norm = self.ffn_norm.ok_or_else(|| candle_core::Error::Msg("ffn_norm not set".into()))?;
+        let rope = self.rope.ok_or_else(|| candle_core::Error::Msg("rope not set".into()))?;
+
+        // Build attention config
+        let mut attn_config = AttentionConfig::new(
+            self.config.num_heads,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+        );
+        if let Some(window) = self.config.sliding_window {
+            attn_config = attn_config.with_sliding_window(window);
+        }
+        if let Some(cap) = self.config.softcap {
+            attn_config = attn_config.with_softcap(cap);
+        }
+
+        // Build attention
+        let mut attention = CausalAttention::new(attn_config, q_proj, k_proj, v_proj, o_proj, rope);
+        if let Some(qk_norm) = self.qk_norm {
+            attention = attention.with_qk_norm(qk_norm);
+        }
+        if let Some(paged_attn) = self.paged_attn {
+            attention = attention.with_paged_attn(paged_attn);
+        }
+        if let Some(dtype) = self.attn_dtype {
+            attention = attention.with_attn_dtype(dtype);
+        }
+
+        // Assemble layer with custom FFN
+        Ok(TransformerBlock::new(attn_norm, attention, ffn_norm, ffn))
+    }
 }
 
 // ============================================================================
@@ -760,6 +816,18 @@ impl TransformerLayerBuilder {
 
 /// Standard transformer block type alias.
 pub type StandardTransformerBlock = TransformerBlock<RmsNorm, CausalAttention, Mlp>;
+
+/// MoE transformer block type alias (generic over routing strategy).
+///
+/// Use with specific routing strategies:
+/// - `MoETransformerBlock<SoftmaxTopK>` for Mixtral, Qwen3 MoE
+/// - `MoETransformerBlock<GroupLimitedGreedy>` for DeepSeek V2
+pub type MoETransformerBlock<R> = TransformerBlock<RmsNorm, CausalAttention, crate::moe::MoE<R>>;
+
+/// MoE or MLP transformer block type alias (for models with mixed layers).
+///
+/// Used by Qwen3 MoE where some layers are MoE and others are standard MLP.
+pub type MoEOrMlpTransformerBlock<R> = TransformerBlock<RmsNorm, CausalAttention, crate::moe::MoEOrMlp<R>>;
 
 /// Context passed to the layer customizer closure.
 ///

@@ -1,7 +1,14 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
-use candle_nn::Linear;
+//! Qwen3 MoE model for NormalPipeline (safetensors loading).
+//!
+//! **DEPRECATED**: This file is maintained for backward compatibility with `NormalPipeline`.
+//! For new code, use `quantized_qwen3_moe::ModelWeights` which supports both GGUF and
+//! safetensors formats via the unified `FromGGUF` and `FromSafetensors` traits.
+//!
+//! The unified version can be used with `CausalLMPipeline` for typed inference.
+
+use candle_core::{Device, Module, Result, Tensor};
 use mistralrs_quant::{
     ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
     ShardedVarBuilder,
@@ -9,12 +16,12 @@ use mistralrs_quant::{
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
-use crate::moe::{MoEExperts, MoEExpertsConfig};
+use crate::moe::{MoE, MoELayerConfig, MoEOrMlp, SoftmaxTopK};
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
     device_map::DeviceMapper,
-    layers::{self, embedding, Activation, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{self, embedding, Activation, CausalMasker, FeedForward, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -73,6 +80,20 @@ impl Config {
     pub(crate) fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Create MoE layer config from model config.
+    fn to_moe_config(&self) -> MoELayerConfig {
+        MoELayerConfig {
+            hidden_size: self.hidden_size,
+            num_experts: self.num_experts,
+            num_experts_per_tok: self.num_experts_per_tok,
+            moe_intermediate_size: self.moe_intermediate_size,
+            norm_topk_prob: self.norm_topk_prob,
+            routed_scaling_factor: 1.0, // Qwen3 uses normalized top-k
+            hidden_act: self.hidden_act,
+            quantization_config: self.quantization_config.clone(),
+        }
     }
 }
 
@@ -293,175 +314,18 @@ impl Attention {
     }
 }
 
-#[derive(Clone)]
-struct Mlp {
-    gate_proj: Arc<dyn QuantMethod>,
-    up_proj: Arc<dyn QuantMethod>,
-    down_proj: Arc<dyn QuantMethod>,
-    act_fn: Activation,
-}
+// MoE layer now uses the type-safe MoE<SoftmaxTopK> from crate::moe
+// MoEOrMlp and Mlp are reused from crate::moe and crate::layers respectively
 
-impl Mlp {
-    fn new(
-        cfg: &Config,
-        vb: ShardedVarBuilder,
-        comm: &Arc<mistralrs_quant::Comm>,
-        i_size: usize,
-    ) -> Result<Self> {
-        let hidden_size = cfg.hidden_size;
+/// Type alias for Qwen3 MoE layers using softmax top-k routing
+type Qwen3MoE = MoE<SoftmaxTopK>;
 
-        let gate_proj = ColumnParallelLayer::new(
-            hidden_size,
-            i_size,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("gate_proj"),
-        )?;
-        let up_proj = RowParallelLayer::new(
-            hidden_size,
-            i_size,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("up_proj"),
-        )?;
-        let down_proj = ColumnParallelLayer::new(
-            i_size,
-            hidden_size,
-            &cfg.quantization_config,
-            false,
-            comm,
-            vb.pp("down_proj"),
-        )?;
-
-        Ok(Self {
-            gate_proj,
-            up_proj,
-            down_proj,
-            act_fn: cfg.hidden_act,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let gate_out = MatMul.qmethod_matmul(&xs, &*self.gate_proj)?;
-        let up_out = MatMul.qmethod_matmul(&xs, &*self.up_proj)?;
-        let current_hidden_states = crate::ops::mul_and_act(&gate_out, &up_out, self.act_fn)?;
-        let mut res = MatMul.qmethod_matmul(&current_hidden_states, &*self.down_proj)?;
-        if self.gate_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
-        Ok(res)
-    }
-}
-
-/// MoE MLP layer for Qwen3 MoE
-struct MoeMlp {
-    gate: Linear,
-    experts: MoEExperts,
-    num_experts_per_tok: usize,
-    norm_topk_prob: bool,
-}
-
-impl MoeMlp {
-    fn new(
-        cfg: &Config,
-        vb: ShardedVarBuilder,
-        layer_device: Device,
-        comm: &Arc<mistralrs_quant::Comm>,
-        loading_isq: bool,
-    ) -> Result<Self> {
-        // Load gate
-        let gate = layers::linear_no_bias(
-            cfg.hidden_size,
-            cfg.num_experts,
-            vb.pp("gate").set_device(layer_device.clone()),
-        )?;
-
-        let moe_cfg = MoEExpertsConfig {
-            num_experts: cfg.num_experts,
-            num_experts_per_tok: cfg.num_experts_per_tok,
-            hidden_size: cfg.hidden_size,
-            moe_intermediate_size: cfg.moe_intermediate_size,
-        };
-
-        // Load experts with automatic backend selection
-        let experts = MoEExperts::new(
-            &moe_cfg,
-            vb,
-            layer_device,
-            comm,
-            loading_isq,
-            &cfg.quantization_config,
-            cfg.hidden_act,
-        )?;
-
-        Ok(Self {
-            gate,
-            experts,
-            num_experts_per_tok: cfg.num_experts_per_tok,
-            norm_topk_prob: cfg.norm_topk_prob,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b_size, seq_len, hidden_dim) = xs.dims3()?;
-        let xs_flat = xs.reshape(((), hidden_dim))?;
-
-        // Compute routing weights
-        let router_logits = self.gate.forward(&xs_flat)?;
-        let routing_weights =
-            candle_nn::ops::softmax_last_dim(&router_logits.to_dtype(DType::F32)?)?;
-
-        // Get top-k experts
-        let topk_ids = routing_weights
-            .arg_sort_last_dim(false)?
-            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-            .contiguous()?;
-
-        let mut topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
-
-        if self.norm_topk_prob {
-            topk_weights = topk_weights.broadcast_div(&topk_weights.sum_keepdim(D::Minus1)?)?;
-        }
-
-        // Forward through experts (is_prefill determined internally based on seq_len)
-        let ys = self.experts.forward(xs, topk_weights, &topk_ids)?;
-
-        ys.reshape((b_size, seq_len, hidden_dim))
-    }
-
-    fn gate(&self) -> &Linear {
-        &self.gate
-    }
-
-    fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
-        self.experts.get_isq_layers()
-    }
-}
-
-enum MoeOrMlp {
-    Moe(MoeMlp),
-    Mlp(Mlp),
-}
-
-impl MoeOrMlp {
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Mlp(m) => m.forward(xs),
-            Self::Moe(m) => m.forward(xs),
-        }
-    }
-}
+/// Type alias for the MoE or MLP layer type
+type Qwen3MoeOrMlp = MoEOrMlp<SoftmaxTopK>;
 
 struct DecoderLayer {
     self_attn: Attention,
-    mlp: MoeOrMlp,
+    mlp: Qwen3MoeOrMlp,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -499,13 +363,23 @@ impl DecoderLayer {
                 .cloned()
                 .unwrap_or(real_device);
 
-            MoeOrMlp::Moe(MoeMlp::new(cfg, vb, layer_device, comm, loading_isq)?)
-        } else {
-            MoeOrMlp::Mlp(Mlp::new(
-                cfg,
-                mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
+            // Use the new type-safe MoE layer with SoftmaxTopK routing
+            Qwen3MoeOrMlp::MoE(Qwen3MoE::new(
+                &cfg.to_moe_config(),
+                vb,
+                layer_device,
                 comm,
+                loading_isq,
+            )?)
+        } else {
+            // Use the layers::Mlp for dense layers
+            Qwen3MoeOrMlp::Mlp(layers::Mlp::new(
+                mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
+                cfg.hidden_size,
                 cfg.intermediate_size,
+                &cfg.quantization_config,
+                cfg.hidden_act,
+                comm,
             )?)
         };
         let input_layernorm = RmsNorm::new(
@@ -812,12 +686,13 @@ impl IsqModel for Model {
             tensors.push((&mut layer.self_attn.v_proj, Some(i)));
             tensors.push((&mut layer.self_attn.o_proj, Some(i)));
             match &mut layer.mlp {
-                MoeOrMlp::Mlp(mlp) => {
-                    tensors.push((&mut mlp.gate_proj, Some(i)));
-                    tensors.push((&mut mlp.up_proj, Some(i)));
-                    tensors.push((&mut mlp.down_proj, Some(i)));
+                Qwen3MoeOrMlp::Mlp(mlp) => {
+                    // layers::Mlp uses gate, up, down field names
+                    tensors.push((&mut mlp.gate, Some(i)));
+                    tensors.push((&mut mlp.up, Some(i)));
+                    tensors.push((&mut mlp.down, Some(i)));
                 }
-                MoeOrMlp::Moe(moe) => {
+                Qwen3MoeOrMlp::MoE(moe) => {
                     for layer in moe.get_isq_layers() {
                         tensors.push((layer, Some(i)));
                     }
@@ -848,7 +723,7 @@ impl IsqModel for Model {
                 .pp("self_attn")
                 .pp("k_norm")
                 .add(&layer.self_attn.k_norm);
-            if let MoeOrMlp::Moe(moe) = &layer.mlp {
+            if let Qwen3MoeOrMlp::MoE(moe) = &layer.mlp {
                 uvb_l.pp("mlp").pp("gate").add(moe.gate());
             }
         }

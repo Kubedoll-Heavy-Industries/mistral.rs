@@ -16,8 +16,9 @@ pub use gguf_metadata::{
 pub use transformer_builder::{
     load_standard_transformer, load_transformer_from_safetensors, load_transformer_layers,
     GgufNaming, GgufWeightSource, LayerConfig, LayerCustomizerContext, LoadedTransformer,
-    SafetensorsNaming, SafetensorsWeightSource, StandardTransformerBlock, TensorNaming,
-    TransformerConfig, TransformerLayerBuilder, WeightSource,
+    MoEOrMlpTransformerBlock, MoETransformerBlock, SafetensorsNaming, SafetensorsWeightSource,
+    StandardTransformerBlock, TensorNaming, TransformerConfig, TransformerLayerBuilder,
+    WeightSource,
 };
 // Re-export ContentConfig for memory estimation (from utils, through this module)
 pub use crate::utils::gguf_metadata::ContentConfig as GgufContentConfig;

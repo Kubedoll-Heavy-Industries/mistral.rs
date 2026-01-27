@@ -2,11 +2,11 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use candle_core::{Context, DType, Device, IndexOp, Result, Tensor, D};
+use candle_core::{Device, Result, Tensor, D};
 use candle_nn::{Embedding, Module};
 use mistralrs_quant::{
-    ColumnParallelLayer, NonZeroOp, QuantMethod, QuantizedConfig, ReplicatedLayer,
-    RowParallelLayer, ShardedVarBuilder, SumAllReduce,
+    ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
+    ShardedVarBuilder,
 };
 use serde::Deserialize;
 
@@ -16,10 +16,11 @@ use crate::{
     device_map::DeviceMapper,
     layers::{
         embedding, Activation, CausalMasker, DeepSeekV2RopeConfig, DeepSeekV2RopeScaling,
-        DeepSeekV2RotaryEmbedding, Mlp, RmsNorm, Sdpa,
+        DeepSeekV2RotaryEmbedding, FeedForward, Mlp, RmsNorm, Sdpa,
     },
-    layers_masker::{masked_fill, PastKvLenCache},
-    ops::{SplitOp, TopKLastDimOp, TopKOutput},
+    layers_masker::PastKvLenCache,
+    moe::{GroupLimitedMoE, MoE, MoELayerConfig, SoftmaxTopK},
+    ops::SplitOp,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -29,9 +30,6 @@ use crate::{
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
-
-use std::collections::HashSet;
-use std::iter::FromIterator;
 serde_default_fn!(f64, routed_scaling_factor, 1.0);
 serde_default_fn!(TopkMethod, topk_method, TopkMethod::Greedy);
 serde_default_fn!(usize, moe_layer_freq, 1);
@@ -115,6 +113,20 @@ impl DeepSeekV2Config {
             softmax_scale = softmax_scale * mscale * mscale;
         }
         softmax_scale
+    }
+
+    /// Create MoE layer config from model config.
+    fn to_moe_config(&self) -> MoELayerConfig {
+        MoELayerConfig {
+            hidden_size: self.hidden_size,
+            num_experts: self.n_routed_experts.unwrap_or(0),
+            num_experts_per_tok: self.num_experts_per_tok.unwrap_or(1),
+            moe_intermediate_size: self.moe_intermediate_size,
+            norm_topk_prob: self.norm_topk_prob,
+            routed_scaling_factor: self.routed_scaling_factor,
+            hidden_act: self.hidden_act,
+            quantization_config: self.quantization_config.clone(),
+        }
     }
 }
 
@@ -374,280 +386,53 @@ impl Attention {
     }
 }
 
-struct Expert {
-    gate: Arc<dyn QuantMethod>,
-    up: Arc<dyn QuantMethod>,
-    down: Arc<dyn QuantMethod>,
-    act: Activation,
-}
+// ============================================================================
+// MoE Type Aliases and Enum for DeepSeek V2
+// ============================================================================
 
-impl Expert {
-    fn new(
-        cfg: &DeepSeekV2Config,
-        vb: ShardedVarBuilder,
-        hidden_size: Option<usize>,
-        intermediate_size: Option<usize>,
-    ) -> Result<Self> {
-        let hidden_size = hidden_size.unwrap_or(cfg.hidden_size);
-        let intermediate_size = intermediate_size.unwrap_or(cfg.intermediate_size);
+/// Type alias for DeepSeek2 MoE with standard softmax top-k routing (Greedy method)
+type DeepSeek2SoftmaxMoE = MoE<SoftmaxTopK>;
 
-        Ok(Self {
-            gate: ReplicatedLayer::new(
-                hidden_size,
-                intermediate_size,
-                &cfg.quantization_config,
-                false,
-                vb.pp("gate_proj"),
-            )?,
-            up: ReplicatedLayer::new(
-                hidden_size,
-                intermediate_size,
-                &cfg.quantization_config,
-                false,
-                vb.pp("up_proj"),
-            )?,
-            down: ReplicatedLayer::new(
-                intermediate_size,
-                hidden_size,
-                &cfg.quantization_config,
-                false,
-                vb.pp("down_proj"),
-            )?,
-            act: cfg.hidden_act,
-        })
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let lhs = self.gate.forward(&xs)?;
-        let rhs = self.up.forward(&xs)?;
-        let mut res = self
-            .down
-            .forward(&crate::ops::mul_and_act(&lhs, &rhs, self.act)?)?;
-        if self.gate.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
-        Ok(res)
-    }
-}
-
-struct MoeGate {
-    weight: Tensor,
-    cfg: DeepSeekV2Config,
-    top_k: usize,
-    n_routed_experts: usize,
-}
-
-impl MoeGate {
-    fn new(cfg: &DeepSeekV2Config, vb: ShardedVarBuilder, n_routed_experts: usize) -> Result<Self> {
-        let weight = vb.get((n_routed_experts, cfg.hidden_size), "weight")?;
-        Ok(Self {
-            weight,
-            cfg: cfg.clone(),
-            top_k: cfg.num_experts_per_tok.unwrap(),
-            n_routed_experts,
-        })
-    }
-
-    /// (topk_idx, topk_weight)
-    fn forward(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
-        let (bs, seq_len, h) = xs.dims3()?;
-        // Compute gating score
-        let xs = xs.reshape(((), h))?;
-        let logits = xs
-            .to_dtype(DType::F32)?
-            .broadcast_matmul(&self.weight.t()?.to_dtype(DType::F32)?)?;
-        let scores = match self.cfg.scoring_func {
-            ScoringFunc::Softmax => candle_nn::ops::softmax_last_dim(&logits)?,
-        };
-
-        // Select top-k experts
-        let (mut topk_weight, topk_idx) = match self.cfg.topk_method {
-            TopkMethod::Greedy => {
-                let TopKOutput { values, indices } = scores.topk_unsorted(self.top_k)?;
-                (values, indices)
-            }
-            TopkMethod::GroupLimitedGreedy => {
-                // (n, n_group)
-                let group_scores = scores
-                    .reshape((bs * seq_len, self.cfg.n_group, ()))?
-                    .max(D::Minus1)?;
-                // (n, topk_group)
-                let group_idx = group_scores.topk_unsorted(self.cfg.topk_group)?.indices;
-                // (n, n_group)
-                let mut group_mask = group_scores.zeros_like()?;
-                // (n, n_group)
-                group_mask = group_mask.scatter_add(
-                    &group_idx,
-                    &group_idx.ones_like()?.to_dtype(group_mask.dtype())?,
-                    1,
-                )?;
-                // (n, e)
-                let score_mask = group_mask
-                    .unsqueeze(D::Minus1)?
-                    .expand((
-                        bs * seq_len,
-                        self.cfg.n_group,
-                        self.n_routed_experts / self.cfg.n_group,
-                    ))?
-                    .reshape((bs * seq_len, ()))?;
-                // (n, e)
-                // Invert the mask
-                let tmp_scores = masked_fill(&score_mask, &(1. - &score_mask.ne(0.)?)?, 0.)?;
-                let TopKOutput { values, indices } = tmp_scores.topk_unsorted(self.top_k)?;
-                (values, indices)
-            }
-        };
-
-        if self.top_k > 1 && self.cfg.norm_topk_prob {
-            let denmoninator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
-            topk_weight = (topk_weight / denmoninator)?;
-        } else {
-            topk_weight = (topk_weight * self.cfg.routed_scaling_factor)?;
-        }
-        Ok((topk_idx, topk_weight))
-    }
-}
-
-struct Moe {
-    experts: Vec<Option<Expert>>,
-    shared_experts: Option<Mlp>,
-    gate: MoeGate,
-    all_reduce: SumAllReduce,
-    experts_start_idx: usize,
-    experts_end_idx: usize,
-    world_size: usize,
-}
-
-impl Moe {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        cfg: &DeepSeekV2Config,
-        vb: ShardedVarBuilder,
-        mapper: &dyn DeviceMapper,
-        layer_idx: usize,
-        loading_isq: bool,
-        n_shared_experts: Option<usize>,
-        n_routed_experts: usize,
-        comm: &Arc<mistralrs_quant::Comm>,
-    ) -> Result<Self> {
-        let mut experts = Vec::with_capacity(n_routed_experts);
-        let n_local_experts = n_routed_experts / comm.world_size();
-        let experts_start_idx = comm.rank() * n_local_experts;
-        let experts_end_idx = experts_start_idx + n_local_experts;
-        for i in 0..n_routed_experts {
-            if i >= experts_start_idx && i < experts_end_idx {
-                let vb_e = vb.pp("experts").pp(i);
-                experts.push(Some(Expert::new(
-                    cfg,
-                    mapper.set_device(layer_idx, vb_e, loading_isq),
-                    None,
-                    Some(cfg.moe_intermediate_size),
-                )?));
-            } else {
-                experts.push(None);
-            }
-        }
-        let shared_experts = if let Some(n_shared_experts) = n_shared_experts {
-            let intermediate_size = cfg.moe_intermediate_size * n_shared_experts;
-            Some(Mlp::new(
-                mapper.set_device(layer_idx, vb.pp("shared_experts"), loading_isq),
-                cfg.hidden_size,
-                intermediate_size,
-                &cfg.quantization_config,
-                cfg.hidden_act,
-                comm,
-            )?)
-        } else {
-            None
-        };
-        let gate = MoeGate::new(
-            cfg,
-            mapper.set_device(layer_idx, vb.pp("gate"), false),
-            n_routed_experts,
-        )?;
-        Ok(Self {
-            experts,
-            shared_experts,
-            gate,
-            all_reduce: SumAllReduce::new(comm),
-            experts_end_idx,
-            experts_start_idx,
-            world_size: comm.world_size(),
-        })
-    }
-
-    fn moe_infer(&self, xs: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
-        let mut y = xs.zeros_like()?;
-        let topk_weight = if topk_weight.dtype() != xs.dtype() {
-            topk_weight.to_dtype(xs.dtype())?
-        } else {
-            topk_weight.to_owned()
-        };
-        let unique_ids: HashSet<u32> =
-            HashSet::from_iter(topk_ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?);
-        for i in self.experts_start_idx..self.experts_end_idx {
-            if !unique_ids.contains(&(i as u32)) {
-                continue;
-            }
-            let idx_top = topk_ids.eq(i as f64)?.nonzero()?.t()?;
-            let idx = &idx_top.i(0)?.contiguous()?;
-            let top = &idx_top.i(1)?.contiguous()?;
-
-            let expert = self.experts[i]
-                .as_ref()
-                .context("Expert is not present for this rank.")?;
-
-            y = y.index_add(
-                idx,
-                &expert.forward(&xs.index_select(idx, 0)?)?.broadcast_mul(
-                    &topk_weight
-                        .index_select(idx, 0)?
-                        .gather(&top.unsqueeze(1)?, 1)?
-                        .squeeze(1)?
-                        .unsqueeze(D::Minus1)?,
-                )?,
-                0,
-            )?;
-        }
-
-        if self.world_size > 1 {
-            y = self.all_reduce.sum_all_reduce(&y)?;
-        }
-
-        Ok(y)
-    }
-
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let identity = xs.clone();
-        let orig_shape = xs.shape();
-        let (topk_idx, topk_weight) = self.gate.forward(xs)?;
-        let xs = xs.reshape(((), xs.dim(D::Minus1)?))?;
-
-        let mut y = self
-            .moe_infer(&xs, &topk_idx, &topk_weight)?
-            .reshape(orig_shape)?;
-        if let Some(ref shared_experts) = self.shared_experts {
-            y = (y + shared_experts.forward(&identity)?)?;
-        }
-        Ok(y)
-    }
-}
-
-enum MoeOrMlp {
-    Moe(Box<Moe>),
+/// Enum for layers that can be MoE (with either routing strategy) or standard MLP.
+///
+/// DeepSeek V2 supports two routing methods:
+/// - `Greedy`: Standard softmax top-k (uses `MoE<SoftmaxTopK>`)
+/// - `GroupLimitedGreedy`: Group-based selection (uses `GroupLimitedMoE`)
+enum DeepSeek2MoeOrMlp {
+    /// MoE layer with softmax top-k routing (Greedy method)
+    SoftmaxMoE(DeepSeek2SoftmaxMoE),
+    /// MoE layer with group-limited greedy routing
+    GroupLimitedMoE(GroupLimitedMoE),
+    /// Standard dense MLP layer
     Mlp(Mlp),
 }
 
-impl MoeOrMlp {
+impl FeedForward for DeepSeek2MoeOrMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
+            Self::SoftmaxMoE(moe) => moe.forward(xs),
+            Self::GroupLimitedMoE(moe) => moe.forward(xs),
             Self::Mlp(mlp) => mlp.forward(xs),
-            Self::Moe(moe) => moe.forward(xs),
+        }
+    }
+}
+
+impl DeepSeek2MoeOrMlp {
+    /// Get mutable references to ISQ layers for quantization.
+    fn get_isq_layers(&mut self) -> Vec<&mut Arc<dyn QuantMethod>> {
+        match self {
+            Self::SoftmaxMoE(moe) => moe.get_isq_layers(),
+            Self::GroupLimitedMoE(moe) => moe.get_isq_layers(),
+            Self::Mlp(mlp) => vec![&mut mlp.gate, &mut mlp.up, &mut mlp.down],
+        }
+    }
+
+    /// Get a reference to the gate for residual tensors.
+    fn gate(&self) -> Option<&Arc<dyn QuantMethod>> {
+        match self {
+            Self::SoftmaxMoE(moe) => Some(moe.gate()),
+            Self::GroupLimitedMoE(moe) => Some(moe.gate()),
+            Self::Mlp(_) => None,
         }
     }
 }
@@ -656,7 +441,7 @@ struct DecoderLayer {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
     attn: Attention,
-    moe_or_mlp: MoeOrMlp,
+    moe_or_mlp: DeepSeek2MoeOrMlp,
 }
 
 impl DecoderLayer {
@@ -695,18 +480,63 @@ impl DecoderLayer {
             && layer_idx >= cfg.first_k_dense_replace
             && layer_idx % cfg.moe_layer_freq == 0
         {
-            MoeOrMlp::Moe(Box::new(Moe::new(
-                cfg,
-                vb.pp("mlp"),
-                mapper,
-                layer_idx,
-                loading_isq,
-                cfg.n_shared_experts,
-                cfg.n_routed_experts.unwrap(),
-                comm,
-            )?))
+            let vb_mlp = mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq);
+            let layer_device = mapper
+                .device_for(layer_idx, false)
+                .cloned()
+                .unwrap_or_else(|| vb.device().clone());
+            let moe_config = cfg.to_moe_config();
+
+            // Build shared expert if configured
+            let shared_expert = if let Some(n_shared_experts) = cfg.n_shared_experts {
+                let intermediate_size = cfg.moe_intermediate_size * n_shared_experts;
+                Some(Mlp::new(
+                    vb_mlp.pp("shared_experts"),
+                    cfg.hidden_size,
+                    intermediate_size,
+                    &cfg.quantization_config,
+                    cfg.hidden_act,
+                    comm,
+                )?)
+            } else {
+                None
+            };
+
+            // Create MoE layer based on routing method
+            match cfg.topk_method {
+                TopkMethod::Greedy => {
+                    // Use standard softmax top-k routing
+                    let mut moe = DeepSeek2SoftmaxMoE::new(
+                        &moe_config,
+                        vb_mlp,
+                        layer_device,
+                        comm,
+                        loading_isq,
+                    )?;
+                    if let Some(shared) = shared_expert {
+                        moe = moe.with_shared_expert(shared);
+                    }
+                    DeepSeek2MoeOrMlp::SoftmaxMoE(moe)
+                }
+                TopkMethod::GroupLimitedGreedy => {
+                    // Use group-limited greedy routing
+                    let mut moe = GroupLimitedMoE::new(
+                        &moe_config,
+                        vb_mlp,
+                        layer_device,
+                        comm,
+                        loading_isq,
+                        cfg.n_group,
+                        cfg.topk_group,
+                    )?;
+                    if let Some(shared) = shared_expert {
+                        moe = moe.with_shared_expert(shared);
+                    }
+                    DeepSeek2MoeOrMlp::GroupLimitedMoE(moe)
+                }
+            }
         } else {
-            MoeOrMlp::Mlp(Mlp::new(
+            DeepSeek2MoeOrMlp::Mlp(Mlp::new(
                 mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
                 cfg.hidden_size,
                 cfg.intermediate_size,
@@ -965,24 +795,9 @@ impl IsqModel for DeepSeekV2 {
             tensors.push((&mut layer.attn.kv_a_proj_with_mqa, Some(i)));
             tensors.push((&mut layer.attn.kv_b_proj, Some(i)));
             tensors.push((&mut layer.attn.o_proj, Some(i)));
-            match &mut layer.moe_or_mlp {
-                MoeOrMlp::Mlp(mlp) => {
-                    tensors.push((&mut mlp.gate, Some(i)));
-                    tensors.push((&mut mlp.up, Some(i)));
-                    tensors.push((&mut mlp.down, Some(i)));
-                }
-                MoeOrMlp::Moe(moe) => {
-                    for mlp in moe.experts.iter_mut().filter_map(|e| e.as_mut()) {
-                        tensors.push((&mut mlp.gate, Some(i)));
-                        tensors.push((&mut mlp.up, Some(i)));
-                        tensors.push((&mut mlp.down, Some(i)));
-                    }
-                    if let Some(mlp) = &mut moe.shared_experts {
-                        tensors.push((&mut mlp.gate, Some(i)));
-                        tensors.push((&mut mlp.up, Some(i)));
-                        tensors.push((&mut mlp.down, Some(i)));
-                    }
-                }
+            // Use the get_isq_layers method from DeepSeek2MoeOrMlp
+            for layer_ref in layer.moe_or_mlp.get_isq_layers() {
+                tensors.push((layer_ref, Some(i)));
             }
         }
         (tensors, &*self.mapper)
@@ -997,24 +812,9 @@ impl IsqModel for DeepSeekV2 {
         let mut tensors = Vec::new();
         tensors.push((&mut self.lm_head, None));
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            match &mut layer.moe_or_mlp {
-                MoeOrMlp::Mlp(mlp) => {
-                    tensors.push((&mut mlp.gate, Some(i)));
-                    tensors.push((&mut mlp.up, Some(i)));
-                    tensors.push((&mut mlp.down, Some(i)));
-                }
-                MoeOrMlp::Moe(moe) => {
-                    for mlp in moe.experts.iter_mut().filter_map(|e| e.as_mut()) {
-                        tensors.push((&mut mlp.gate, Some(i)));
-                        tensors.push((&mut mlp.up, Some(i)));
-                        tensors.push((&mut mlp.down, Some(i)));
-                    }
-                    if let Some(mlp) = &mut moe.shared_experts {
-                        tensors.push((&mut mlp.gate, Some(i)));
-                        tensors.push((&mut mlp.up, Some(i)));
-                        tensors.push((&mut mlp.down, Some(i)));
-                    }
-                }
+            // Use the get_isq_layers method from DeepSeek2MoeOrMlp
+            for layer_ref in layer.moe_or_mlp.get_isq_layers() {
+                tensors.push((layer_ref, Some(i)));
             }
         }
         (tensors, &*self.mapper)
@@ -1039,14 +839,9 @@ impl IsqModel for DeepSeekV2 {
                 .pp("kv_a_layernorm")
                 .add(&layer.attn.kv_a_layernorm);
 
-            match &layer.moe_or_mlp {
-                MoeOrMlp::Moe(moe) => {
-                    uvb_l
-                        .pp("mlp")
-                        .pp("gate")
-                        .add_tensor("weight", moe.gate.weight.clone());
-                }
-                MoeOrMlp::Mlp(_) => (),
+            // Add gate tensor for MoE layers
+            if let Some(gate) = layer.moe_or_mlp.gate() {
+                uvb_l.pp("mlp").pp("gate").add(gate);
             }
 
             match &layer.attn.q {
@@ -1079,14 +874,9 @@ impl IsqModel for DeepSeekV2 {
                 .pp("kv_a_layernorm")
                 .add(&layer.attn.kv_a_layernorm);
 
-            match &layer.moe_or_mlp {
-                MoeOrMlp::Moe(moe) => {
-                    uvb_l
-                        .pp("mlp")
-                        .pp("gate")
-                        .add_tensor("weight", moe.gate.weight.clone());
-                }
-                MoeOrMlp::Mlp(_) => (),
+            // Add gate tensor for MoE layers
+            if let Some(gate) = layer.moe_or_mlp.gate() {
+                uvb_l.pp("mlp").pp("gate").add(gate);
             }
 
             match &layer.attn.q {

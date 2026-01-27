@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::cuda::moe;
 use crate::layers::Activation;
 use crate::moe::shard;
+use crate::moe::weight_source::{LoadedExpertWeights, QuantProperties};
 
 /// Configuration for MoEExperts
 pub struct MoEExpertsConfig {
@@ -77,6 +78,34 @@ struct FastExpertsWeights {
 /// Internal representation for loop-based experts (quantized fallback)
 struct SlowExpertsWeights {
     experts: PackedExperts,
+}
+
+impl FastExpertsWeights {
+    /// Create from pre-loaded weights by stacking them.
+    ///
+    /// This currently fails for per-expert weights - they need to be
+    /// stacked into fused format. For GGUF, use SlowExpertsWeights instead.
+    fn from_loaded(_loaded: &LoadedExpertWeights) -> Result<Self> {
+        // TODO: Implement stacking of per-expert weights into fused format
+        // For now, return error - caller should fall back to Slow
+        candle_core::bail!(
+            "FastExpertsWeights::from_loaded not yet implemented for per-expert weights. \
+             Use SlowExpertsWeights instead."
+        )
+    }
+}
+
+impl SlowExpertsWeights {
+    /// Create from pre-loaded expert weights.
+    fn from_loaded(loaded: LoadedExpertWeights) -> Result<Self> {
+        Ok(Self {
+            experts: PackedExperts {
+                gate_proj: loaded.gate_proj,
+                up_proj: loaded.up_proj,
+                down_proj: loaded.down_proj,
+            },
+        })
+    }
 }
 
 /// MoE experts layer without gate
@@ -177,6 +206,98 @@ impl MoEExperts {
             all_reduce: SumAllReduce::new(comm),
             world_size: comm.world_size(),
         })
+    }
+
+    /// Create MoEExperts from pre-loaded weights.
+    ///
+    /// This constructor enables unified MoE loading for both GGUF and safetensors.
+    /// The backend is selected based on tensor properties (device, quantization),
+    /// not the source file format.
+    ///
+    /// # Arguments
+    ///
+    /// * `loaded` - Pre-loaded expert weights with quant properties
+    /// * `num_experts_per_tok` - Number of experts activated per token
+    /// * `comm` - Communication context for tensor parallelism
+    /// * `act` - Activation function for the expert MLPs
+    ///
+    /// # Backend Selection
+    ///
+    /// - **Fused**: Not available for pre-loaded weights (requires raw Tensors)
+    /// - **Fast**: Used when `supports_indexed_forward` is true (CUDA with optimized kernels)
+    /// - **Slow**: Fallback for CPU or unsupported quantization
+    pub fn from_loaded(
+        loaded: LoadedExpertWeights,
+        num_experts_per_tok: usize,
+        comm: &Arc<mistralrs_quant::Comm>,
+        act: Activation,
+    ) -> Result<Self> {
+        loaded.validate()?;
+
+        let device = if let Some(first) = loaded.gate_proj.first() {
+            first
+                .unquant_weight_bias()
+                .map(|(w, _)| w.device().clone())
+                .unwrap_or(Device::Cpu)
+        } else {
+            Device::Cpu
+        };
+
+        let backend = Self::select_backend_for_loaded(&device, &loaded.quant_properties);
+
+        let backend_impl = match backend {
+            MoEExpertsBackend::Fused => {
+                // Fused backend requires raw Tensors, not QuantMethod
+                // Fall back to Fast or Slow
+                if loaded.quant_properties.supports_indexed_forward && device.is_cuda() {
+                    MoEExpertsBackendImpl::Fast(FastExpertsWeights::from_loaded(&loaded)?)
+                } else {
+                    MoEExpertsBackendImpl::Slow(SlowExpertsWeights::from_loaded(loaded)?)
+                }
+            }
+            MoEExpertsBackend::Fast => {
+                MoEExpertsBackendImpl::Fast(FastExpertsWeights::from_loaded(&loaded)?)
+            }
+            MoEExpertsBackend::Slow => {
+                MoEExpertsBackendImpl::Slow(SlowExpertsWeights::from_loaded(loaded)?)
+            }
+        };
+
+        Ok(Self {
+            backend: backend_impl,
+            act,
+            num_experts_per_tok,
+            all_reduce: SumAllReduce::new(comm),
+            world_size: comm.world_size(),
+        })
+    }
+
+    /// Select backend based on device and quantization properties.
+    ///
+    /// This is the unified backend selection that works for any weight source.
+    fn select_backend_for_loaded(device: &Device, props: &QuantProperties) -> MoEExpertsBackend {
+        // Pre-quantized weights (GGUF) can't use Fused backend (needs raw Tensors)
+        if props.is_prequantized {
+            if device.is_cuda() && props.supports_indexed_forward {
+                // Use indexed_moe_forward CUDA kernels
+                MoEExpertsBackend::Fast
+            } else if device.is_metal() {
+                // Metal can use gather-based fast path
+                MoEExpertsBackend::Fast
+            } else {
+                // CPU or unsupported quantization
+                MoEExpertsBackend::Slow
+            }
+        } else {
+            // Unquantized weights: prefer Fused on CUDA, Fast on Metal
+            if device.is_cuda() && props.quant_format.is_none() {
+                MoEExpertsBackend::Fused
+            } else if device.is_metal() || device.is_cuda() {
+                MoEExpertsBackend::Fast
+            } else {
+                MoEExpertsBackend::Slow
+            }
+        }
     }
 
     /// Load fused weights in standard per-expert format

@@ -1088,30 +1088,44 @@ pub struct MixtralLoader;
 impl NormalModelLoader for MixtralLoader {
     fn load(
         &self,
-        _config: &str,
-        _vb: ShardedVarBuilder,
-        _normal_loading_metadata: NormalLoadingMetadata,
-        _attention_mechanism: AttentionImplementation,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        anyhow::bail!(
-            "Mixtral safetensors loading is not supported. \
-             Please use GGUF format with CausalLMLoaderBuilder for Mixtral models."
-        )
+        let cfg: crate::models::mixtral::Config = serde_json::from_str(config)?;
+
+        #[allow(deprecated)]
+        Ok(Box::new(models::mixtral::Mixtral::from_safetensors(
+            &cfg,
+            vb,
+            self.is_gptx(config)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
     }
     fn load_xlora(
         &self,
-        _config: &str,
-        _vb: ShardedVarBuilder,
-        _lora_config: &[((String, String), LoraConfig)],
-        _xlora_config: Option<XLoraConfig>,
-        _xlora_ordering: Ordering,
-        _normal_loading_metadata: NormalLoadingMetadata,
-        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+        config: &str,
+        vb: ShardedVarBuilder,
+        lora_config: &[((String, String), LoraConfig)],
+        xlora_config: Option<XLoraConfig>,
+        xlora_ordering: Ordering,
+        normal_loading_metadata: NormalLoadingMetadata,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        anyhow::bail!(
-            "Mixtral XLoRA/LoRA loading is not supported. \
-             Please use GGUF format with CausalLMLoaderBuilder for Mixtral models."
-        )
+        let cfg: crate::models::mixtral::Config = serde_json::from_str(config)?;
+
+        Ok(Box::new(xlora_models::XLoraMixtral::new(
+            &cfg,
+            vb,
+            lora_config,
+            xlora_config,
+            xlora_ordering,
+            self.is_gptx(config)?,
+            normal_loading_metadata,
+            preload_adapters,
+        )?))
     }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)
@@ -1132,11 +1146,10 @@ impl IsqModelLoader for MixtralLoader {
             Regex::new(r"layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
             Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
             Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
-            // Experts
-            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.gate\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w1\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w2\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.w3\.(weight|bias)$")?,
+            // MoE experts (type-safe MoE uses gate_proj, up_proj, down_proj)
+            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.gate_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.up_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.down_proj\.(weight|bias)$")?,
         ])
     }
     fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {

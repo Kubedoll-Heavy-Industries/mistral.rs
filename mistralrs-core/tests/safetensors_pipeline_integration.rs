@@ -3,6 +3,14 @@
 // Allow deprecated method calls during migration - tests need to work with current API
 #![allow(deprecated)]
 //!
+//! ## Serial Test Groups
+//!
+//! Tests use named serial groups to prevent memory exhaustion:
+//! - `#[serial(small_model)]`: Tests loading models <2B params (Qwen2 0.5B, Qwen3 0.6B)
+//! - `#[serial(large_model)]`: Tests loading models >2B params (Phi3 3.8B, Mistral 7B)
+//!
+//! These groups are shared across test files to prevent cross-crate parallelism issues.
+//!
 //! These tests verify that safetensors models load correctly through the typed pipeline
 //! infrastructure. Tests are organized into two tiers:
 //!
@@ -264,28 +272,28 @@ fn run_smoke_test(config: &SafetensorsTestConfig) -> Result<(), Box<dyn std::err
 }
 
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_safetensors_smoke_qwen2() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
     run_smoke_test(config).expect("Qwen2 smoke test failed");
 }
 
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_safetensors_smoke_qwen3() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen3").unwrap();
     run_smoke_test(config).expect("Qwen3 smoke test failed");
 }
 
 #[test]
-#[serial]
+#[serial(large_model)]
 fn test_safetensors_smoke_phi3() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Phi3").unwrap();
     run_smoke_test(config).expect("Phi3 smoke test failed");
 }
 
 #[test]
-#[serial]
+#[serial(large_model)]
 fn test_safetensors_smoke_mistral() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Mistral").unwrap();
     run_smoke_test(config).expect("Mistral smoke test failed");
@@ -293,7 +301,7 @@ fn test_safetensors_smoke_mistral() {
 
 /// Run all small model smoke tests.
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_safetensors_smoke_small_models() {
     for config in SAFETENSORS_CONFIGS.iter().filter(|c| !c.is_large) {
         if let Err(e) = run_smoke_test(config) {
@@ -304,7 +312,7 @@ fn test_safetensors_smoke_small_models() {
 
 /// Run all smoke tests (including large models if enabled).
 #[test]
-#[serial]
+#[serial(large_model)]
 fn test_safetensors_smoke_all() {
     let mut passed = 0;
     let mut skipped = 0;
@@ -374,7 +382,7 @@ fn run_regression_test(case: &RegressionTestCase) -> Result<(), Box<dyn std::err
 }
 
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_safetensors_regression_qwen2() {
     for case in REGRESSION_CASES.iter().filter(|c| c.model_family == "Qwen2") {
         run_regression_test(case).expect("Qwen2 regression test failed");
@@ -382,7 +390,7 @@ fn test_safetensors_regression_qwen2() {
 }
 
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_safetensors_regression_qwen3() {
     for case in REGRESSION_CASES.iter().filter(|c| c.model_family == "Qwen3") {
         run_regression_test(case).expect("Qwen3 regression test failed");
@@ -390,7 +398,7 @@ fn test_safetensors_regression_qwen3() {
 }
 
 #[test]
-#[serial]
+#[serial(large_model)]
 fn test_safetensors_regression_all() {
     if !regression_tests_enabled() {
         println!("Skipping all regression tests (set TEST_SAFETENSORS_REGRESSION=1 to enable)");
@@ -425,7 +433,7 @@ fn test_safetensors_regression_all() {
 
 /// Test ISQ (Immediate Safetensors Quantization) loading.
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_safetensors_with_isq() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
     let repo_id = get_repo_id(config);
@@ -459,7 +467,7 @@ fn test_safetensors_with_isq() {
 
 /// Test pipeline parallelism layer range loading.
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_safetensors_with_layer_range() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
     let repo_id = get_repo_id(config);
@@ -498,7 +506,7 @@ fn test_safetensors_with_layer_range() {
 
 /// Test that Qwen2 architecture-specific features work.
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_qwen2_architecture_features() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
     let repo_id = get_repo_id(config);
@@ -534,7 +542,7 @@ fn test_qwen2_architecture_features() {
 
 /// Test that Qwen3 architecture-specific features work (Q/K norm).
 #[test]
-#[serial]
+#[serial(small_model)]
 fn test_qwen3_architecture_features() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen3").unwrap();
     let repo_id = get_repo_id(config);
@@ -567,7 +575,7 @@ fn test_qwen3_architecture_features() {
 
 /// Test that Mistral YaRN RoPE scaling works (if applicable).
 #[test]
-#[serial]
+#[serial(large_model)]
 fn test_mistral_architecture_features() {
     let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Mistral").unwrap();
 
