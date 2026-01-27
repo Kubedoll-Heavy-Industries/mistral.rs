@@ -178,6 +178,7 @@ impl ModelConfig::FromGGUF for Llama {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         // Extract configuration from GGUF metadata
         let metadata = ContentMetadata {
@@ -222,6 +223,7 @@ impl ModelConfig::FromGGUF for Llama {
             device,
             attention_mechanism,
             dtype,
+            adapter_registry,
             |_ctx, builder, _weights| Ok(builder), // No customization needed for Llama
         )?;
 
@@ -266,6 +268,7 @@ impl ModelConfig::FromSafetensors for Llama {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         let _naming = SafetensorsNaming;
 
@@ -282,6 +285,7 @@ impl ModelConfig::FromSafetensors for Llama {
             attention_mechanism,
             dtype,
             layer_range,
+            adapter_registry,
             |_ctx, builder, _weights| Ok(builder), // No customization needed for Llama
         )?;
 
@@ -414,7 +418,7 @@ impl Llama {
         let dtype = vb.dtype();
 
         // Use FromSafetensors implementation
-        Self::from_safetensors(cfg, vb, device, mapper, attention_mechanism, dtype, None)
+        Self::from_safetensors(cfg, vb, device, mapper, attention_mechanism, dtype, None, None)
     }
 
     /// Get input embeddings for tokens.

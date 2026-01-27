@@ -18,7 +18,8 @@ mod registry_linear;
 // These are intentionally exported for external use even if not used internally
 #[allow(unused_imports)]
 pub use registry::{
-    AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter, PROJECTION_OFFSETS,
+    AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter, PROJECTIONS_PER_LAYER,
+    PROJECTION_OFFSETS,
 };
 #[allow(unused_imports)]
 pub use registry_linear::{wrap_with_lora, RegistryLoraLinear};

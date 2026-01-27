@@ -181,6 +181,7 @@ pub trait FromGGUF {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self, candle_core::Error>
     where
         Self: Sized;
@@ -203,6 +204,7 @@ pub trait FromSafetensors {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self, candle_core::Error>
     where
         Self: Sized;
@@ -285,7 +287,8 @@ impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, NoAdapter> {
         let ParamsGGUF(ct, Device { device, mapper }, attention_implementation, dtype, layer_range) = self.quant;
 
         // Forwards all structured fields above into the required flattened param sequence:
-        T::from_gguf(ct, device, mapper, attention_implementation, dtype, layer_range)
+        // Note: adapter_registry is None - this path doesn't support per-request LoRA
+        T::from_gguf(ct, device, mapper, attention_implementation, dtype, layer_range, None)
     }
 }
 

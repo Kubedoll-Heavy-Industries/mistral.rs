@@ -672,7 +672,8 @@ fn load_pipeline_for_model<M: LanguageModel + FromGGUF + Send + Sync + 'static>(
     let content = Content::from_readers(&mut reader_refs)?;
 
     // Load model via FromGGUF trait
-    let model = M::from_gguf(content, device, mapper, attention, dtype, layer_range)
+    // Note: adapter_registry is None - use CausalLMLoaderBuilder for per-request LoRA
+    let model = M::from_gguf(content, device, mapper, attention, dtype, layer_range, None)
         .map_err(|e| anyhow!("Failed to load model: {}", e))?;
 
     // Get tokenizer
@@ -1623,6 +1624,9 @@ impl CausalLMLoaderBuilder {
             Arc::new(move |_| DeviceForLoadTensor::Base), // get_device_for_tensor
         )?;
 
+        // Load adapters for per-request switching (if configured)
+        let adapter_registry = self.load_runtime_adapters(model_meta.num_layers)?;
+
         let result = match loader_type {
             NormalLoaderType::Qwen2 => {
                 let config: crate::models::quantized_qwen::Config =
@@ -1635,6 +1639,7 @@ impl CausalLMLoaderBuilder {
                     self.attention,
                     self.dtype,
                     self.layer_range.clone(),
+                    adapter_registry.clone(),
                 )?;
                 let pipeline = self.build_text_pipeline_safetensors(
                     model,
@@ -1642,6 +1647,7 @@ impl CausalLMLoaderBuilder {
                     tokenizer_path,
                     repo,
                     repo_id,
+                    adapter_registry.clone(),
                 )?;
                 Ok(CausalLMPipeline::Qwen2(pipeline))
             }
@@ -1656,6 +1662,7 @@ impl CausalLMLoaderBuilder {
                     self.attention,
                     self.dtype,
                     self.layer_range.clone(),
+                    adapter_registry.clone(),
                 )?;
                 let pipeline = self.build_text_pipeline_safetensors(
                     model,
@@ -1663,6 +1670,7 @@ impl CausalLMLoaderBuilder {
                     tokenizer_path,
                     repo,
                     repo_id,
+                    adapter_registry.clone(),
                 )?;
                 Ok(CausalLMPipeline::Phi3(pipeline))
             }
@@ -1677,6 +1685,7 @@ impl CausalLMLoaderBuilder {
                     self.attention,
                     self.dtype,
                     self.layer_range.clone(),
+                    adapter_registry.clone(),
                 )?;
                 let pipeline = self.build_text_pipeline_safetensors(
                     model,
@@ -1684,6 +1693,7 @@ impl CausalLMLoaderBuilder {
                     tokenizer_path,
                     repo,
                     repo_id,
+                    adapter_registry.clone(),
                 )?;
                 Ok(CausalLMPipeline::Qwen3(pipeline))
             }
@@ -1699,6 +1709,7 @@ impl CausalLMLoaderBuilder {
                     self.attention,
                     self.dtype,
                     self.layer_range.clone(),
+                    adapter_registry.clone(),
                 )?;
                 let pipeline = self.build_text_pipeline_safetensors(
                     model,
@@ -1706,6 +1717,7 @@ impl CausalLMLoaderBuilder {
                     tokenizer_path,
                     repo,
                     repo_id,
+                    adapter_registry.clone(),
                 )?;
                 Ok(CausalLMPipeline::Mistral3(pipeline))
             }
@@ -1830,6 +1842,7 @@ impl CausalLMLoaderBuilder {
         tokenizer_path: &Path,
         repo: &hf_hub::api::sync::ApiRepo,
         repo_id: &str,
+        adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<crate::pipeline::TextPipeline<M>> {
         use crate::device_map::SingleDeviceMapper;
         use crate::pipeline::chat_template::{ChatTemplate, ChatTemplateValue};
@@ -1961,14 +1974,21 @@ impl CausalLMLoaderBuilder {
         let pipeline_mapper: Box<dyn crate::device_map::DeviceMapper + Send + Sync> =
             Box::new(SingleDeviceMapper::new(self.device.clone()));
 
-        Ok(crate::pipeline::TextPipeline::new(
+        let mut pipeline = crate::pipeline::TextPipeline::new(
             model,
             tokenizer,
             Arc::new(chat_template),
             model_id,
             pipeline_mapper,
             metadata,
-        ))
+        );
+
+        // Attach adapter registry for per-request LoRA switching
+        if let Some(registry) = adapter_registry {
+            pipeline.set_adapter_registry(registry);
+        }
+
+        Ok(pipeline)
     }
 
     /// Build the pipeline wrapped for engine integration.
@@ -2244,6 +2264,9 @@ impl CausalLMLoaderBuilder {
             }
         }
 
+        // Load adapters for per-request switching (if configured)
+        let adapter_registry = self.load_runtime_adapters(total_layers)?;
+
         // Load model via FromGGUF trait
         let model = M::from_gguf(
             content,
@@ -2252,6 +2275,7 @@ impl CausalLMLoaderBuilder {
             self.attention,
             self.dtype,
             self.layer_range.clone(),
+            adapter_registry.clone(),
         )
         .map_err(|e| anyhow!("Failed to load model: {}", e))?;
 
@@ -2403,14 +2427,21 @@ impl CausalLMLoaderBuilder {
         let pipeline_mapper: Box<dyn DeviceMapper + Send + Sync> =
             Box::new(crate::device_map::SingleDeviceMapper::new(self.device.clone()));
 
-        Ok(crate::pipeline::TextPipeline::new(
+        let mut pipeline = crate::pipeline::TextPipeline::new(
             model,
             tokenizer,
             Arc::new(chat_template),
             model_id,
             pipeline_mapper,
             metadata,
-        ))
+        );
+
+        // Attach adapter registry for per-request LoRA switching
+        if let Some(registry) = adapter_registry {
+            pipeline.set_adapter_registry(registry);
+        }
+
+        Ok(pipeline)
     }
 }
 

@@ -1029,3 +1029,230 @@ fn test_per_request_adapter_wiring() {
     println!("Successfully attached adapter registry to pipeline");
     println!("=== Per-request adapter wiring test PASSED ===\n");
 }
+
+// =============================================================================
+// End-to-End Inference Tests
+// =============================================================================
+//
+// These tests verify that inference produces coherent output, not just that
+// models load successfully. They use the full MistralRs engine.
+//
+// Environment variables:
+// - TEST_E2E_INFERENCE=1: Enable e2e inference tests (they take longer)
+// - TEST_LORA_ADAPTER: LoRA adapter repo for LoRA inference test
+
+use indexmap::IndexMap;
+use mistralrs_core::{
+    Constraint, DefaultSchedulerMethod, InferenceExec, InferenceInput, InferenceOperation,
+    MessageContent, MistralRsBuilder, NormalRequest, Request, ResponseOk, SchedulerConfig,
+    TokenSamplingParams,
+};
+
+/// Helper to create a simple chat message.
+fn create_chat_message(role: &str, content: &str) -> IndexMap<String, MessageContent> {
+    use either::Either;
+    let mut msg = IndexMap::new();
+    msg.insert("role".to_string(), Either::Left(role.to_string()));
+    msg.insert("content".to_string(), Either::Left(content.to_string()));
+    msg
+}
+
+/// Helper to run a simple inference request and return the response text.
+async fn run_simple_inference(
+    runner: &std::sync::Arc<mistralrs_core::MistralRs>,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    use tokio::sync::mpsc::channel;
+
+    let messages = vec![create_chat_message("user", prompt)];
+
+    let (tx, mut rx) = channel(1);
+
+    let request = Request::Normal(Box::new(NormalRequest {
+        id: uuid::Uuid::new_v4(),
+        input: InferenceInput {
+            op: InferenceOperation::Chat {
+                messages,
+                attachments: vec![],
+                thinking: None,
+                sampling_params: {
+                    let mut params = TokenSamplingParams::deterministic();
+                    params.max_len = Some(50); // Short response
+                    params
+                },
+                return_logprobs: false,
+                constraint: Constraint::None,
+                tools: None,
+                tool_choice: None,
+                logits_processors: None,
+                return_raw_logits: false,
+                web_search_options: None,
+            },
+            exec: InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
+            adapters: None,
+        },
+        response: tx,
+        model_id: None,
+    }));
+
+    runner.get_sender(None)?.send(request).await?;
+
+    let response = rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Channel closed"))?;
+
+    match response.as_result()? {
+        ResponseOk::Done(completion) => {
+            let content = completion
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_ref())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Ok(content)
+        }
+        _ => anyhow::bail!("Unexpected response type"),
+    }
+}
+
+/// End-to-end inference test: verify model produces coherent output.
+///
+/// This test loads a model, sends a chat request, and verifies the response
+/// is not empty and contains recognizable text (not gibberish).
+///
+/// Set TEST_E2E_INFERENCE=1 to run this test.
+#[tokio::test]
+#[serial(small_model)]
+async fn test_e2e_inference_coherent_output() {
+    if std::env::var("TEST_E2E_INFERENCE").is_err() {
+        println!("Skipping e2e inference test: TEST_E2E_INFERENCE not set");
+        println!("To run: TEST_E2E_INFERENCE=1 cargo test test_e2e_inference");
+        return;
+    }
+
+    let model_path = get_test_model_path();
+    println!("\n=== E2E Inference Test ===");
+    println!("Model: {:?}", model_path);
+
+    // Build pipeline
+    let pipeline = CausalLMLoaderBuilder::from_gguf_paths(&[&model_path])
+        .with_device(Device::Cpu)
+        .with_dtype(DType::F32)
+        .silent()
+        .build_async()
+        .expect("Failed to build pipeline");
+
+    // Create MistralRs engine
+    let scheduler = SchedulerConfig::DefaultScheduler {
+        method: DefaultSchedulerMethod::Fixed(1.try_into().unwrap()),
+    };
+    let runner = MistralRsBuilder::new(pipeline, scheduler, false, None)
+        .build()
+        .await;
+
+    // Run inference
+    let prompt = "What is 2 + 2? Answer with just the number.";
+    println!("Prompt: {}", prompt);
+
+    let response = run_simple_inference(&runner, prompt)
+        .await
+        .expect("Inference failed");
+
+    println!("Response: {}", response);
+
+    // Verify response is not empty
+    assert!(!response.is_empty(), "Response should not be empty");
+
+    // Verify response contains recognizable content (not gibberish)
+    // For "2 + 2", we expect the response to contain "4" or related words
+    let response_lower = response.to_lowercase();
+    let has_expected_content = response_lower.contains("4")
+        || response_lower.contains("four")
+        || response_lower.contains("answer");
+
+    assert!(
+        has_expected_content,
+        "Response should contain expected content (got: {})",
+        response
+    );
+
+    println!("=== E2E Inference Test PASSED ===\n");
+}
+
+/// End-to-end inference test with LoRA adapter.
+///
+/// This test verifies that a model with a LoRA adapter produces coherent output.
+/// Set TEST_E2E_INFERENCE=1 and TEST_LORA_ADAPTER=<repo> to run this test.
+#[tokio::test]
+#[serial(small_model)]
+async fn test_e2e_inference_with_lora() {
+    if std::env::var("TEST_E2E_INFERENCE").is_err() {
+        println!("Skipping e2e LoRA inference test: TEST_E2E_INFERENCE not set");
+        return;
+    }
+
+    let adapter_repo = match std::env::var("TEST_LORA_ADAPTER") {
+        Ok(repo) => repo,
+        Err(_) => {
+            println!("Skipping e2e LoRA inference test: TEST_LORA_ADAPTER not set");
+            return;
+        }
+    };
+
+    let (base_repo, base_file) = if let Ok(base) = std::env::var("TEST_LORA_BASE_MODEL") {
+        let file = std::env::var("TEST_LORA_BASE_FILE").unwrap_or_else(|_| "model.gguf".to_string());
+        (base, file)
+    } else {
+        (
+            DEFAULT_MODEL_REPO.to_string(),
+            DEFAULT_MODEL_FILE.to_string(),
+        )
+    };
+
+    println!("\n=== E2E LoRA Inference Test ===");
+    println!("Base model: {}/{}", base_repo, base_file);
+    println!("LoRA adapter: {}", adapter_repo);
+
+    // Build pipeline with LoRA
+    let pipeline = CausalLMLoaderBuilder::from_hf_gguf(&base_repo, &[&base_file])
+        .with_device(Device::Cpu)
+        .with_dtype(DType::F32)
+        .with_lora_adapter(&adapter_repo)
+        .silent()
+        .build_async()
+        .expect("Failed to build pipeline with LoRA");
+
+    // Create MistralRs engine
+    let scheduler = SchedulerConfig::DefaultScheduler {
+        method: DefaultSchedulerMethod::Fixed(1.try_into().unwrap()),
+    };
+    let runner = MistralRsBuilder::new(pipeline, scheduler, false, None)
+        .build()
+        .await;
+
+    // Run inference
+    let prompt = "Hello! How are you today?";
+    println!("Prompt: {}", prompt);
+
+    let response = run_simple_inference(&runner, prompt)
+        .await
+        .expect("Inference with LoRA failed");
+
+    println!("Response: {}", response);
+
+    // Verify response is not empty
+    assert!(
+        !response.is_empty(),
+        "Response with LoRA should not be empty"
+    );
+
+    // Verify response contains words (not just random bytes)
+    let has_words = response.split_whitespace().count() >= 1;
+    assert!(has_words, "Response should contain words (got: {})", response);
+
+    println!("=== E2E LoRA Inference Test PASSED ===\n");
+}

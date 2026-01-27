@@ -596,6 +596,7 @@ impl ModelConfig::FromGGUF for Mixtral {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        _adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         // Parse metadata
         let metadata = ContentMetadata {

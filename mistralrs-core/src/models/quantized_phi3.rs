@@ -210,6 +210,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        _adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         if let Some(ref quant_cfg) = &cfg.quantization_config {
             tracing::info!(
@@ -400,6 +401,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        _adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         // Extract configuration from GGUF metadata
         let metadata = ContentMetadata {

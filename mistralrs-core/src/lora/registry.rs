@@ -126,6 +126,10 @@ pub const PROJECTION_OFFSETS: &[(&str, usize)] = &[
     ("down_proj", 6),
 ];
 
+/// Number of LoRA-targetable projections per transformer layer.
+/// Used to compute unified indices: `layer_idx * PROJECTIONS_PER_LAYER + projection_offset`
+pub const PROJECTIONS_PER_LAYER: usize = 7;
+
 impl AdapterWeights {
     /// Parse LoRA weights from a VarBuilder into the unified index scheme.
     ///

@@ -496,6 +496,57 @@ fn test_safetensors_with_isq() {
     }
 }
 
+/// Test LoRA adapter loading with safetensors base model.
+///
+/// Uses Qwen2.5-0.5B base model with a compatible LoRA adapter.
+/// Override the adapter via `TEST_SAFETENSORS_LORA_ADAPTER` env var.
+#[test]
+#[serial(small_model)]
+fn test_safetensors_with_lora_adapter() {
+    // Default to a known-compatible LoRA adapter for Qwen2.5-0.5B
+    let adapter_repo = std::env::var("TEST_SAFETENSORS_LORA_ADAPTER")
+        .unwrap_or_else(|_| "lewtun/Qwen2.5-0.5B-SFT-LoRA".to_string());
+
+    // Base model must match the LoRA adapter's base
+    let base_repo = std::env::var("TEST_SAFETENSORS_LORA_BASE")
+        .unwrap_or_else(|_| "Qwen/Qwen2.5-0.5B".to_string());
+
+    println!("\n=== Safetensors + LoRA Test ===");
+    println!("Base model: {}", base_repo);
+    println!("LoRA adapter: {}", adapter_repo);
+
+    let result = CausalLMLoaderBuilder::from_hf_safetensors(&base_repo)
+        .with_dtype(DType::F32)
+        .with_lora_adapter(&adapter_repo)
+        .with_device_map(DeviceMapSetting::Auto(AutoDeviceMapParams::Text {
+            max_seq_len: 2048,
+            max_batch_size: 1,
+        }))
+        .build_async();
+
+    match result {
+        Ok(pipeline) => {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let guard = pipeline.lock().await;
+                println!("Loaded with LoRA adapter: {}", guard.name());
+
+                // Verify tokenizer works
+                let tokenizer = guard.tokenizer().expect("Tokenizer should be available");
+                let test_text = "Hello from LoRA test!";
+                let encoding = tokenizer
+                    .encode(test_text, false)
+                    .expect("Tokenization should succeed");
+                println!("Tokenized '{}' -> {} tokens", test_text, encoding.len());
+            });
+            println!("=== Safetensors + LoRA Test PASSED ===\n");
+        }
+        Err(e) => {
+            panic!("Safetensors + LoRA loading failed: {}", e);
+        }
+    }
+}
+
 /// Test pipeline parallelism layer range loading.
 #[test]
 #[serial(small_model)]
@@ -611,6 +662,199 @@ fn test_qwen3_architecture_features() {
     });
 
     println!("=== Qwen3 Architecture Test PASSED ===\n");
+}
+
+// =============================================================================
+// End-to-End Inference Tests
+// =============================================================================
+
+use indexmap::IndexMap;
+use mistralrs_core::{
+    Constraint, DefaultSchedulerMethod, InferenceExec, InferenceInput, InferenceOperation,
+    MessageContent, MistralRsBuilder, NormalRequest, Request, ResponseOk, SchedulerConfig,
+    TokenSamplingParams,
+};
+
+/// Helper to create a simple chat message.
+fn create_chat_message(role: &str, content: &str) -> IndexMap<String, MessageContent> {
+    use either::Either;
+    let mut msg = IndexMap::new();
+    msg.insert("role".to_string(), Either::Left(role.to_string()));
+    msg.insert("content".to_string(), Either::Left(content.to_string()));
+    msg
+}
+
+/// Helper to run a simple inference request and return the response text.
+async fn run_simple_inference(
+    runner: &std::sync::Arc<mistralrs_core::MistralRs>,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    use tokio::sync::mpsc::channel;
+
+    let messages = vec![create_chat_message("user", prompt)];
+
+    let (tx, mut rx) = channel(1);
+
+    let request = Request::Normal(Box::new(NormalRequest {
+        id: uuid::Uuid::new_v4(),
+        input: InferenceInput {
+            op: InferenceOperation::Chat {
+                messages,
+                attachments: vec![],
+                thinking: None,
+                sampling_params: {
+                    let mut params = TokenSamplingParams::deterministic();
+                    params.max_len = Some(50);
+                    params
+                },
+                return_logprobs: false,
+                constraint: Constraint::None,
+                tools: None,
+                tool_choice: None,
+                logits_processors: None,
+                return_raw_logits: false,
+                web_search_options: None,
+            },
+            exec: InferenceExec {
+                is_streaming: false,
+                truncate_sequence: false,
+            },
+            adapters: None,
+        },
+        response: tx,
+        model_id: None,
+    }));
+
+    runner.get_sender(None)?.send(request).await?;
+
+    let response = rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Channel closed"))?;
+
+    match response.as_result()? {
+        ResponseOk::Done(completion) => {
+            let content = completion
+                .choices
+                .first()
+                .and_then(|c| c.message.content.as_ref())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            Ok(content)
+        }
+        _ => anyhow::bail!("Unexpected response type"),
+    }
+}
+
+/// E2E inference test for safetensors model.
+///
+/// Set TEST_E2E_INFERENCE=1 to run this test.
+#[tokio::test]
+#[serial(small_model)]
+async fn test_safetensors_e2e_inference() {
+    if std::env::var("TEST_E2E_INFERENCE").is_err() {
+        println!("Skipping safetensors e2e inference test: TEST_E2E_INFERENCE not set");
+        return;
+    }
+
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Qwen2")
+        .unwrap();
+    let repo_id = get_repo_id(config);
+
+    println!("\n=== Safetensors E2E Inference Test: {} ===", config.name);
+    println!("Repo: {}", repo_id);
+
+    // Build pipeline
+    let pipeline = CausalLMLoaderBuilder::from_hf_safetensors(&repo_id)
+        .with_dtype(DType::F32)
+        .with_device_map(DeviceMapSetting::Auto(AutoDeviceMapParams::Text {
+            max_seq_len: 2048,
+            max_batch_size: 1,
+        }))
+        .build_async()
+        .expect("Failed to build safetensors pipeline");
+
+    // Create engine
+    let scheduler = SchedulerConfig::DefaultScheduler {
+        method: DefaultSchedulerMethod::Fixed(1.try_into().unwrap()),
+    };
+    let runner = MistralRsBuilder::new(pipeline, scheduler, false, None)
+        .build()
+        .await;
+
+    // Run inference
+    let prompt = "What is 2 + 2? Answer with just the number.";
+    println!("Prompt: {}", prompt);
+
+    let response = run_simple_inference(&runner, prompt)
+        .await
+        .expect("Inference failed");
+
+    println!("Response: {}", response);
+
+    // Verify response is not empty
+    assert!(!response.is_empty(), "Response should not be empty");
+
+    println!("=== Safetensors E2E Inference Test PASSED ===\n");
+}
+
+/// E2E inference test for safetensors model with LoRA adapter.
+///
+/// Set TEST_E2E_INFERENCE=1 and TEST_SAFETENSORS_LORA_ADAPTER to run.
+#[tokio::test]
+#[serial(small_model)]
+async fn test_safetensors_e2e_inference_with_lora() {
+    if std::env::var("TEST_E2E_INFERENCE").is_err() {
+        println!("Skipping safetensors LoRA e2e test: TEST_E2E_INFERENCE not set");
+        return;
+    }
+
+    let adapter_repo = std::env::var("TEST_SAFETENSORS_LORA_ADAPTER")
+        .unwrap_or_else(|_| "lewtun/Qwen2.5-0.5B-SFT-LoRA".to_string());
+    let base_repo = std::env::var("TEST_SAFETENSORS_LORA_BASE")
+        .unwrap_or_else(|_| "Qwen/Qwen2.5-0.5B".to_string());
+
+    println!("\n=== Safetensors + LoRA E2E Inference Test ===");
+    println!("Base model: {}", base_repo);
+    println!("LoRA adapter: {}", adapter_repo);
+
+    // Build pipeline with LoRA
+    let pipeline = CausalLMLoaderBuilder::from_hf_safetensors(&base_repo)
+        .with_dtype(DType::F32)
+        .with_lora_adapter(&adapter_repo)
+        .with_device_map(DeviceMapSetting::Auto(AutoDeviceMapParams::Text {
+            max_seq_len: 2048,
+            max_batch_size: 1,
+        }))
+        .build_async()
+        .expect("Failed to build pipeline with LoRA");
+
+    // Create engine
+    let scheduler = SchedulerConfig::DefaultScheduler {
+        method: DefaultSchedulerMethod::Fixed(1.try_into().unwrap()),
+    };
+    let runner = MistralRsBuilder::new(pipeline, scheduler, false, None)
+        .build()
+        .await;
+
+    // Run inference
+    let prompt = "Hello! How are you?";
+    println!("Prompt: {}", prompt);
+
+    let response = run_simple_inference(&runner, prompt)
+        .await
+        .expect("Inference with LoRA failed");
+
+    println!("Response: {}", response);
+
+    // Verify response is not empty and contains words
+    assert!(!response.is_empty(), "Response should not be empty");
+    let has_words = response.split_whitespace().count() >= 1;
+    assert!(has_words, "Response should contain words");
+
+    println!("=== Safetensors + LoRA E2E Inference Test PASSED ===\n");
 }
 
 /// Test that Mistral YaRN RoPE scaling works (if applicable).

@@ -611,7 +611,7 @@ pub struct TransformerLayerBuilder {
     attn_dtype: Option<DType>,
     // LoRA adapter support
     adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
-    /// Base layer index for LoRA weight lookup (layer_idx * 7 + projection_offset)
+    /// Base layer index for LoRA weight lookup (layer_idx * PROJECTIONS_PER_LAYER + projection_offset)
     layer_base_idx: usize,
 }
 
@@ -651,7 +651,7 @@ impl TransformerLayerBuilder {
     ///
     /// # Layer Index Scheme
     ///
-    /// Each projection gets a unique index: `layer_idx * 7 + projection_offset`
+    /// Each projection gets a unique index: `layer_idx * PROJECTIONS_PER_LAYER + projection_offset`
     /// - q_proj: offset 0
     /// - k_proj: offset 1
     /// - v_proj: offset 2
@@ -664,8 +664,9 @@ impl TransformerLayerBuilder {
         registry: Arc<crate::lora::AdapterRegistry>,
         layer_idx: usize,
     ) -> Self {
+        use crate::lora::PROJECTIONS_PER_LAYER;
         self.adapter_registry = Some(registry);
-        self.layer_base_idx = layer_idx * 7; // 7 projections per layer
+        self.layer_base_idx = layer_idx * PROJECTIONS_PER_LAYER;
         self
     }
 
@@ -1147,6 +1148,7 @@ pub fn load_transformer_layers<W, N, F>(
     device: &Device,
     attention_mechanism: AttentionImplementation,
     dtype: DType,
+    adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
     mut customizer: F,
 ) -> Result<Vec<StandardTransformerBlock>>
 where
@@ -1261,6 +1263,11 @@ where
             .rope(rotary as Arc<dyn PositionEncoding>)
             .with_attn_dtype(dtype);
 
+        // Add adapter registry for per-request LoRA switching
+        if let Some(ref registry) = adapter_registry {
+            builder = builder.with_adapter_registry(registry.clone(), layer_idx);
+        }
+
         // Add paged attention if enabled
         if let AttentionImplementation::PagedAttention = attention_mechanism {
             builder =
@@ -1373,6 +1380,7 @@ pub fn load_transformer_from_safetensors<C, F>(
     attention_mechanism: AttentionImplementation,
     dtype: DType,
     layer_range: Option<Range<usize>>,
+    adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
     mut layer_customizer: F,
 ) -> Result<LoadedTransformer>
 where
@@ -1540,6 +1548,12 @@ where
             .rope(rotary as Arc<dyn PositionEncoding>)
             .with_attn_dtype(dtype);
 
+        // Add adapter registry for per-request LoRA switching
+        // (must be before customizer to ensure consistent ordering with GGUF path)
+        if let Some(ref registry) = adapter_registry {
+            builder = builder.with_adapter_registry(registry.clone(), layer_idx);
+        }
+
         // Add paged attention if enabled
         if let AttentionImplementation::PagedAttention = attention_mechanism {
             builder = builder.with_paged_attn(PagedAttention::new(config.head_dim, layer_device, None)?);
@@ -1579,6 +1593,7 @@ pub fn load_standard_transformer<C: crate::models::LanguageModelConfig>(
     attention_mechanism: AttentionImplementation,
     dtype: DType,
     layer_range: Option<Range<usize>>,
+    adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
 ) -> Result<LoadedTransformer> {
     load_transformer_from_safetensors(
         cfg,
@@ -1589,6 +1604,7 @@ pub fn load_standard_transformer<C: crate::models::LanguageModelConfig>(
         attention_mechanism,
         dtype,
         layer_range,
+        adapter_registry,
         |_ctx, builder, _weights| Ok(builder),
     )
 }

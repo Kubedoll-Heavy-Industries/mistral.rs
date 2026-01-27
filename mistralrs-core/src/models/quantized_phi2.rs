@@ -127,6 +127,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        _adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         // Parameter extraction from metadata.
         let metadata = ContentMetadata {

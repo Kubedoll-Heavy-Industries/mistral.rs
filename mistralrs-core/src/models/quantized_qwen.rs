@@ -151,6 +151,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         let naming = SafetensorsNaming;
 
@@ -164,6 +165,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             attention_mechanism,
             dtype,
             layer_range,
+            adapter_registry,
             |ctx, builder, weights| {
                 // Check if Q/K norm exists (Qwen3-style) and load if present
                 let q_norm_name = naming.attn_q_norm(ctx.layer_idx);
@@ -205,6 +207,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         // Verify architecture (accept both qwen2 and qwen3)
         let meta = ct.get_metadata();
@@ -261,6 +264,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             device,
             attention_mechanism,
             dtype,
+            adapter_registry,
             |ctx, builder, weights| {
                 // Check if Q/K norm exists (Qwen3-style) and load if present
                 let q_norm_name = naming.attn_q_norm(ctx.layer_idx);

@@ -537,6 +537,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         // Parse Mistral3-specific metadata (includes YaRN config)
         let metadata = ContentMetadata {
@@ -655,6 +656,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             device,
             attention_mechanism,
             dtype,
+            adapter_registry,
             |ctx, builder, _weights| {
                 // Replace default RoPE with YaRN RoPE for this layer's device
                 let yarn_rope = yarn_ropes
@@ -693,6 +695,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
         attention_mechanism: AttentionImplementation,
         dtype: DType,
         layer_range: Option<std::ops::Range<usize>>,
+        adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
         // Derived values for YaRN RoPE setup
         let num_layers = cfg.num_hidden_layers;
@@ -759,6 +762,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             attention_mechanism,
             dtype,
             layer_range,
+            adapter_registry,
             |ctx, builder, _weights| {
                 // Replace default RoPE with YaRN RoPE for this layer's device
                 let yarn_rope = yarn_ropes
