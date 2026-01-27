@@ -215,8 +215,32 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
     Ok(Tensor::from((storage, shape)))
 }
 
-#[derive(yoke::Yokeable)]
 struct SafeTensors_<'a>(SafeTensors<'a>);
+
+// Manual Yokeable implementation for yoke 0.8 compatibility
+// SAFETY: SafeTensors<'a> is covariant in 'a (it only contains references to data)
+unsafe impl<'a> yoke::Yokeable<'a> for SafeTensors_<'static> {
+    type Output = SafeTensors_<'a>;
+
+    fn transform(&'a self) -> &'a Self::Output {
+        self
+    }
+
+    fn transform_owned(self) -> Self::Output {
+        self
+    }
+
+    unsafe fn make(from: Self::Output) -> Self {
+        std::mem::transmute(from)
+    }
+
+    fn transform_mut<F>(&'a mut self, f: F)
+    where
+        F: 'static + for<'b> FnOnce(&'b mut Self::Output),
+    {
+        unsafe { f(std::mem::transmute::<&mut Self, &mut Self::Output>(self)) }
+    }
+}
 
 pub struct MmapedSafetensors {
     safetensors: Vec<yoke::Yoke<SafeTensors_<'static>, memmap2::Mmap>>,
