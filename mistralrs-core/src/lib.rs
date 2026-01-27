@@ -9,7 +9,7 @@ pub use engine::{
     EngineInstruction, SearchEmbeddingModel, ENGINE_INSTRUCTIONS, TERMINATE_ALL_NEXT_STEP,
 };
 use hf_hub::Cache;
-pub use lora::Ordering;
+pub use lora::{AdapterRegistry, Ordering};
 pub use pipeline::{AutoregressivePipeline, ModelCategory, ModelCategoryKind};
 pub use pipeline::Pipeline;
 #[cfg(feature = "pyo3_macros")]

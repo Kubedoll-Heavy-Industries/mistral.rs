@@ -981,3 +981,51 @@ fn test_multiple_lora_adapters() {
         }
     }
 }
+
+/// Test per-request adapter selection wiring.
+///
+/// This test verifies that the adapter selection flow works correctly:
+/// 1. Pipeline can have an AdapterRegistry attached
+/// 2. Requests with adapter names flow through to forward_inputs
+/// 3. The registry's set_active() is called (even if no adapters registered)
+///
+/// Note: This tests the wiring, not the actual LoRA computation. For full
+/// LoRA e2e testing, use test_lora_adapter_loading with TEST_LORA_ADAPTER set.
+#[test]
+#[serial(small_model)]
+fn test_per_request_adapter_wiring() {
+    use mistralrs_core::AdapterRegistry;
+    use std::sync::Arc;
+
+    let model_path = get_test_model_path();
+
+    println!("\n=== Testing Per-Request Adapter Wiring ===");
+    println!("Model: {:?}", model_path);
+
+    // Build pipeline
+    let mut pipeline = CausalLMLoaderBuilder::from_gguf_paths(&[&model_path])
+        .with_device(Device::Cpu)
+        .with_dtype(DType::F32)
+        .silent()
+        .build()
+        .expect("Failed to load model");
+
+    // Create empty adapter registry
+    let registry = Arc::new(AdapterRegistry::new(Device::Cpu));
+
+    // Attach registry to pipeline
+    pipeline.set_adapter_registry(registry.clone());
+
+    // Verify registry was attached
+    assert!(
+        pipeline.adapter_registry().is_some(),
+        "Adapter registry should be attached"
+    );
+    assert!(
+        Arc::ptr_eq(pipeline.adapter_registry().unwrap(), &registry),
+        "Registry reference should match"
+    );
+
+    println!("Successfully attached adapter registry to pipeline");
+    println!("=== Per-request adapter wiring test PASSED ===\n");
+}

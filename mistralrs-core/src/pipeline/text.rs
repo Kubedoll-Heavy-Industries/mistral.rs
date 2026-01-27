@@ -137,10 +137,17 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
         self
     }
 
-    /// Configure per-request LoRA adapter registry.
+    /// Configure per-request LoRA adapter registry (builder pattern).
     pub fn with_adapter_registry(mut self, registry: Arc<crate::lora::AdapterRegistry>) -> Self {
         self.adapter_registry = Some(registry);
         self
+    }
+
+    /// Set the adapter registry for per-request LoRA adapter selection.
+    ///
+    /// This allows setting the registry after pipeline construction.
+    pub fn set_adapter_registry(&mut self, registry: Arc<crate::lora::AdapterRegistry>) {
+        self.adapter_registry = Some(registry);
     }
 
     /// Get the adapter registry if configured.

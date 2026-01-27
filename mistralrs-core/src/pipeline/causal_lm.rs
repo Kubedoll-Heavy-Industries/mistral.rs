@@ -25,6 +25,7 @@ use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;
 
 use crate::device_map::DeviceMapper;
+use crate::lora::AdapterRegistry;
 use crate::models::llama::LlamaModel;
 use crate::models::mixtral::Mixtral;
 use crate::models::quantized_mistral3::ModelWeights as QMistral3;
@@ -216,6 +217,34 @@ impl CausalLMPipeline {
             Self::Qwen3MoE(_) => "Qwen3MoE",
             Self::Starcoder2(_) => "Starcoder2",
         }
+    }
+
+    /// Set the adapter registry for per-request LoRA adapter selection.
+    ///
+    /// The registry allows runtime adapter switching without rebuilding the model.
+    /// When requests include adapter names, they will be activated via this registry
+    /// before each forward pass.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut pipeline = CausalLMLoaderBuilder::from_gguf_paths(&[path])
+    ///     .build()?;
+    ///
+    /// // Create and populate registry
+    /// let registry = AdapterRegistry::new(pipeline.device());
+    /// registry.register("style", config, weights)?;
+    ///
+    /// // Attach registry to pipeline
+    /// pipeline.set_adapter_registry(Arc::new(registry));
+    /// ```
+    pub fn set_adapter_registry(&mut self, registry: Arc<AdapterRegistry>) {
+        dispatch!(self, p => p.set_adapter_registry(registry))
+    }
+
+    /// Get the adapter registry if configured.
+    pub fn adapter_registry(&self) -> Option<&Arc<AdapterRegistry>> {
+        dispatch!(self, p => p.adapter_registry())
     }
 }
 
