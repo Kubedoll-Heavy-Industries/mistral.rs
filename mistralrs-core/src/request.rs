@@ -56,6 +56,10 @@ pub struct InferenceExec {
 pub struct InferenceInput {
     pub op: InferenceOperation,
     pub exec: InferenceExec,
+    /// Names of LoRA adapters to activate for this request.
+    /// If None, uses the model's default adapter set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapters: Option<Vec<String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

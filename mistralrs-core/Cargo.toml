@@ -174,3 +174,7 @@ harness = false
 [[bench]]
 name = "sampling"
 harness = false
+
+[[bench]]
+name = "lora_forward"
+harness = false

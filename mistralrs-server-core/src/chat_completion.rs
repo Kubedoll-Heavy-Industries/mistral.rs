@@ -1,6 +1,11 @@
 //! ## Chat Completions functionality and route handler.
 
-use std::{ops::Deref, pin::Pin, task::Poll, time::{Duration, Instant}};
+use std::{
+    ops::Deref,
+    pin::Pin,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -252,12 +257,13 @@ pub async fn parse_request(
 
     // Parse reasoning effort for Harmony-format models
     let reasoning_effort = parse_reasoning_effort(&oairequest.reasoning_effort);
-    let thinking: Option<mistralrs_core::ThinkingMode> = match (oairequest.enable_thinking, reasoning_effort) {
-        // Prefer the more specific knob at boundary inputs.
-        (_, Some(effort)) => Some(mistralrs_core::ThinkingMode::Effort(effort)),
-        (Some(b), None) => Some(mistralrs_core::ThinkingMode::Bool(b)),
-        (None, None) => None,
-    };
+    let thinking: Option<mistralrs_core::ThinkingMode> =
+        match (oairequest.enable_thinking, reasoning_effort) {
+            // Prefer the more specific knob at boundary inputs.
+            (_, Some(effort)) => Some(mistralrs_core::ThinkingMode::Effort(effort)),
+            (Some(b), None) => Some(mistralrs_core::ThinkingMode::Bool(b)),
+            (None, None) => None,
+        };
 
     let stop_toks = convert_stop_tokens(oairequest.stop_seqs);
 
@@ -453,19 +459,19 @@ pub async fn parse_request(
                         let mut content_map: Vec<IndexMap<String, Value>> = Vec::new();
                         for item in &items {
                             if matches!(item, ContentPart::Image { .. }) {
-                            let mut content_image_map = IndexMap::new();
-                            content_image_map
-                                .insert("type".to_string(), Value::String("image".to_string()));
-                            content_map.push(content_image_map);
-                        }
+                                let mut content_image_map = IndexMap::new();
+                                content_image_map
+                                    .insert("type".to_string(), Value::String("image".to_string()));
+                                content_map.push(content_image_map);
+                            }
                         }
                         for item in &items {
                             if matches!(item, ContentPart::Audio { .. }) {
-                            let mut content_audio_map = IndexMap::new();
-                            content_audio_map
-                                .insert("type".to_string(), Value::String("audio".to_string()));
-                            content_map.push(content_audio_map);
-                        }
+                                let mut content_audio_map = IndexMap::new();
+                                content_audio_map
+                                    .insert("type".to_string(), Value::String("audio".to_string()));
+                                content_map.push(content_audio_map);
+                            }
                         }
                         {
                             let mut content_text_map = IndexMap::new();
@@ -594,6 +600,7 @@ pub async fn parse_request(
                     is_streaming,
                     truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
                 },
+                adapters: oairequest.adapters,
             },
         })),
         is_streaming,

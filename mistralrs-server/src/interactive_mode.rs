@@ -5,7 +5,7 @@ use mistralrs_core::{
     speech_utils, ChatAttachment, Constraint, DiffusionGenerationParams, DryTokenSamplingParams,
     ImageGenerationResponseFormat, InferenceExec, InferenceInput, InferenceOperation,
     MessageContent, MistralRs, ModelCategory, NormalRequest, Request, Response, ResponseOk,
-    TokenSamplingParams, ThinkingMode, WebSearchOptions, TERMINATE_ALL_NEXT_STEP,
+    ThinkingMode, TokenSamplingParams, WebSearchOptions, TERMINATE_ALL_NEXT_STEP,
 };
 use regex::Regex;
 use rustyline::{error::ReadlineError, history::History, DefaultEditor, Editor, Helper};
@@ -335,6 +335,7 @@ async fn text_interactive_mode(
                     is_streaming: true,
                     truncate_sequence: false,
                 },
+                adapters: None,
             },
             response: tx,
             model_id: None,
@@ -658,6 +659,7 @@ async fn vision_interactive_mode(
                     is_streaming: true,
                     truncate_sequence: false,
                 },
+                adapters: None,
             },
             response: tx,
             model_id: None,
@@ -827,6 +829,7 @@ async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) 
                     is_streaming: false,
                     truncate_sequence: false,
                 },
+                adapters: None,
             },
             response: tx,
             model_id: None,
@@ -911,6 +914,7 @@ async fn speech_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) {
                     is_streaming: false,
                     truncate_sequence: false,
                 },
+                adapters: None,
             },
             response: tx,
             model_id: None,

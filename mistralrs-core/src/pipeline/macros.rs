@@ -943,6 +943,7 @@ macro_rules! lora_model_loader {
                 get_device_for_tensor.clone(),
             )?;
 
+            #[allow(deprecated)] // Thread-local API - migration in progress
             mistralrs_quant::push_applied_lora(mistralrs_quant::LoraAdapter {
                 config: lora_config.clone(),
                 weights: lora_vb,

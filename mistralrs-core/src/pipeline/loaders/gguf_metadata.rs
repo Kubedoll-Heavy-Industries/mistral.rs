@@ -1411,6 +1411,7 @@ impl CausalLMLoaderBuilder {
     /// Downloads adapter weights from HuggingFace Hub and registers them
     /// via `push_applied_lora()`. The adapters will be merged into base
     /// model weights during VarBuilder tensor loading.
+    #[allow(deprecated)] // Using thread-local API until migration complete
     fn load_lora_adapters(&self) -> Result<()> {
         use crate::utils::varbuilder_utils::{from_mmaped_safetensors, DeviceForLoadTensor};
 
@@ -1468,6 +1469,7 @@ impl CausalLMLoaderBuilder {
     }
 
     /// Clear registered LoRA adapters after model loading.
+    #[allow(deprecated)] // Using thread-local API until migration complete
     fn clear_lora_adapters(&self) {
         if !self.lora_adapters.is_empty() {
             mistralrs_quant::clear_applied_loras();

@@ -4,10 +4,10 @@ use cli_table::{format::Justify, print_stdout, Cell, CellStruct, Style, Table};
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, initialize_logging, paged_attn_supported,
     parse_isq_value, Constraint, DefaultSchedulerMethod, DeviceLayerMapMetadata, DeviceMapMetadata,
-    DeviceMapSetting, DryTokenSamplingParams, Loader, LoaderBuilder, MemoryGpuConfig, MistralRs,
-    InferenceExec, InferenceInput, InferenceOperation, ModelSelected, MistralRsBuilder,
-    MistralRsConfig, MistralRsError, NormalRequest, PagedAttentionConfig, PagedCacheType, Pipeline,
-    Request, Response, TokenSamplingParams, SchedulerConfig, TokenSource, Usage,
+    DeviceMapSetting, DryTokenSamplingParams, InferenceExec, InferenceInput, InferenceOperation,
+    Loader, LoaderBuilder, MemoryGpuConfig, MistralRs, MistralRsBuilder, MistralRsConfig,
+    MistralRsError, ModelSelected, NormalRequest, PagedAttentionConfig, PagedCacheType, Pipeline,
+    Request, Response, SchedulerConfig, TokenSamplingParams, TokenSource, Usage,
 };
 use std::fmt::Display;
 use std::sync::Arc;
@@ -80,6 +80,7 @@ async fn run_bench(
                 is_streaming: false,
                 truncate_sequence: false,
             },
+            adapters: None,
         },
         response: tx,
         model_id: None,
@@ -249,6 +250,7 @@ async fn warmup_run(mistralrs: Arc<MistralRs>) {
                 is_streaming: false,
                 truncate_sequence: false,
             },
+            adapters: None,
         },
         response: tx,
         model_id: None,

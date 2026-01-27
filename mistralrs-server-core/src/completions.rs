@@ -280,6 +280,7 @@ pub fn parse_request(
                     is_streaming,
                     truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
                 },
+                adapters: oairequest.adapters,
             },
         })),
         is_streaming,

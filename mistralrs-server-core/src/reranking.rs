@@ -11,9 +11,7 @@ use axum::{
     http,
     response::IntoResponse,
 };
-use mistralrs_core::{
-    MistralRs, NormalRequest, Request, Response,
-};
+use mistralrs_core::{MistralRs, NormalRequest, Request, Response};
 
 use crate::{
     handler_core::{create_response_channel, send_request_with_model, ErrorToResponse, JsonError},
@@ -89,10 +87,7 @@ pub async fn rerank(
 
             // Record token usage on the span
             if let Some(ref usage) = response.usage {
-                record_reranker_token_usage(
-                    &tracing::Span::current(),
-                    usage.total_tokens as usize,
-                );
+                record_reranker_token_usage(&tracing::Span::current(), usage.total_tokens as usize);
             }
 
             RerankResponder::Json(response)
@@ -132,6 +127,7 @@ async fn cross_encoder_rerank(
                 is_streaming: false,
                 truncate_sequence: false,
             },
+            adapters: None,
         },
     }));
 

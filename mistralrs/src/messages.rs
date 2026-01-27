@@ -83,6 +83,7 @@ impl Chat {
                 is_streaming,
                 truncate_sequence,
             },
+            adapters: None,
         }
     }
 }

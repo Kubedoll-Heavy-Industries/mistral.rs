@@ -1473,6 +1473,7 @@ async fn parse_openresponses_request(
         enable_thinking,
         truncate_sequence,
         reasoning_effort,
+        adapters: None,
     };
 
     let (request, is_streaming) = parse_chat_request(chat_request, state, tx).await?;

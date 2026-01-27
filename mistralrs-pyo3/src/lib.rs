@@ -22,17 +22,16 @@ use candle_core::{Device, Result};
 use mistralrs_core::{
     initialize_logging, paged_attn_supported, parse_isq_value, AnyMoeLoader, AutoDeviceMapParams,
     ChatCompletionResponse, CompletionResponse, Constraint, DefaultSchedulerMethod,
-    DetokenizationRequest, DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting,
-    DiffusionGenerationParams, DiffusionLoaderBuilder, DryTokenSamplingParams, EmbeddingLoaderBuilder,
-    EmbeddingSpecificConfig, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
-    GGUFSpecificConfig, ImageGenerationResponse, ImageGenerationResponseFormat, LlguidanceGrammar,
-    Loader, MemoryGpuConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest,
-    NormalSpecificConfig, PagedAttentionConfig, PagedCacheType, ReasoningEffort,
-    InferenceExec, InferenceInput, InferenceOperation, Request as _Request, Response, ResponseOk,
-    TokenSamplingParams, SchedulerConfig,
-    SearchEmbeddingModel, SpeculativeConfig, SpeculativeLoader, SpeechLoader, StopTokens,
-    DetokenizeInput, TokenSource, TokenizationRequest, TokenizeInput, Tool, Topology,
-    VisionLoaderBuilder, VisionSpecificConfig,
+    DetokenizationRequest, DetokenizeInput, DeviceLayerMapMetadata, DeviceMapMetadata,
+    DeviceMapSetting, DiffusionGenerationParams, DiffusionLoaderBuilder, DryTokenSamplingParams,
+    EmbeddingLoaderBuilder, EmbeddingSpecificConfig, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, ImageGenerationResponse, ImageGenerationResponseFormat,
+    InferenceExec, InferenceInput, InferenceOperation, LlguidanceGrammar, Loader, MemoryGpuConfig,
+    MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest, NormalSpecificConfig,
+    PagedAttentionConfig, PagedCacheType, ReasoningEffort, Request as _Request, Response,
+    ResponseOk, SchedulerConfig, SearchEmbeddingModel, SpeculativeConfig, SpeculativeLoader,
+    SpeechLoader, StopTokens, TokenSamplingParams, TokenSource, TokenizationRequest, TokenizeInput,
+    Tool, Topology, VisionLoaderBuilder, VisionSpecificConfig,
 };
 use mistralrs_core::{
     CalledFunction, SearchCallback, SearchFunctionParameters, SearchResult, ToolCallback,
@@ -1154,23 +1153,23 @@ impl Runner {
                                 let mut content_map: Vec<IndexMap<String, Value>> = Vec::new();
                                 for item in &items {
                                     if matches!(item, ContentPart::Image { .. }) {
-                                    let mut content_image_map = IndexMap::new();
-                                    content_image_map.insert(
-                                        "type".to_string(),
-                                        Value::String("image".to_string()),
-                                    );
-                                    content_map.push(content_image_map);
-                                }
+                                        let mut content_image_map = IndexMap::new();
+                                        content_image_map.insert(
+                                            "type".to_string(),
+                                            Value::String("image".to_string()),
+                                        );
+                                        content_map.push(content_image_map);
+                                    }
                                 }
                                 for item in &items {
                                     if matches!(item, ContentPart::Audio { .. }) {
-                                    let mut content_audio_map = IndexMap::new();
-                                    content_audio_map.insert(
-                                        "type".to_string(),
-                                        Value::String("audio".to_string()),
-                                    );
-                                    content_map.push(content_audio_map);
-                                }
+                                        let mut content_audio_map = IndexMap::new();
+                                        content_audio_map.insert(
+                                            "type".to_string(),
+                                            Value::String("audio".to_string()),
+                                        );
+                                        content_map.push(content_audio_map);
+                                    }
                                 }
                                 {
                                     let mut content_text_map = IndexMap::new();
@@ -1284,6 +1283,7 @@ impl Runner {
                         is_streaming: request.stream,
                         truncate_sequence: request.truncate_sequence,
                     },
+                    adapters: None,
                 },
                 response: tx,
                 model_id: model_id.clone(),
@@ -1357,6 +1357,7 @@ impl Runner {
                             is_streaming: false,
                             truncate_sequence,
                         },
+                        adapters: None,
                     },
                     response: tx,
                     model_id: model_id.clone(),
@@ -1524,6 +1525,7 @@ impl Runner {
                         is_streaming: false,
                         truncate_sequence: request.truncate_sequence,
                     },
+                    adapters: None,
                 },
                 response: tx,
                 model_id: model_id.clone(),
@@ -1583,6 +1585,7 @@ impl Runner {
                     is_streaming: false,
                     truncate_sequence: false,
                 },
+                adapters: None,
             },
             response: tx,
             model_id: model_id.clone(),
@@ -1622,6 +1625,7 @@ impl Runner {
                     is_streaming: false,
                     truncate_sequence: false,
                 },
+                adapters: None,
             },
             response: tx,
             model_id: model_id.clone(),
@@ -1972,10 +1976,8 @@ impl Runner {
                                         "type".to_string(),
                                         Value::String("text".to_string()),
                                     );
-                                    content_text_map.insert(
-                                        "text".to_string(),
-                                        Value::String(text_content),
-                                    );
+                                    content_text_map
+                                        .insert("text".to_string(), Value::String(text_content));
                                     content_map.push(content_text_map);
                                 }
 
@@ -2058,6 +2060,7 @@ impl Runner {
                         is_streaming: request.stream,
                         truncate_sequence: request.truncate_sequence,
                     },
+                    adapters: None,
                 },
                 response: tx,
                 model_id: Some(model_id.clone()),
@@ -2168,6 +2171,7 @@ impl Runner {
                         is_streaming: false,
                         truncate_sequence: request.truncate_sequence,
                     },
+                    adapters: None,
                 },
                 response: tx,
                 model_id: Some(model_id.clone()),

@@ -692,6 +692,7 @@ impl MistralRs {
                             is_streaming: false,
                             truncate_sequence: false,
                         },
+                        adapters: None,
                     },
                     response: tx,
                     model_id: None,

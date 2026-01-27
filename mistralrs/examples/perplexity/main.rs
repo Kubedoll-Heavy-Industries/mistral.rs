@@ -4,9 +4,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use either::Either;
 use mistralrs::{
-    cross_entropy_loss, parse_isq_value, Constraint, DType, Device, MistralRs, NormalRequest,
-    InferenceExec, InferenceInput, InferenceOperation, Request, ResponseOk, TokenSamplingParams, Tensor,
-    TextModelBuilder,
+    cross_entropy_loss, parse_isq_value, Constraint, DType, Device, InferenceExec, InferenceInput,
+    InferenceOperation, MistralRs, NormalRequest, Request, ResponseOk, Tensor, TextModelBuilder,
+    TokenSamplingParams,
 };
 use tokio::sync::mpsc::channel;
 
@@ -57,6 +57,7 @@ async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(T
                 is_streaming: false,
                 truncate_sequence: false,
             },
+            adapters: None,
         },
     }));
 

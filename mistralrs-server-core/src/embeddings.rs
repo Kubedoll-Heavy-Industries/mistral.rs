@@ -8,9 +8,7 @@ use axum::{
 };
 use base64::{prelude::BASE64_STANDARD, Engine};
 use futures::future::join_all;
-use mistralrs_core::{
-    MistralRs, NormalRequest, Request, Response,
-};
+use mistralrs_core::{MistralRs, NormalRequest, Request, Response};
 use tokio::sync::mpsc::Receiver;
 
 use crate::{
@@ -269,6 +267,7 @@ async fn fetch_embedding(
                 is_streaming: false,
                 truncate_sequence,
             },
+            adapters: None,
         },
     }));
 
@@ -297,6 +296,7 @@ async fn fetch_embedding_tokens(
                 is_streaming: false,
                 truncate_sequence,
             },
+            adapters: None,
         },
     }));
 

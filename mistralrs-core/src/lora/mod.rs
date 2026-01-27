@@ -11,6 +11,11 @@ use serde::Deserialize;
 
 mod loralinear;
 mod qloralinear;
+mod registry;
+mod registry_linear;
+
+pub use registry::{AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter};
+pub use registry_linear::RegistryLoraLinear;
 
 use std::collections::HashMap;
 

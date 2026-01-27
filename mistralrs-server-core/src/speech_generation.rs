@@ -10,7 +10,8 @@ use axum::{
     response::IntoResponse,
 };
 use mistralrs_core::{
-    speech_utils::{self, Sample}, MistralRs, NormalRequest, Request, Response,
+    speech_utils::{self, Sample},
+    MistralRs, NormalRequest, Request, Response,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -76,6 +77,7 @@ pub fn parse_request(
                 is_streaming: false,
                 truncate_sequence: false,
             },
+            adapters: None,
         },
     }));
 

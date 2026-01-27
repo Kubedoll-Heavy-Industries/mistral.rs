@@ -84,6 +84,7 @@ pub fn parse_request(
                 is_streaming: false,
                 truncate_sequence: false,
             },
+            adapters: None,
         },
     })))
 }

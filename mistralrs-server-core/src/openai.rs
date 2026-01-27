@@ -604,6 +604,11 @@ pub struct ChatCompletionRequest {
     #[schema(example = json!(Option::None::<bool>))]
     #[serde(default)]
     pub truncate_sequence: Option<bool>,
+    /// Names of LoRA adapters to activate for this request.
+    /// Adapters must be pre-loaded in the model's AdapterRegistry.
+    /// If not specified, uses the model's default adapter set.
+    #[schema(example = json!(Option::None::<Vec<String>>))]
+    pub adapters: Option<Vec<String>>,
 }
 
 /// Function for ChatCompletionRequest.messages Schema generation to handle `Either`
@@ -717,6 +722,11 @@ pub struct CompletionRequest {
     #[schema(example = json!(Option::None::<bool>))]
     #[serde(default)]
     pub truncate_sequence: Option<bool>,
+    /// Names of LoRA adapters to activate for this request.
+    /// Adapters must be pre-loaded in the model's AdapterRegistry.
+    /// If not specified, uses the model's default adapter set.
+    #[schema(example = json!(Option::None::<Vec<String>>))]
+    pub adapters: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
