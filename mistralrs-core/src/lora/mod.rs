@@ -19,7 +19,7 @@ mod registry_linear;
 #[allow(unused_imports)]
 pub use registry::{AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter};
 #[allow(unused_imports)]
-pub use registry_linear::RegistryLoraLinear;
+pub use registry_linear::{wrap_with_lora, RegistryLoraLinear};
 
 use std::collections::HashMap;
 

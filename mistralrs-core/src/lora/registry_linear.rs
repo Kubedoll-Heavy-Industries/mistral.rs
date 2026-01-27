@@ -348,6 +348,121 @@ impl LinearLayerLike for RegistryLoraLinear {
     }
 }
 
+// ============================================================================
+// QuantMethod Implementation
+// ============================================================================
+//
+// This allows RegistryLoraLinear to be used as a drop-in replacement for any
+// Arc<dyn QuantMethod>, enabling transparent per-request adapter switching.
+
+impl mistralrs_quant::QuantizedSerde for RegistryLoraLinear {
+    fn name(&self) -> &'static str {
+        "registry_lora_linear"
+    }
+
+    fn isq_serde_supported(&self) -> bool {
+        // Serialization not supported - registry state is runtime-only
+        false
+    }
+}
+
+impl mistralrs_quant::QuantMethod for RegistryLoraLinear {
+    fn new(_method: mistralrs_quant::QuantMethodConfig) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        // RegistryLoraLinear is constructed via RegistryLoraLinear::new(), not this method
+        candle_core::bail!(
+            "RegistryLoraLinear cannot be constructed via QuantMethod::new(). \
+             Use RegistryLoraLinear::new(base, registry, layer_idx) instead."
+        )
+    }
+
+    fn dequantize_w(&self) -> Result<Tensor> {
+        // Delegate to base layer - LoRA weights are separate
+        self.base.dequantize_w()
+    }
+
+    fn forward(&self, a: &Tensor) -> Result<Tensor> {
+        // Use lora_forward with default scaling parameters
+        // global_scaling_weight=1.0 means full adapter effect
+        // is_scaling_pass=None means normal forward (not XLoRA scaling)
+        self.lora_forward(a, None, 1.0, None)
+    }
+
+    fn quantized_act_type(&self) -> Option<DType> {
+        // Delegate to base layer
+        self.base.quantized_act_type()
+    }
+
+    fn dtype_and_device(&self) -> (DType, candle_core::Device) {
+        // Delegate to base layer
+        self.base.dtype_and_device()
+    }
+
+    fn add_delta_w(&self, delta: &Tensor) -> Result<Arc<dyn QuantMethod>> {
+        // Add delta to base weights - this is for static LoRA merging
+        // For dynamic LoRA, we don't merge but apply at forward time
+        let new_base = self.base.add_delta_w(delta)?;
+        Ok(Arc::new(RegistryLoraLinear {
+            base: new_base,
+            registry: self.registry.clone(),
+            layer_idx: self.layer_idx,
+            cache: RwLock::new(None),
+            merged: self.merged,
+        }))
+    }
+
+    fn apply_isq(
+        self: Arc<Self>,
+        dtype: Option<mistralrs_quant::IsqType>,
+        device: candle_core::Device,
+        n_quantized: &std::sync::atomic::AtomicUsize,
+        imatrix_weight: Option<Vec<f32>>,
+        guard: mistralrs_quant::QuantizeOntoGuard,
+    ) -> Result<Arc<dyn QuantMethod>> {
+        // Apply ISQ to base layer, rewrap with LoRA
+        let new_base = self
+            .base
+            .clone()
+            .apply_isq(dtype, device, n_quantized, imatrix_weight, guard)?;
+        Ok(Arc::new(RegistryLoraLinear {
+            base: new_base,
+            registry: self.registry.clone(),
+            layer_idx: self.layer_idx,
+            cache: RwLock::new(None),
+            merged: self.merged,
+        }))
+    }
+}
+
+/// Wrap a base linear layer with LoRA adapter support.
+///
+/// This creates a `RegistryLoraLinear` that can be used anywhere an
+/// `Arc<dyn QuantMethod>` is expected. The returned layer will apply
+/// active adapters from the registry during forward pass.
+///
+/// # Arguments
+///
+/// * `base` - Base linear layer to wrap
+/// * `registry` - Adapter registry for fetching active adapters
+/// * `layer_idx` - Index of this layer in the model (for fetching correct weights)
+///
+/// # Example
+///
+/// ```ignore
+/// let registry = Arc::new(AdapterRegistry::new(device));
+/// let base_layer = load_linear_layer(...)?;
+/// let lora_layer = wrap_with_lora(base_layer, registry.clone(), 0);
+/// ```
+pub fn wrap_with_lora(
+    base: Arc<dyn QuantMethod>,
+    registry: Arc<AdapterRegistry>,
+    layer_idx: usize,
+) -> Arc<dyn QuantMethod> {
+    Arc::new(RegistryLoraLinear::new(base, registry, layer_idx))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
