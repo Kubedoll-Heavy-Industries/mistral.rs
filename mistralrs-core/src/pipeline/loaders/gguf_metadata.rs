@@ -1476,6 +1476,106 @@ impl CausalLMLoaderBuilder {
         }
     }
 
+    /// Load LoRA adapters into an AdapterRegistry for per-request switching.
+    ///
+    /// Unlike `load_lora_adapters()` which merges adapters at load time, this
+    /// creates an `AdapterRegistry` that allows switching adapters at runtime
+    /// based on the `adapters` field in the request.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_layers` - Number of transformer layers in the model
+    ///
+    /// # Returns
+    ///
+    /// An `AdapterRegistry` with all configured adapters loaded and ready.
+    /// Returns `None` if no adapters are configured.
+    pub fn load_runtime_adapters(
+        &self,
+        num_layers: usize,
+    ) -> Result<Option<Arc<crate::lora::AdapterRegistry>>> {
+        use crate::lora::{AdapterRegistry, AdapterWeights};
+        use crate::utils::varbuilder_utils::{from_mmaped_safetensors, DeviceForLoadTensor};
+
+        if self.lora_adapters.is_empty() {
+            return Ok(None);
+        }
+
+        info!(
+            "Loading {} LoRA adapter(s) for per-request switching",
+            self.lora_adapters.len()
+        );
+
+        let registry = Arc::new(AdapterRegistry::new(self.device.clone()));
+        let api = Api::new().map_err(|e| anyhow!("Failed to create HF API: {}", e))?;
+
+        for adapter_repo_id in &self.lora_adapters {
+            if !self.silent {
+                info!("Downloading LoRA adapter: {}", adapter_repo_id);
+            }
+
+            let repo = api.repo(Repo::new(adapter_repo_id.clone(), RepoType::Model));
+
+            // Download adapter config
+            let config_path = repo.get("adapter_config.json").map_err(|e| {
+                anyhow!(
+                    "Failed to download adapter_config.json from {}: {}",
+                    adapter_repo_id,
+                    e
+                )
+            })?;
+            let config_str = std::fs::read_to_string(&config_path)?;
+            let config: mistralrs_quant::LoraConfig = serde_json::from_str(&config_str)
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to parse adapter_config.json from {}: {}",
+                        adapter_repo_id,
+                        e
+                    )
+                })?;
+
+            // Download adapter weights
+            let weights_path = repo.get("adapter_model.safetensors").map_err(|e| {
+                anyhow!(
+                    "Failed to download adapter_model.safetensors from {}: {}",
+                    adapter_repo_id,
+                    e
+                )
+            })?;
+
+            // Create VarBuilder for adapter weights
+            let vb = from_mmaped_safetensors(
+                vec![weights_path],
+                Vec::new(),
+                Some(self.dtype),
+                &self.device,
+                Vec::new(),
+                true,
+                None,
+                |_| true,
+                Arc::new(move |_| DeviceForLoadTensor::Base),
+            )?;
+
+            // Parse adapter weights into unified index scheme
+            let adapter_weights =
+                AdapterWeights::from_varbuilder(&vb, num_layers, &config.target_modules)?;
+
+            info!(
+                "Loaded LoRA adapter '{}' (rank={}, alpha={}, targets={:?}, {} layers with weights)",
+                adapter_repo_id,
+                config.rank,
+                config.alpha,
+                config.target_modules,
+                adapter_weights.a_weights.len()
+            );
+
+            // Register adapter in the registry
+            registry.register(adapter_repo_id, config, adapter_weights)?;
+        }
+
+        Ok(Some(registry))
+    }
+
     /// Build pipeline for detected safetensors architecture.
     fn build_for_safetensors_architecture(
         &self,

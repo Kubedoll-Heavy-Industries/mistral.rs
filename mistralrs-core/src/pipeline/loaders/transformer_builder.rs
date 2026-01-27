@@ -583,6 +583,12 @@ impl LayerConfig {
 /// This separates weight loading (format-specific) from layer assembly (generic).
 /// Models load weights in their format-specific way, then use this builder to
 /// assemble the standard transformer layer structure.
+///
+/// # LoRA Adapter Support
+///
+/// For per-request adapter switching, use `with_adapter_registry()` to enable
+/// dynamic LoRA. When set, projection layers (q/k/v/o/gate/up/down) are wrapped
+/// with `RegistryLoraLinear` during build, allowing runtime adapter switching.
 pub struct TransformerLayerBuilder {
     config: LayerConfig,
     // Attention weights
@@ -603,6 +609,10 @@ pub struct TransformerLayerBuilder {
     qk_norm: Option<Arc<dyn QkNorm>>,
     paged_attn: Option<PagedAttention>,
     attn_dtype: Option<DType>,
+    // LoRA adapter support
+    adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
+    /// Base layer index for LoRA weight lookup (layer_idx * 7 + projection_offset)
+    layer_base_idx: usize,
 }
 
 impl TransformerLayerBuilder {
@@ -623,6 +633,52 @@ impl TransformerLayerBuilder {
             qk_norm: None,
             paged_attn: None,
             attn_dtype: None,
+            adapter_registry: None,
+            layer_base_idx: 0,
+        }
+    }
+
+    /// Enable per-request LoRA adapter support.
+    ///
+    /// When set, projection layers are wrapped with `RegistryLoraLinear` during
+    /// build, allowing different adapters to be activated per request.
+    ///
+    /// # Arguments
+    ///
+    /// * `registry` - Shared adapter registry for fetching active adapters
+    /// * `layer_idx` - The transformer layer index (0-based), used to compute
+    ///   unique indices for each projection (q=0, k=1, v=2, o=3, gate=4, up=5, down=6)
+    ///
+    /// # Layer Index Scheme
+    ///
+    /// Each projection gets a unique index: `layer_idx * 7 + projection_offset`
+    /// - q_proj: offset 0
+    /// - k_proj: offset 1
+    /// - v_proj: offset 2
+    /// - o_proj: offset 3
+    /// - gate_proj: offset 4
+    /// - up_proj: offset 5
+    /// - down_proj: offset 6
+    pub fn with_adapter_registry(
+        mut self,
+        registry: Arc<crate::lora::AdapterRegistry>,
+        layer_idx: usize,
+    ) -> Self {
+        self.adapter_registry = Some(registry);
+        self.layer_base_idx = layer_idx * 7; // 7 projections per layer
+        self
+    }
+
+    /// Wrap a layer with LoRA if adapter registry is configured.
+    fn maybe_wrap_with_lora(
+        &self,
+        layer: Arc<dyn QuantMethod>,
+        offset: usize,
+    ) -> Arc<dyn QuantMethod> {
+        if let Some(ref registry) = self.adapter_registry {
+            crate::lora::wrap_with_lora(layer, registry.clone(), self.layer_base_idx + offset)
+        } else {
+            layer
         }
     }
 
@@ -709,7 +765,11 @@ impl TransformerLayerBuilder {
     /// Build the transformer layer from the provided weights.
     ///
     /// Returns an error if any required weights are missing.
+    ///
+    /// If an adapter registry was set via `with_adapter_registry()`, projections
+    /// are automatically wrapped with `RegistryLoraLinear` for per-request switching.
     pub fn build(self) -> Result<TransformerBlock<RmsNorm, CausalAttention, Mlp>> {
+        // Extract projections
         let q_proj = self.q_proj.ok_or_else(|| candle_core::Error::Msg("q_proj not set".into()))?;
         let k_proj = self.k_proj.ok_or_else(|| candle_core::Error::Msg("k_proj not set".into()))?;
         let v_proj = self.v_proj.ok_or_else(|| candle_core::Error::Msg("v_proj not set".into()))?;
@@ -720,6 +780,23 @@ impl TransformerLayerBuilder {
         let attn_norm = self.attn_norm.ok_or_else(|| candle_core::Error::Msg("attn_norm not set".into()))?;
         let ffn_norm = self.ffn_norm.ok_or_else(|| candle_core::Error::Msg("ffn_norm not set".into()))?;
         let rope = self.rope.ok_or_else(|| candle_core::Error::Msg("rope not set".into()))?;
+
+        // Wrap projections with LoRA if adapter registry is configured
+        let (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj) =
+            if let Some(ref registry) = self.adapter_registry {
+                let base_idx = self.layer_base_idx;
+                (
+                    crate::lora::wrap_with_lora(q_proj, registry.clone(), base_idx + 0),
+                    crate::lora::wrap_with_lora(k_proj, registry.clone(), base_idx + 1),
+                    crate::lora::wrap_with_lora(v_proj, registry.clone(), base_idx + 2),
+                    crate::lora::wrap_with_lora(o_proj, registry.clone(), base_idx + 3),
+                    crate::lora::wrap_with_lora(gate_proj, registry.clone(), base_idx + 4),
+                    crate::lora::wrap_with_lora(up_proj, registry.clone(), base_idx + 5),
+                    crate::lora::wrap_with_lora(down_proj, registry.clone(), base_idx + 6),
+                )
+            } else {
+                (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj)
+            };
 
         // Build attention config
         let mut attn_config = AttentionConfig::new(
@@ -772,6 +849,7 @@ impl TransformerLayerBuilder {
         self,
         ffn: F,
     ) -> Result<TransformerBlock<RmsNorm, CausalAttention, F>> {
+        // Extract attention projections
         let q_proj = self.q_proj.ok_or_else(|| candle_core::Error::Msg("q_proj not set".into()))?;
         let k_proj = self.k_proj.ok_or_else(|| candle_core::Error::Msg("k_proj not set".into()))?;
         let v_proj = self.v_proj.ok_or_else(|| candle_core::Error::Msg("v_proj not set".into()))?;
@@ -779,6 +857,20 @@ impl TransformerLayerBuilder {
         let attn_norm = self.attn_norm.ok_or_else(|| candle_core::Error::Msg("attn_norm not set".into()))?;
         let ffn_norm = self.ffn_norm.ok_or_else(|| candle_core::Error::Msg("ffn_norm not set".into()))?;
         let rope = self.rope.ok_or_else(|| candle_core::Error::Msg("rope not set".into()))?;
+
+        // Wrap attention projections with LoRA if registry is configured
+        // (FFN is passed in externally, so caller handles MoE LoRA if needed)
+        let (q_proj, k_proj, v_proj, o_proj) = if let Some(ref registry) = self.adapter_registry {
+            let base_idx = self.layer_base_idx;
+            (
+                crate::lora::wrap_with_lora(q_proj, registry.clone(), base_idx + 0),
+                crate::lora::wrap_with_lora(k_proj, registry.clone(), base_idx + 1),
+                crate::lora::wrap_with_lora(v_proj, registry.clone(), base_idx + 2),
+                crate::lora::wrap_with_lora(o_proj, registry.clone(), base_idx + 3),
+            )
+        } else {
+            (q_proj, k_proj, v_proj, o_proj)
+        };
 
         // Build attention config
         let mut attn_config = AttentionConfig::new(

@@ -111,6 +111,124 @@ impl Default for AdapterWeights {
     }
 }
 
+/// Projection name to offset mapping for the unified layer index scheme.
+///
+/// Each transformer layer has 7 projections:
+/// - q_proj (0), k_proj (1), v_proj (2), o_proj (3) for attention
+/// - gate_proj (4), up_proj (5), down_proj (6) for MLP
+pub const PROJECTION_OFFSETS: &[(&str, usize)] = &[
+    ("q_proj", 0),
+    ("k_proj", 1),
+    ("v_proj", 2),
+    ("o_proj", 3),
+    ("gate_proj", 4),
+    ("up_proj", 5),
+    ("down_proj", 6),
+];
+
+impl AdapterWeights {
+    /// Parse LoRA weights from a VarBuilder into the unified index scheme.
+    ///
+    /// This function extracts A and B weight tensors from the VarBuilder and
+    /// maps them to the unified layer index scheme used by `RegistryLoraLinear`:
+    /// `unified_idx = layer_idx * 7 + projection_offset`
+    ///
+    /// # Arguments
+    ///
+    /// * `vb` - VarBuilder containing the adapter weights (from safetensors)
+    /// * `num_layers` - Number of transformer layers in the model
+    /// * `target_modules` - Which projections this adapter targets (e.g., ["q_proj", "v_proj"])
+    ///
+    /// # Weight Name Patterns
+    ///
+    /// Tries multiple common LoRA weight naming conventions:
+    /// - `base_model.model.layers.{layer}.self_attn.{proj}.lora_{A|B}.weight`
+    /// - `model.layers.{layer}.self_attn.{proj}.lora_{A|B}.weight`
+    /// - `layers.{layer}.self_attn.{proj}.lora_{A|B}.weight` (fallback for GGUF-converted)
+    ///
+    /// MLP projections use similar patterns with `mlp.{proj}` instead of `self_attn.{proj}`.
+    pub fn from_varbuilder(
+        vb: &mistralrs_quant::ShardedVarBuilder,
+        num_layers: usize,
+        target_modules: &std::collections::HashSet<String>,
+    ) -> Result<Self> {
+        let mut weights = Self::new();
+
+        // Common prefixes used by different LoRA libraries/formats
+        let prefixes = ["base_model.model.", "model.", ""];
+
+        // Attention vs MLP projection mapping
+        let proj_to_submodule = |proj: &str| -> &'static str {
+            match proj {
+                "q_proj" | "k_proj" | "v_proj" | "o_proj" => "self_attn",
+                "gate_proj" | "up_proj" | "down_proj" => "mlp",
+                _ => "self_attn", // fallback
+            }
+        };
+
+        for layer_idx in 0..num_layers {
+            for (proj_name, proj_offset) in PROJECTION_OFFSETS {
+                // Skip projections not targeted by this adapter
+                if !target_modules.contains(*proj_name) {
+                    continue;
+                }
+
+                let submodule = proj_to_submodule(proj_name);
+                let unified_idx = layer_idx * 7 + proj_offset;
+
+                // Try different prefix patterns
+                let mut a_tensor: Option<Tensor> = None;
+                let mut b_tensor: Option<Tensor> = None;
+
+                for prefix in &prefixes {
+                    let a_key = format!(
+                        "{prefix}layers.{layer_idx}.{submodule}.{proj_name}.lora_A.weight"
+                    );
+                    let b_key = format!(
+                        "{prefix}layers.{layer_idx}.{submodule}.{proj_name}.lora_B.weight"
+                    );
+
+                    // Try to load A tensor
+                    if a_tensor.is_none() && vb.contains_tensor(&a_key) {
+                        if let Ok(t) = vb.get_with_hints_dtype(
+                            (),
+                            &a_key,
+                            Default::default(), // Full tensor (world_size=1)
+                            candle_core::DType::F32,
+                        ) {
+                            a_tensor = Some(t);
+                        }
+                    }
+
+                    // Try to load B tensor
+                    if b_tensor.is_none() && vb.contains_tensor(&b_key) {
+                        if let Ok(t) = vb.get_with_hints_dtype(
+                            (),
+                            &b_key,
+                            Default::default(), // Full tensor (world_size=1)
+                            candle_core::DType::F32,
+                        ) {
+                            b_tensor = Some(t);
+                        }
+                    }
+
+                    // Break early if we found both
+                    if a_tensor.is_some() && b_tensor.is_some() {
+                        break;
+                    }
+                }
+
+                // Add layer weights if we found both A and B
+                if let (Some(a), Some(b)) = (a_tensor, b_tensor) {
+                    weights.add_layer(unified_idx, a, b);
+                }
+            }
+        }
+
+        Ok(weights)
+    }
+}
+
 /// A loaded adapter with its configuration and weights.
 #[derive(Debug)]
 pub struct LoadedAdapter {

@@ -14,10 +14,12 @@ mod qloralinear;
 mod registry;
 mod registry_linear;
 
-// Re-export registry types for future use (dynamic adapter selection)
-// These are intentionally exported even though not yet wired up internally
+// Re-export registry types for per-request adapter selection
+// These are intentionally exported for external use even if not used internally
 #[allow(unused_imports)]
-pub use registry::{AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter};
+pub use registry::{
+    AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter, PROJECTION_OFFSETS,
+};
 #[allow(unused_imports)]
 pub use registry_linear::{wrap_with_lora, RegistryLoraLinear};
 
