@@ -14,7 +14,11 @@ async fn main() -> Result<()> {
     let mut messages = VisionMessages::new().add_message(TextMessageRole::User, "Hello!");
 
     let resp = model
-        .send_chat_request(RequestBuilder::from(messages.clone()).set_sampler_max_len(100).into())
+        .send_chat_request(
+            RequestBuilder::from(messages.clone())
+                .set_sampler_max_len(100)
+                .into(),
+        )
         .await?
         .choices[0]
         .message
@@ -40,7 +44,11 @@ async fn main() -> Result<()> {
         &model,
     )?;
     let resp = model
-        .send_chat_request(RequestBuilder::from(messages.clone()).set_sampler_max_len(100).into())
+        .send_chat_request(
+            RequestBuilder::from(messages.clone())
+                .set_sampler_max_len(100)
+                .into(),
+        )
         .await?
         .choices[0]
         .message
@@ -61,7 +69,11 @@ async fn main() -> Result<()> {
     messages =
         messages.add_image_message(TextMessageRole::User, "What is this?", vec![image], &model)?;
     let resp = model
-        .send_chat_request(RequestBuilder::from(messages.clone()).set_sampler_max_len(100).into())
+        .send_chat_request(
+            RequestBuilder::from(messages.clone())
+                .set_sampler_max_len(100)
+                .into(),
+        )
         .await?
         .choices[0]
         .message
@@ -82,7 +94,11 @@ async fn main() -> Result<()> {
     messages =
         messages.add_image_message(TextMessageRole::User, "What is this?", vec![image], &model)?;
     let resp = model
-        .send_chat_request(RequestBuilder::from(messages.clone()).set_sampler_max_len(100).into())
+        .send_chat_request(
+            RequestBuilder::from(messages.clone())
+                .set_sampler_max_len(100)
+                .into(),
+        )
         .await?
         .choices[0]
         .message

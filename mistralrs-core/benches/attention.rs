@@ -84,7 +84,12 @@ fn create_qkv_tensors(
     let q = Tensor::randn(
         0f32,
         1f32,
-        (config.batch_size, config.num_heads, config.seq_len, config.head_dim),
+        (
+            config.batch_size,
+            config.num_heads,
+            config.seq_len,
+            config.head_dim,
+        ),
         device,
     )?
     .to_dtype(dtype)?;
@@ -93,7 +98,12 @@ fn create_qkv_tensors(
     let k = Tensor::randn(
         0f32,
         1f32,
-        (config.batch_size, config.num_kv_heads, config.seq_len, config.head_dim),
+        (
+            config.batch_size,
+            config.num_kv_heads,
+            config.seq_len,
+            config.head_dim,
+        ),
         device,
     )?
     .to_dtype(dtype)?;
@@ -101,7 +111,12 @@ fn create_qkv_tensors(
     let v = Tensor::randn(
         0f32,
         1f32,
-        (config.batch_size, config.num_kv_heads, config.seq_len, config.head_dim),
+        (
+            config.batch_size,
+            config.num_kv_heads,
+            config.seq_len,
+            config.head_dim,
+        ),
         device,
     )?
     .to_dtype(dtype)?;
@@ -132,7 +147,12 @@ fn bench_qk_matmul(c: &mut Criterion) {
         let (q, k, _v) = create_qkv_tensors(config, &device, dtype).expect("tensor creation");
 
         // Throughput in FLOPs: 2 * batch * heads * seq * seq * head_dim
-        let flops = 2 * config.batch_size * config.num_heads * config.seq_len * config.seq_len * config.head_dim;
+        let flops = 2
+            * config.batch_size
+            * config.num_heads
+            * config.seq_len
+            * config.seq_len
+            * config.head_dim;
         group.throughput(Throughput::Elements(flops as u64));
 
         group.bench_with_input(
@@ -164,7 +184,12 @@ fn bench_softmax(c: &mut Criterion) {
         let att = Tensor::randn(
             0f32,
             1f32,
-            (config.batch_size, config.num_heads, config.seq_len, config.seq_len),
+            (
+                config.batch_size,
+                config.num_heads,
+                config.seq_len,
+                config.seq_len,
+            ),
             &device,
         )
         .expect("tensor")
@@ -205,7 +230,12 @@ fn bench_full_attention(c: &mut Criterion) {
         let softmax_scale = 1.0 / (config.head_dim as f64).sqrt();
 
         // Total FLOPs: 2 * QK^T + softmax + 2 * att@V
-        let flops = 4 * config.batch_size * config.num_heads * config.seq_len * config.seq_len * config.head_dim;
+        let flops = 4
+            * config.batch_size
+            * config.num_heads
+            * config.seq_len
+            * config.seq_len
+            * config.head_dim;
         group.throughput(Throughput::Elements(flops as u64));
 
         group.bench_with_input(
@@ -255,16 +285,38 @@ fn bench_gqa_kv_expand(c: &mut Criterion) {
                     let k_expanded = k
                         .unsqueeze(2)
                         .expect("unsqueeze")
-                        .expand((config.batch_size, config.num_kv_heads, num_groups, config.seq_len, config.head_dim))
+                        .expand((
+                            config.batch_size,
+                            config.num_kv_heads,
+                            num_groups,
+                            config.seq_len,
+                            config.head_dim,
+                        ))
                         .expect("expand")
-                        .reshape((config.batch_size, config.num_heads, config.seq_len, config.head_dim))
+                        .reshape((
+                            config.batch_size,
+                            config.num_heads,
+                            config.seq_len,
+                            config.head_dim,
+                        ))
                         .expect("reshape");
                     let v_expanded = v
                         .unsqueeze(2)
                         .expect("unsqueeze")
-                        .expand((config.batch_size, config.num_kv_heads, num_groups, config.seq_len, config.head_dim))
+                        .expand((
+                            config.batch_size,
+                            config.num_kv_heads,
+                            num_groups,
+                            config.seq_len,
+                            config.head_dim,
+                        ))
                         .expect("expand")
-                        .reshape((config.batch_size, config.num_heads, config.seq_len, config.head_dim))
+                        .reshape((
+                            config.batch_size,
+                            config.num_heads,
+                            config.seq_len,
+                            config.head_dim,
+                        ))
                         .expect("reshape");
                     device.synchronize().ok();
                     bb(k_expanded.elem_count() + v_expanded.elem_count())

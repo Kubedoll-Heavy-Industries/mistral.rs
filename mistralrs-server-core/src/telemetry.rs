@@ -166,9 +166,7 @@ pub fn shutdown_telemetry(providers: TelemetryProviders) {
 /// Extract trace context from HTTP headers.
 ///
 /// Supports W3C Trace Context (traceparent/tracestate headers).
-pub fn extract_trace_context(
-    headers: &axum::http::HeaderMap,
-) -> opentelemetry::Context {
+pub fn extract_trace_context(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
     use opentelemetry::propagation::TextMapPropagator;
 
     struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
@@ -286,11 +284,7 @@ macro_rules! embedding_span {
 ///
 /// Records both OTel GenAI (`gen_ai.usage.*`) and OpenInference (`llm.token_count.*`)
 /// attributes for compatibility with different observability backends.
-pub fn record_token_usage(
-    span: &tracing::Span,
-    prompt_tokens: usize,
-    completion_tokens: usize,
-) {
+pub fn record_token_usage(span: &tracing::Span, prompt_tokens: usize, completion_tokens: usize) {
     let total = prompt_tokens + completion_tokens;
 
     // OTel GenAI attributes (RECOMMENDED)
@@ -430,10 +424,7 @@ pub fn record_sampling_params(
         params.insert("presence_penalty".to_string(), serde_json::Value::from(v));
     }
     if let Some(v) = repetition_penalty {
-        params.insert(
-            "repetition_penalty".to_string(),
-            serde_json::Value::from(v),
-        );
+        params.insert("repetition_penalty".to_string(), serde_json::Value::from(v));
     }
 
     // Record JSON representation for OpenInference

@@ -628,7 +628,10 @@ impl MistralRsForServerBuilder {
     }
 
     /// Optionally sets the layer range for pipeline parallelism.
-    pub fn with_layer_range_optional(mut self, layer_range: Option<std::ops::Range<usize>>) -> Self {
+    pub fn with_layer_range_optional(
+        mut self,
+        layer_range: Option<std::ops::Range<usize>>,
+    ) -> Self {
         self.layer_range = layer_range;
         self
     }
@@ -755,7 +758,8 @@ impl MistralRsForServerBuilder {
         )?;
 
         // Wrap with SpeculativeLoader if configured (single-model only)
-        let loader: Box<dyn Loader> = if let Some(draft_model) = self.speculative_draft_model.take() {
+        let loader: Box<dyn Loader> = if let Some(draft_model) = self.speculative_draft_model.take()
+        {
             if self.models.len() > 1 {
                 anyhow::bail!("Speculative decoding is not supported with multiple models");
             }

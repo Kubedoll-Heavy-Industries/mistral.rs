@@ -112,7 +112,10 @@ fn test_load_text_pipeline_with_layer_range() {
         }
         Err(e) => {
             // Layer range might cause issues with some models - that's OK for now
-            eprintln!("Note: Layer range loading returned error (expected for some models): {}", e);
+            eprintln!(
+                "Note: Layer range loading returned error (expected for some models): {}",
+                e
+            );
         }
     }
 }
@@ -137,7 +140,9 @@ fn test_load_text_pipeline_forward_pass() {
     .expect("Failed to load pipeline");
 
     // Get tokenizer and encode a simple prompt
-    let tokenizer = pipeline.tokenizer().expect("Pipeline should have tokenizer");
+    let tokenizer = pipeline
+        .tokenizer()
+        .expect("Pipeline should have tokenizer");
     let encoding = tokenizer
         .encode("Hello, world!", false)
         .expect("Failed to encode");
@@ -268,7 +273,10 @@ fn test_pp_stage_detection_tail() {
     let hook = MockPipelineHook::tail_stage(14, 28); // Layers 14-28
     let container = HookContainer::new(std::sync::Arc::new(hook));
 
-    assert!(!container.is_first_stage(), "TAIL should NOT be first stage");
+    assert!(
+        !container.is_first_stage(),
+        "TAIL should NOT be first stage"
+    );
     assert!(container.is_last_stage(), "TAIL should be last stage");
     assert!(
         !container.needs_external_logits(),
@@ -281,7 +289,10 @@ fn test_pp_stage_detection_tail() {
 fn test_pp_head_and_tail_stage_loading() {
     let model_path = get_test_model_path();
 
-    println!("Testing PP HEAD and TAIL stage loading with model: {:?}", model_path);
+    println!(
+        "Testing PP HEAD and TAIL stage loading with model: {:?}",
+        model_path
+    );
 
     let device = Device::Cpu;
 
@@ -295,7 +306,10 @@ fn test_pp_head_and_tail_stage_loading() {
 
     // Split layers: HEAD gets first half, TAIL gets second half
     let mid = total_layers / 2;
-    println!("Splitting at layer {}: HEAD=0..{}, TAIL={}..{}", mid, mid, mid, total_layers);
+    println!(
+        "Splitting at layer {}: HEAD=0..{}, TAIL={}..{}",
+        mid, mid, mid, total_layers
+    );
 
     // Load HEAD stage (layers 0..mid)
     println!("\nLoading HEAD stage (layers 0..{})...", mid);
@@ -363,7 +377,10 @@ fn test_builder_from_paths() {
         .build()
         .expect("Failed to build pipeline");
 
-    println!("Successfully loaded pipeline via builder: {}", pipeline.name());
+    println!(
+        "Successfully loaded pipeline via builder: {}",
+        pipeline.name()
+    );
     assert!(!pipeline.name().is_empty());
 }
 
@@ -399,7 +416,10 @@ fn test_builder_with_layer_range() {
         }
         Err(e) => {
             // Layer range loading may not be fully supported for all models
-            println!("Note: Layer range loading returned error (may be expected): {}", e);
+            println!(
+                "Note: Layer range loading returned error (may be expected): {}",
+                e
+            );
         }
     }
 }
@@ -412,15 +432,12 @@ fn test_builder_from_hf_gguf() {
 
     println!("Testing CausalLMLoaderBuilder::from_hf_gguf()");
 
-    let pipeline = CausalLMLoaderBuilder::from_hf_gguf(
-        DEFAULT_MODEL_REPO,
-        &[DEFAULT_MODEL_FILE],
-    )
-    .with_device(Device::Cpu)
-    .with_dtype(DType::F32)
-    .silent()
-    .build()
-    .expect("Failed to build pipeline from HF");
+    let pipeline = CausalLMLoaderBuilder::from_hf_gguf(DEFAULT_MODEL_REPO, &[DEFAULT_MODEL_FILE])
+        .with_device(Device::Cpu)
+        .with_dtype(DType::F32)
+        .silent()
+        .build()
+        .expect("Failed to build pipeline from HF");
 
     println!("Successfully loaded pipeline from HF: {}", pipeline.name());
     assert!(!pipeline.name().is_empty());
@@ -455,7 +472,9 @@ fn test_builder_build_async() {
 // CausalLMLoader Tests (Loader trait implementation)
 // =============================================================================
 
-use mistralrs_core::{CausalLMLoader, DeviceMapSetting, Loader, ModelDType, TokenSource, LoaderBuilder, ModelSelected};
+use mistralrs_core::{
+    CausalLMLoader, DeviceMapSetting, Loader, LoaderBuilder, ModelDType, ModelSelected, TokenSource,
+};
 
 #[test]
 #[serial(small_model)]
@@ -469,7 +488,11 @@ fn test_loader_builder_gguf_uses_causal_lm_loader() {
     let model_selected = ModelSelected::GGUF {
         tok_model_id: None,
         quantized_model_id: model_path.parent().unwrap().to_string_lossy().to_string(),
-        quantized_filename: model_path.file_name().unwrap().to_string_lossy().to_string(),
+        quantized_filename: model_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string(),
         topology: None,
         dtype: ModelDType::Auto,
         max_seq_len: 2048,
@@ -486,7 +509,10 @@ fn test_loader_builder_gguf_uses_causal_lm_loader() {
         mistralrs_core::ModelKind::GgufQuantized { .. }
     ));
 
-    println!("Successfully created loader via LoaderBuilder: {}", loader.get_id());
+    println!(
+        "Successfully created loader via LoaderBuilder: {}",
+        loader.get_id()
+    );
 }
 
 #[test]
@@ -510,16 +536,18 @@ fn test_causal_lm_loader_from_hf() {
     ));
 
     // Load the model via Loader trait
-    let pipeline = loader.load_model_from_hf(
-        None,
-        TokenSource::CacheToken,
-        &ModelDType::Auto,
-        &Device::Cpu,
-        true, // silent
-        DeviceMapSetting::dummy(),
-        None,
-        None,
-    ).expect("Failed to load via CausalLMLoader");
+    let pipeline = loader
+        .load_model_from_hf(
+            None,
+            TokenSource::CacheToken,
+            &ModelDType::Auto,
+            &Device::Cpu,
+            true, // silent
+            DeviceMapSetting::dummy(),
+            None,
+            None,
+        )
+        .expect("Failed to load via CausalLMLoader");
 
     // Verify we can access the pipeline
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -604,10 +632,7 @@ fn run_model_family_test(info: &ModelTestInfo) -> bool {
     let model_path = match std::env::var(info.env_var) {
         Ok(path) => PathBuf::from(path),
         Err(_) => {
-            println!(
-                "Skipping {} test: {} not set",
-                info.name, info.env_var
-            );
+            println!("Skipping {} test: {} not set", info.name, info.env_var);
             return false;
         }
     };
@@ -647,7 +672,11 @@ fn run_model_family_test(info: &ModelTestInfo) -> bool {
 
     match pipeline {
         Ok(pipeline) => {
-            println!("Successfully loaded {} pipeline: {}", info.name, pipeline.name());
+            println!(
+                "Successfully loaded {} pipeline: {}",
+                info.name,
+                pipeline.name()
+            );
 
             // Test tokenizer
             if let Some(tokenizer) = pipeline.tokenizer() {
@@ -783,12 +812,19 @@ fn test_all_model_families() {
         }
     }
 
-    println!("\n=== Summary: {}/{} model families passed ===", passed, tested);
+    println!(
+        "\n=== Summary: {}/{} model families passed ===",
+        passed, tested
+    );
 
     if tested == 0 {
         println!("No model family environment variables set. Set one or more of:");
         for info in MODEL_FAMILIES {
-            println!("  {}=/path/to/{}.gguf", info.env_var, info.name.to_lowercase());
+            println!(
+                "  {}=/path/to/{}.gguf",
+                info.env_var,
+                info.name.to_lowercase()
+            );
         }
     } else {
         assert_eq!(passed, tested, "Some model families failed");

@@ -55,12 +55,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use candle_core::DType;
-use mistralrs_core::{
-    AutoDeviceMapParams, CausalLMLoaderBuilder, DeviceMapSetting, Pipeline,
-};
+use mistralrs_core::{AutoDeviceMapParams, CausalLMLoaderBuilder, DeviceMapSetting, Pipeline};
 use serial_test::serial;
-use tokio::sync::Mutex;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 // =============================================================================
 // Test Configuration
@@ -197,10 +195,12 @@ fn load_test_pipeline(
 }
 
 /// Cache for loaded pipelines (avoid reloading in multiple tests).
-static PIPELINE_CACHE: OnceLock<std::sync::Mutex<HashMap<String, Arc<Mutex<dyn Pipeline + Send + Sync>>>>> =
-    OnceLock::new();
+static PIPELINE_CACHE: OnceLock<
+    std::sync::Mutex<HashMap<String, Arc<Mutex<dyn Pipeline + Send + Sync>>>>,
+> = OnceLock::new();
 
-fn get_pipeline_cache() -> &'static std::sync::Mutex<HashMap<String, Arc<Mutex<dyn Pipeline + Send + Sync>>>> {
+fn get_pipeline_cache(
+) -> &'static std::sync::Mutex<HashMap<String, Arc<Mutex<dyn Pipeline + Send + Sync>>>> {
     PIPELINE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -228,7 +228,10 @@ fn get_or_load_pipeline(
 fn run_smoke_test(config: &SafetensorsTestConfig) -> Result<(), Box<dyn std::error::Error>> {
     let repo_id = get_repo_id(config);
 
-    println!("\n=== Smoke Test: {} ({:.1}B params) ===", config.name, config.params_billions);
+    println!(
+        "\n=== Smoke Test: {} ({:.1}B params) ===",
+        config.name, config.params_billions
+    );
     println!("Repo: {}", repo_id);
 
     if config.is_large && skip_large_models() {
@@ -246,8 +249,11 @@ fn run_smoke_test(config: &SafetensorsTestConfig) -> Result<(), Box<dyn std::err
 
         // Verify the model name contains expected architecture
         assert!(
-            name.to_lowercase().contains(&config.expected_arch_contains.to_lowercase())
-                || repo_id.to_lowercase().contains(&config.expected_arch_contains.to_lowercase()),
+            name.to_lowercase()
+                .contains(&config.expected_arch_contains.to_lowercase())
+                || repo_id
+                    .to_lowercase()
+                    .contains(&config.expected_arch_contains.to_lowercase()),
             "Model name '{}' should contain '{}'",
             name,
             config.expected_arch_contains
@@ -260,7 +266,8 @@ fn run_smoke_test(config: &SafetensorsTestConfig) -> Result<(), Box<dyn std::err
         // Test tokenization
         let tokenizer = tokenizer.unwrap();
         let test_text = format!("Hello from {} test!", config.name);
-        let encoding = tokenizer.encode(test_text.as_str(), false)
+        let encoding = tokenizer
+            .encode(test_text.as_str(), false)
             .expect("Tokenization should succeed");
         println!("Tokenized '{}' -> {} tokens", test_text, encoding.len());
         assert!(encoding.len() > 0, "Tokenization should produce tokens");
@@ -274,28 +281,40 @@ fn run_smoke_test(config: &SafetensorsTestConfig) -> Result<(), Box<dyn std::err
 #[test]
 #[serial(small_model)]
 fn test_safetensors_smoke_qwen2() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Qwen2")
+        .unwrap();
     run_smoke_test(config).expect("Qwen2 smoke test failed");
 }
 
 #[test]
 #[serial(small_model)]
 fn test_safetensors_smoke_qwen3() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen3").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Qwen3")
+        .unwrap();
     run_smoke_test(config).expect("Qwen3 smoke test failed");
 }
 
 #[test]
 #[serial(large_model)]
 fn test_safetensors_smoke_phi3() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Phi3").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Phi3")
+        .unwrap();
     run_smoke_test(config).expect("Phi3 smoke test failed");
 }
 
 #[test]
 #[serial(large_model)]
 fn test_safetensors_smoke_mistral() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Mistral").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Mistral")
+        .unwrap();
     run_smoke_test(config).expect("Mistral smoke test failed");
 }
 
@@ -376,7 +395,10 @@ fn run_regression_test(case: &RegressionTestCase) -> Result<(), Box<dyn std::err
     // For now, just verify the model loads and tokenizes correctly
     println!("Note: Full inference regression testing requires Engine integration");
     println!("Verified model loads and tokenizer works");
-    println!("=== {} Regression Test PASSED (loading only) ===\n", config.name);
+    println!(
+        "=== {} Regression Test PASSED (loading only) ===\n",
+        config.name
+    );
 
     Ok(())
 }
@@ -384,7 +406,10 @@ fn run_regression_test(case: &RegressionTestCase) -> Result<(), Box<dyn std::err
 #[test]
 #[serial(small_model)]
 fn test_safetensors_regression_qwen2() {
-    for case in REGRESSION_CASES.iter().filter(|c| c.model_family == "Qwen2") {
+    for case in REGRESSION_CASES
+        .iter()
+        .filter(|c| c.model_family == "Qwen2")
+    {
         run_regression_test(case).expect("Qwen2 regression test failed");
     }
 }
@@ -392,7 +417,10 @@ fn test_safetensors_regression_qwen2() {
 #[test]
 #[serial(small_model)]
 fn test_safetensors_regression_qwen3() {
-    for case in REGRESSION_CASES.iter().filter(|c| c.model_family == "Qwen3") {
+    for case in REGRESSION_CASES
+        .iter()
+        .filter(|c| c.model_family == "Qwen3")
+    {
         run_regression_test(case).expect("Qwen3 regression test failed");
     }
 }
@@ -435,7 +463,10 @@ fn test_safetensors_regression_all() {
 #[test]
 #[serial(small_model)]
 fn test_safetensors_with_isq() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Qwen2")
+        .unwrap();
     let repo_id = get_repo_id(config);
 
     println!("\n=== ISQ Test: {} ===", config.name);
@@ -469,7 +500,10 @@ fn test_safetensors_with_isq() {
 #[test]
 #[serial(small_model)]
 fn test_safetensors_with_layer_range() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Qwen2")
+        .unwrap();
     let repo_id = get_repo_id(config);
 
     println!("\n=== Layer Range Test: {} ===", config.name);
@@ -508,7 +542,10 @@ fn test_safetensors_with_layer_range() {
 #[test]
 #[serial(small_model)]
 fn test_qwen2_architecture_features() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen2").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Qwen2")
+        .unwrap();
     let repo_id = get_repo_id(config);
 
     println!("\n=== Qwen2 Architecture Test ===");
@@ -544,7 +581,10 @@ fn test_qwen2_architecture_features() {
 #[test]
 #[serial(small_model)]
 fn test_qwen3_architecture_features() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Qwen3").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Qwen3")
+        .unwrap();
     let repo_id = get_repo_id(config);
 
     println!("\n=== Qwen3 Architecture Test ===");
@@ -577,7 +617,10 @@ fn test_qwen3_architecture_features() {
 #[test]
 #[serial(large_model)]
 fn test_mistral_architecture_features() {
-    let config = SAFETENSORS_CONFIGS.iter().find(|c| c.name == "Mistral").unwrap();
+    let config = SAFETENSORS_CONFIGS
+        .iter()
+        .find(|c| c.name == "Mistral")
+        .unwrap();
 
     if config.is_large && skip_large_models() {
         println!("Skipping Mistral architecture test (large model)");

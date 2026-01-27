@@ -242,7 +242,9 @@ fn bench_minp(c: &mut Criterion) {
                 // Threshold = max_prob * min_p
                 let threshold = (max_prob * min_p as f64).expect("mul");
                 // Mask tokens below threshold
-                let mask = probs.broadcast_ge(&threshold.unsqueeze(D::Minus1).expect("unsqueeze")).expect("ge");
+                let mask = probs
+                    .broadcast_ge(&threshold.unsqueeze(D::Minus1).expect("unsqueeze"))
+                    .expect("ge");
                 device.synchronize().ok();
                 bb(mask.elem_count())
             });
@@ -277,8 +279,11 @@ fn bench_repetition_penalty(c: &mut Criterion) {
                 b.iter(|| {
                     // Apply penalty to tokens in history
                     // This is typically done on CPU with scatter
-                    let mut logits_vec = logits.flatten_all().expect("flatten")
-                        .to_vec1::<f32>().expect("to_vec1");
+                    let mut logits_vec = logits
+                        .flatten_all()
+                        .expect("flatten")
+                        .to_vec1::<f32>()
+                        .expect("to_vec1");
 
                     for &token_id in &history {
                         let idx = token_id as usize;
@@ -290,7 +295,8 @@ fn bench_repetition_penalty(c: &mut Criterion) {
                     }
 
                     // Convert back to tensor
-                    let penalized = Tensor::from_vec(logits_vec, *vocab_size, &device).expect("from_vec");
+                    let penalized =
+                        Tensor::from_vec(logits_vec, *vocab_size, &device).expect("from_vec");
                     bb(penalized.elem_count())
                 });
             });

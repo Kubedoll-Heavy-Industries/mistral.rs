@@ -33,7 +33,7 @@ fn get_device() -> Device {
 // ============================================================================
 
 /// Model hidden dimensions for benchmarking
-const HIDDEN_SIZES: &[(& str, usize)] = &[
+const HIDDEN_SIZES: &[(&str, usize)] = &[
     ("qwen_0.6b", 896),
     ("llama_1b", 2048),
     ("llama_7b", 4096),
@@ -68,7 +68,8 @@ fn bench_rmsnorm(c: &mut Criterion) {
 
             group.bench_with_input(BenchmarkId::from_parameter(&id), &(), |b, _| {
                 b.iter(|| {
-                    let result = candle_nn::ops::rms_norm(&x, &weight, eps as f32).expect("rmsnorm");
+                    let result =
+                        candle_nn::ops::rms_norm(&x, &weight, eps as f32).expect("rmsnorm");
                     device.synchronize().ok();
                     bb(result.elem_count())
                 });
@@ -106,7 +107,8 @@ fn bench_rmsnorm_contiguous(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(*model_name), &(), |b, _| {
             b.iter(|| {
                 let x_contig = x.contiguous().expect("contiguous");
-                let result = candle_nn::ops::rms_norm(&x_contig, &weight, eps as f32).expect("rmsnorm");
+                let result =
+                    candle_nn::ops::rms_norm(&x_contig, &weight, eps as f32).expect("rmsnorm");
                 device.synchronize().ok();
                 bb(result.elem_count())
             });
@@ -129,9 +131,24 @@ struct RopeConfig {
 }
 
 const ROPE_CONFIGS: &[RopeConfig] = &[
-    RopeConfig { name: "llama_7b", head_dim: 128, num_heads: 32, max_position: 4096 },
-    RopeConfig { name: "mistral_7b", head_dim: 128, num_heads: 32, max_position: 8192 },
-    RopeConfig { name: "qwen_0.6b", head_dim: 64, num_heads: 14, max_position: 4096 },
+    RopeConfig {
+        name: "llama_7b",
+        head_dim: 128,
+        num_heads: 32,
+        max_position: 4096,
+    },
+    RopeConfig {
+        name: "mistral_7b",
+        head_dim: 128,
+        num_heads: 32,
+        max_position: 8192,
+    },
+    RopeConfig {
+        name: "qwen_0.6b",
+        head_dim: 64,
+        num_heads: 14,
+        max_position: 4096,
+    },
 ];
 
 /// Precompute RoPE cos/sin tables
@@ -168,8 +185,14 @@ fn bench_rope_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("rope_lookup");
 
     for config in ROPE_CONFIGS {
-        let (cos, sin) = create_rope_tables(config.head_dim, config.max_position, 10000.0, &device, dtype)
-            .expect("rope tables");
+        let (cos, sin) = create_rope_tables(
+            config.head_dim,
+            config.max_position,
+            10000.0,
+            &device,
+            dtype,
+        )
+        .expect("rope tables");
 
         for &seq_len in &[1usize, 64, 256, 1024] {
             let offset = 100usize; // Typical decode position
@@ -199,19 +222,35 @@ fn bench_rope_apply(c: &mut Criterion) {
     group.sample_size(50);
 
     for config in ROPE_CONFIGS {
-        let (cos, sin) = create_rope_tables(config.head_dim, config.max_position, 10000.0, &device, dtype)
-            .expect("rope tables");
+        let (cos, sin) = create_rope_tables(
+            config.head_dim,
+            config.max_position,
+            10000.0,
+            &device,
+            dtype,
+        )
+        .expect("rope tables");
 
         for &seq_len in &[1usize, 64, 256] {
             // Q tensor: [batch, heads, seq_len, head_dim]
-            let q = Tensor::randn(0f32, 1f32, (1, config.num_heads, seq_len, config.head_dim), &device)
-                .expect("q")
-                .to_dtype(dtype)
-                .expect("dtype");
-            let k = Tensor::randn(0f32, 1f32, (1, config.num_heads, seq_len, config.head_dim), &device)
-                .expect("k")
-                .to_dtype(dtype)
-                .expect("dtype");
+            let q = Tensor::randn(
+                0f32,
+                1f32,
+                (1, config.num_heads, seq_len, config.head_dim),
+                &device,
+            )
+            .expect("q")
+            .to_dtype(dtype)
+            .expect("dtype");
+            let k = Tensor::randn(
+                0f32,
+                1f32,
+                (1, config.num_heads, seq_len, config.head_dim),
+                &device,
+            )
+            .expect("k")
+            .to_dtype(dtype)
+            .expect("dtype");
 
             let cos_slice = cos.narrow(0, 0, seq_len).expect("narrow cos");
             let sin_slice = sin.narrow(0, 0, seq_len).expect("narrow sin");
@@ -223,10 +262,18 @@ fn bench_rope_apply(c: &mut Criterion) {
             group.bench_with_input(BenchmarkId::from_parameter(&id), &(), |b, _| {
                 b.iter(|| {
                     // Apply RoPE using candle_nn (GPT-NeoX style)
-                    let q_embed = candle_nn::rotary_emb::rope(&q.contiguous().expect("contig"), &cos_slice, &sin_slice)
-                        .expect("rope q");
-                    let k_embed = candle_nn::rotary_emb::rope(&k.contiguous().expect("contig"), &cos_slice, &sin_slice)
-                        .expect("rope k");
+                    let q_embed = candle_nn::rotary_emb::rope(
+                        &q.contiguous().expect("contig"),
+                        &cos_slice,
+                        &sin_slice,
+                    )
+                    .expect("rope q");
+                    let k_embed = candle_nn::rotary_emb::rope(
+                        &k.contiguous().expect("contig"),
+                        &cos_slice,
+                        &sin_slice,
+                    )
+                    .expect("rope k");
                     device.synchronize().ok();
                     bb(q_embed.elem_count() + k_embed.elem_count())
                 });
@@ -249,9 +296,21 @@ struct MlpConfig {
 }
 
 const MLP_CONFIGS: &[MlpConfig] = &[
-    MlpConfig { name: "qwen_0.6b", hidden_size: 896, intermediate_size: 4864 },
-    MlpConfig { name: "llama_7b", hidden_size: 4096, intermediate_size: 11008 },
-    MlpConfig { name: "mistral_7b", hidden_size: 4096, intermediate_size: 14336 },
+    MlpConfig {
+        name: "qwen_0.6b",
+        hidden_size: 896,
+        intermediate_size: 4864,
+    },
+    MlpConfig {
+        name: "llama_7b",
+        hidden_size: 4096,
+        intermediate_size: 11008,
+    },
+    MlpConfig {
+        name: "mistral_7b",
+        hidden_size: 4096,
+        intermediate_size: 14336,
+    },
 ];
 
 /// Benchmark: MLP gate projection (hidden -> intermediate)
@@ -271,10 +330,15 @@ fn bench_mlp_projection(c: &mut Criterion) {
                 .expect("dtype");
 
             // Weight: [intermediate_size, hidden_size]
-            let w = Tensor::randn(0f32, 1f32, (config.intermediate_size, config.hidden_size), &device)
-                .expect("w")
-                .to_dtype(dtype)
-                .expect("dtype");
+            let w = Tensor::randn(
+                0f32,
+                1f32,
+                (config.intermediate_size, config.hidden_size),
+                &device,
+            )
+            .expect("w")
+            .to_dtype(dtype)
+            .expect("dtype");
 
             let id = format!("{}_{}_gate", config.name, seq_len);
             let flops = 2 * seq_len * config.hidden_size * config.intermediate_size;
@@ -314,7 +378,9 @@ fn bench_swiglu(c: &mut Criterion) {
                 .expect("dtype");
 
             let id = format!("{}_{}", config.name, seq_len);
-            group.throughput(Throughput::Elements((seq_len * config.intermediate_size) as u64));
+            group.throughput(Throughput::Elements(
+                (seq_len * config.intermediate_size) as u64,
+            ));
 
             group.bench_with_input(BenchmarkId::from_parameter(&id), &(), |b, _| {
                 b.iter(|| {
@@ -347,22 +413,40 @@ fn bench_mlp_full(c: &mut Criterion) {
                 .expect("dtype");
 
             // Weights
-            let w_gate = Tensor::randn(0f32, 1f32, (config.intermediate_size, config.hidden_size), &device)
-                .expect("w_gate")
-                .to_dtype(dtype)
-                .expect("dtype");
-            let w_up = Tensor::randn(0f32, 1f32, (config.intermediate_size, config.hidden_size), &device)
-                .expect("w_up")
-                .to_dtype(dtype)
-                .expect("dtype");
-            let w_down = Tensor::randn(0f32, 1f32, (config.hidden_size, config.intermediate_size), &device)
-                .expect("w_down")
-                .to_dtype(dtype)
-                .expect("dtype");
+            let w_gate = Tensor::randn(
+                0f32,
+                1f32,
+                (config.intermediate_size, config.hidden_size),
+                &device,
+            )
+            .expect("w_gate")
+            .to_dtype(dtype)
+            .expect("dtype");
+            let w_up = Tensor::randn(
+                0f32,
+                1f32,
+                (config.intermediate_size, config.hidden_size),
+                &device,
+            )
+            .expect("w_up")
+            .to_dtype(dtype)
+            .expect("dtype");
+            let w_down = Tensor::randn(
+                0f32,
+                1f32,
+                (config.hidden_size, config.intermediate_size),
+                &device,
+            )
+            .expect("w_down")
+            .to_dtype(dtype)
+            .expect("dtype");
 
             let id = format!("{}_{}", config.name, seq_len);
             // FLOPs: 2 * (gate + up + down) projections
-            let flops = 2 * seq_len * (2 * config.hidden_size * config.intermediate_size + config.intermediate_size * config.hidden_size);
+            let flops = 2
+                * seq_len
+                * (2 * config.hidden_size * config.intermediate_size
+                    + config.intermediate_size * config.hidden_size);
             group.throughput(Throughput::Elements(flops as u64));
 
             group.bench_with_input(BenchmarkId::from_parameter(&id), &(), |b, _| {

@@ -330,7 +330,9 @@ impl CustomOp3 for DequantizeOp {
             ),
             (BnbDType::BF16, BnbQuantType::Nf4) => {
                 if !crate::afq::ffi::HAVE_BF16_KERNELS {
-                    candle_core::bail!("BF16 bitsandbytes kernels require compute capability 8.0+ (SM80+)");
+                    candle_core::bail!(
+                        "BF16 bitsandbytes kernels require compute capability 8.0+ (SM80+)"
+                    );
                 }
                 candle_core::CudaStorage::wrap_cuda_slice(
                     self.dispatch_cuda_kernel::<half::bf16>(
@@ -366,7 +368,9 @@ impl CustomOp3 for DequantizeOp {
             ),
             (BnbDType::BF16, BnbQuantType::Fp4) => {
                 if !crate::afq::ffi::HAVE_BF16_KERNELS {
-                    candle_core::bail!("BF16 bitsandbytes kernels require compute capability 8.0+ (SM80+)");
+                    candle_core::bail!(
+                        "BF16 bitsandbytes kernels require compute capability 8.0+ (SM80+)"
+                    );
                 }
                 candle_core::CudaStorage::wrap_cuda_slice(
                     self.dispatch_cuda_kernel::<half::bf16>(
@@ -402,7 +406,9 @@ impl CustomOp3 for DequantizeOp {
             ),
             (BnbDType::BF16, BnbQuantType::Int8) => {
                 if !crate::afq::ffi::HAVE_BF16_KERNELS {
-                    candle_core::bail!("BF16 bitsandbytes kernels require compute capability 8.0+ (SM80+)");
+                    candle_core::bail!(
+                        "BF16 bitsandbytes kernels require compute capability 8.0+ (SM80+)"
+                    );
                 }
                 candle_core::CudaStorage::wrap_cuda_slice(
                     self.dispatch_cuda_kernel::<half::bf16>(
