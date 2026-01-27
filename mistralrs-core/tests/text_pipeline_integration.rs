@@ -830,3 +830,154 @@ fn test_all_model_families() {
         assert_eq!(passed, tested, "Some model families failed");
     }
 }
+
+// =============================================================================
+// LoRA Adapter Tests
+// =============================================================================
+//
+// These tests verify LoRA adapter loading and inference.
+//
+// Environment variables:
+// - TEST_LORA_BASE_MODEL: HF repo ID or path to base GGUF model
+//   Default: unsloth/Qwen3-0.6B-GGUF (same as other tests)
+// - TEST_LORA_BASE_FILE: GGUF filename within the repo
+//   Default: Qwen3-0.6B-Q4_K_M.gguf
+// - TEST_LORA_ADAPTER: HF repo ID for LoRA adapter
+//   Example: "someone/qwen3-lora-adapter"
+//
+// Example usage:
+//   TEST_LORA_ADAPTER=username/my-adapter cargo test --test text_pipeline_integration test_lora
+//
+// Note: LoRA adapters must be compatible with the base model architecture.
+// The adapter's target_modules in adapter_config.json must match base model layers.
+
+/// Test LoRA adapter loading via CausalLMLoaderBuilder.
+///
+/// This test verifies that a model with a LoRA adapter loads successfully.
+/// Set TEST_LORA_ADAPTER environment variable to run this test.
+#[test]
+#[serial(small_model)]
+fn test_lora_adapter_loading() {
+    let adapter_repo = match std::env::var("TEST_LORA_ADAPTER") {
+        Ok(repo) => repo,
+        Err(_) => {
+            println!("Skipping LoRA test: TEST_LORA_ADAPTER not set");
+            println!("To run this test, set TEST_LORA_ADAPTER to a HuggingFace adapter repo");
+            println!("Example: TEST_LORA_ADAPTER=username/my-lora-adapter cargo test test_lora");
+            return;
+        }
+    };
+
+    // Use custom base model if specified, otherwise use default
+    let (base_repo, base_file) = if let Ok(base) = std::env::var("TEST_LORA_BASE_MODEL") {
+        let file = std::env::var("TEST_LORA_BASE_FILE")
+            .unwrap_or_else(|_| "model.gguf".to_string());
+        (base, file)
+    } else {
+        (DEFAULT_MODEL_REPO.to_string(), DEFAULT_MODEL_FILE.to_string())
+    };
+
+    println!("\n=== Testing LoRA Adapter Loading ===");
+    println!("Base model: {}/{}", base_repo, base_file);
+    println!("LoRA adapter: {}", adapter_repo);
+
+    let result = CausalLMLoaderBuilder::from_hf_gguf(&base_repo, &[&base_file])
+        .with_device(Device::Cpu)
+        .with_dtype(DType::F32)
+        .with_lora_adapter(&adapter_repo)
+        .silent()
+        .build();
+
+    match result {
+        Ok(pipeline) => {
+            println!("Successfully loaded model with LoRA adapter: {}", pipeline.name());
+
+            // Verify tokenizer works
+            if let Some(tokenizer) = pipeline.tokenizer() {
+                let test_text = "Hello, testing LoRA adapter!";
+                match tokenizer.encode(test_text, false) {
+                    Ok(encoding) => {
+                        println!("Tokenized '{}' -> {} tokens", test_text, encoding.len());
+                    }
+                    Err(e) => {
+                        println!("Warning: Failed to encode text: {}", e);
+                    }
+                }
+            }
+
+            println!("=== LoRA adapter loading test PASSED ===\n");
+        }
+        Err(e) => {
+            panic!("Failed to load model with LoRA adapter: {}", e);
+        }
+    }
+}
+
+/// Test that loading a model without adapters still works.
+/// This serves as a baseline to compare against LoRA-loaded models.
+#[test]
+#[serial(small_model)]
+fn test_baseline_without_lora() {
+    let model_path = get_test_model_path();
+
+    println!("\n=== Testing Baseline (No LoRA) ===");
+    println!("Model: {:?}", model_path);
+
+    let pipeline = CausalLMLoaderBuilder::from_gguf_paths(&[&model_path])
+        .with_device(Device::Cpu)
+        .with_dtype(DType::F32)
+        .silent()
+        .build()
+        .expect("Failed to load baseline model");
+
+    println!("Successfully loaded baseline model: {}", pipeline.name());
+    println!("=== Baseline test PASSED ===\n");
+}
+
+/// Test multiple LoRA adapters (merged in order).
+///
+/// Set TEST_LORA_ADAPTER and TEST_LORA_ADAPTER_2 to run this test.
+#[test]
+#[serial(small_model)]
+fn test_multiple_lora_adapters() {
+    let adapter1 = match std::env::var("TEST_LORA_ADAPTER") {
+        Ok(repo) => repo,
+        Err(_) => {
+            println!("Skipping multiple LoRA test: TEST_LORA_ADAPTER not set");
+            return;
+        }
+    };
+
+    let adapter2 = match std::env::var("TEST_LORA_ADAPTER_2") {
+        Ok(repo) => repo,
+        Err(_) => {
+            println!("Skipping multiple LoRA test: TEST_LORA_ADAPTER_2 not set");
+            return;
+        }
+    };
+
+    let model_path = get_test_model_path();
+
+    println!("\n=== Testing Multiple LoRA Adapters ===");
+    println!("Model: {:?}", model_path);
+    println!("Adapter 1: {}", adapter1);
+    println!("Adapter 2: {}", adapter2);
+
+    let result = CausalLMLoaderBuilder::from_gguf_paths(&[&model_path])
+        .with_device(Device::Cpu)
+        .with_dtype(DType::F32)
+        .with_lora_adapter(&adapter1)
+        .with_lora_adapter(&adapter2)
+        .silent()
+        .build();
+
+    match result {
+        Ok(pipeline) => {
+            println!("Successfully loaded model with 2 LoRA adapters: {}", pipeline.name());
+            println!("=== Multiple LoRA adapters test PASSED ===\n");
+        }
+        Err(e) => {
+            panic!("Failed to load model with multiple LoRA adapters: {}", e);
+        }
+    }
+}

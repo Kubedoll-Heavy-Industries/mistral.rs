@@ -14,7 +14,11 @@ mod qloralinear;
 mod registry;
 mod registry_linear;
 
+// Re-export registry types for future use (dynamic adapter selection)
+// These are intentionally exported even though not yet wired up internally
+#[allow(unused_imports)]
 pub use registry::{AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter};
+#[allow(unused_imports)]
 pub use registry_linear::RegistryLoraLinear;
 
 use std::collections::HashMap;
