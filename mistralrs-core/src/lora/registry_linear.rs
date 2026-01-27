@@ -583,4 +583,66 @@ mod tests {
 
         Ok(())
     }
+
+    /// Test that QuantMethod::forward() works correctly via trait.
+    ///
+    /// This verifies that RegistryLoraLinear can be used as a drop-in replacement
+    /// for any Arc<dyn QuantMethod>.
+    #[test]
+    fn test_quant_method_forward() -> Result<()> {
+        use mistralrs_quant::QuantMethod;
+
+        let device = Device::Cpu;
+        let in_features = 16;
+        let out_features = 32;
+
+        // Create base linear
+        let weight = Tensor::randn(0.0f32, 1.0, (out_features, in_features), &device)?;
+        let base = Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
+            candle_nn::Linear::new(weight, None),
+        ))?) as Arc<dyn QuantMethod>;
+
+        // Create registry and layer
+        let registry = Arc::new(AdapterRegistry::new(device.clone()));
+        let lora_layer: Arc<dyn QuantMethod> = wrap_with_lora(base, registry.clone(), 0);
+
+        // Test forward via QuantMethod trait (no adapters)
+        let input = Tensor::randn(0.0f32, 1.0, (1, 8, in_features), &device)?;
+        let output = lora_layer.forward(&input)?;
+        assert_eq!(output.dims(), &[1, 8, out_features]);
+
+        // Register and activate an adapter
+        let mut weights = AdapterWeights::new();
+        weights.add_layer(
+            0,
+            Tensor::randn(0.0f32, 0.1, (4, in_features), &device)?, // A: (rank, in)
+            Tensor::randn(0.0f32, 0.1, (out_features, 4), &device)?, // B: (out, rank)
+        );
+        registry.register("style-adapter", test_config(), weights)?;
+        registry.set_active(&["style-adapter"])?;
+
+        // Forward with adapter should also work via QuantMethod trait
+        let output_with_adapter = lora_layer.forward(&input)?;
+        assert_eq!(output_with_adapter.dims(), &[1, 8, out_features]);
+
+        // Outputs should be different (adapter adds a delta)
+        let diff = (&output - &output_with_adapter)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(diff > 0.0, "Adapter should change the output");
+
+        Ok(())
+    }
+
+    /// Test dtype_and_device delegation.
+    #[test]
+    fn test_dtype_and_device() -> Result<()> {
+        use mistralrs_quant::QuantMethod;
+
+        let (layer, _registry) = create_test_layer()?;
+        let (dtype, device) = layer.dtype_and_device();
+
+        assert_eq!(dtype, DType::F32);
+        assert!(device.is_cpu());
+
+        Ok(())
+    }
 }
