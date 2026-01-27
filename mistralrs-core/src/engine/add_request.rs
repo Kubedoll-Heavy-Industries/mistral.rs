@@ -607,6 +607,7 @@ impl Engine {
                 eos_toks,
                 None, // pipeline_continue_op_id
                 None, // logical_seq_len - normal requests use tokens.len()
+                request.input.adapters.clone(), // per-request LoRA adapters
             );
 
             // Only "track" a new sequence if it is a traditional one
@@ -1022,6 +1023,7 @@ impl Engine {
                 eos_toks,
                 None, // pipeline_continue_op_id
                 Some(initial_seq_len), // logical_seq_len - PP continuation uses initial_seq_len
+                None, // adapters - PP continuation doesn't support per-request adapters yet
             );
 
             // Set token_offset for RoPE alignment with HEAD's prefix cache offset.

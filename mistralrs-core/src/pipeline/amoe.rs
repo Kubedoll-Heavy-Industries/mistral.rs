@@ -582,5 +582,6 @@ fn new_dummy_seq(
         eos_toks,
         None, // pipeline_continue_op_id
         None, // logical_seq_len - dummy sequences use tokens.len()
+        None, // adapters - dummy sequences don't use per-request adapters
     )
 }

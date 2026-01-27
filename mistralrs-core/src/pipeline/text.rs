@@ -91,6 +91,8 @@ pub struct TextPipeline<M: LanguageModel + Send + Sync> {
     cache: EitherCache,
     /// Pipeline hook for distributed inference (PP stage communication).
     hook: Option<HookContainer>,
+    /// Adapter registry for per-request LoRA adapter selection.
+    adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
 }
 
 impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
@@ -125,6 +127,7 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
             metadata,
             cache,
             hook: None,
+            adapter_registry: None,
         }
     }
 
@@ -132,6 +135,17 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
     pub fn with_hook(mut self, hook: HookContainer) -> Self {
         self.hook = Some(hook);
         self
+    }
+
+    /// Configure per-request LoRA adapter registry.
+    pub fn with_adapter_registry(mut self, registry: Arc<crate::lora::AdapterRegistry>) -> Self {
+        self.adapter_registry = Some(registry);
+        self
+    }
+
+    /// Get the adapter registry if configured.
+    pub fn adapter_registry(&self) -> Option<&Arc<crate::lora::AdapterRegistry>> {
+        self.adapter_registry.as_ref()
     }
 
     /// Whether this stage has embedding weights (first stage).

@@ -495,6 +495,10 @@ pub struct Sequence {
     /// If Some, this request is part of a pipeline continuation and the cache
     /// should NOT be reset if this op_id has already done its first forward.
     pipeline_continue_op_id: Option<uuid::Uuid>,
+
+    /// Per-request LoRA adapters to activate for this sequence.
+    /// When set, these adapters will be activated before the forward pass.
+    adapters: Option<Vec<String>>,
 }
 
 impl BlockEngineSequence for Sequence {
@@ -608,6 +612,8 @@ impl Sequence {
         // When set, this is used for prompt_len and paged attention allocation instead of tokens.len().
         // Non-first PP stages receive hidden states, not tokens, so tokens can be empty.
         logical_seq_len: Option<usize>,
+        // Per-request LoRA adapters
+        adapters: Option<Vec<String>>,
     ) -> Self {
         // For PP continuation stages, logical_seq_len overrides tokens.len()
         let prompt_len = logical_seq_len.unwrap_or(tokens.len());
@@ -694,6 +700,7 @@ impl Sequence {
             harmony_context: None,
             think_tag_context: None,
             pipeline_continue_op_id,
+            adapters,
         }
     }
 
@@ -782,6 +789,11 @@ impl Sequence {
     /// Returns the UUID7 request ID for distributed tracing and pipeline parallelism.
     pub fn request_id(&self) -> uuid::Uuid {
         self.request_id
+    }
+
+    /// Returns the per-request LoRA adapters to activate for this sequence.
+    pub fn adapters(&self) -> Option<&[String]> {
+        self.adapters.as_deref()
     }
 
     pub fn is_running(&self) -> bool {
