@@ -153,6 +153,93 @@ where
     }
 }
 
+// ============================================================================
+// Parallel Transformer Block (Phi-2 style)
+// ============================================================================
+
+/// Parallel pre-norm transformer block (Phi-2 architecture).
+///
+/// Unlike the standard sequential block, this computes attention and FFN
+/// in parallel from the same normalized input:
+/// ```text
+/// input → norm → [attention, ffn] → attention_out + ffn_out + residual → output
+/// ```
+///
+/// This is used by Phi-2 and similar models that benefit from parallel computation.
+pub struct ParallelTransformerBlock<N, A, F> {
+    /// Single normalization layer (applied before both attention and FFN)
+    pub norm: N,
+    pub attention: A,
+    pub ffn: F,
+}
+
+impl<N, A, F> ParallelTransformerBlock<N, A, F>
+where
+    N: Module,
+    A: Attention,
+    F: FeedForward,
+{
+    /// Create a new parallel transformer block.
+    pub fn new(norm: N, attention: A, ffn: F) -> Self {
+        Self {
+            norm,
+            attention,
+            ffn,
+        }
+    }
+
+    /// Forward pass with parallel attention and FFN computation.
+    pub fn forward(
+        &self,
+        hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        cache: &mut KvCache,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        let residual = &hidden;
+
+        // Single norm applied to input
+        let x = self.norm.forward(&hidden)?;
+
+        // Move mask to same device as x (for device mapping support)
+        let mask = mask.map(|m| m.to_device(x.device()).unwrap());
+
+        // Parallel: attention and FFN both receive the same normalized input
+        let attn_out = self
+            .attention
+            .forward(&x, mask.as_ref(), cache, position_offsets, metadata)?;
+        let ffn_out = self.ffn.forward(&x)?;
+
+        // Combine: residual + attention_output + ffn_output
+        residual + attn_out + ffn_out
+    }
+
+    /// Check if this block has paged attention enabled.
+    pub fn has_paged_attn(&self) -> bool {
+        self.attention.has_paged_attn()
+    }
+}
+
+// Implement TransformerLayer trait for ParallelTransformerBlock.
+impl<N, A, F> crate::models::TransformerLayer for ParallelTransformerBlock<N, A, F>
+where
+    N: Module + Send + Sync,
+    A: Attention + Send + Sync,
+    F: FeedForward + Send + Sync,
+{
+    fn forward(
+        &self,
+        hidden: Tensor,
+        mask: Option<&Tensor>,
+        position_offsets: &[usize],
+        cache: &mut KvCache,
+        paged_attn_meta: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
+    ) -> Result<Tensor> {
+        ParallelTransformerBlock::forward(self, hidden, mask, position_offsets, cache, paged_attn_meta)
+    }
+}
+
 use crate::{
     amoe::{AnyMoeTrainableLayer, MlpLayer},
     embedding_models::embedding_gemma::EmbeddingGemmaConfig,
@@ -2418,6 +2505,92 @@ impl RotaryEmbedding {
 impl crate::attention::PositionEncoding for RotaryEmbedding {
     fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
         RotaryEmbedding::forward(self, q, k, seqlen_offsets)
+    }
+}
+
+// ============================================================================
+// Partial Rotary Embedding (Phi2-style)
+// ============================================================================
+
+/// Partial rotary embedding that applies RoPE to only part of the head dimension.
+///
+/// Some models like Phi2 apply rotary embeddings to only the first `rope_dim`
+/// dimensions of the head, leaving the rest unchanged. This struct wraps a
+/// `RotaryEmbedding` and handles the split/rotate/concat logic.
+///
+/// # Example
+/// For a head_dim=80 model with rope_dim=32:
+/// - First 32 dimensions get RoPE applied
+/// - Last 48 dimensions pass through unchanged
+#[derive(Debug, Clone)]
+pub struct PartialRotaryEmbedding {
+    /// Inner rotary embedding (created for rope_dim, not full head_dim)
+    inner: RotaryEmbedding,
+    /// Dimension to apply rotation to (first `rope_dim` dims of head)
+    rope_dim: usize,
+}
+
+impl PartialRotaryEmbedding {
+    /// Create a new partial rotary embedding.
+    ///
+    /// # Arguments
+    /// * `base` - Base frequency (theta) for RoPE
+    /// * `rope_dim` - Number of dimensions to apply RoPE to
+    /// * `max_position_embeddings` - Maximum sequence length
+    /// * `device` - Device to create tensors on
+    /// * `is_gpt_neox` - Whether to use GPT-NeoX style rotation
+    /// * `dtype` - Data type for the embeddings
+    pub fn new(
+        base: f32,
+        rope_dim: usize,
+        max_position_embeddings: usize,
+        device: &Device,
+        is_gpt_neox: bool,
+        dtype: DType,
+    ) -> Result<Self> {
+        let inner = RotaryEmbedding::new_partial(
+            base,
+            rope_dim,
+            max_position_embeddings,
+            device,
+            is_gpt_neox,
+            dtype,
+        )?;
+        Ok(Self { inner, rope_dim })
+    }
+
+    /// Forward pass: split, rotate, concat.
+    ///
+    /// Input tensors are [batch, n_heads, seq_len, head_dim].
+    /// Output tensors have the same shape.
+    pub fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        // Split into rotated and pass-through parts
+        // q/k shape: [batch, n_heads, seq_len, head_dim]
+        let q_rot = q.narrow(candle_core::D::Minus1, 0, self.rope_dim)?;
+        let q_pass = q.narrow(candle_core::D::Minus1, self.rope_dim, q.dim(candle_core::D::Minus1)? - self.rope_dim)?;
+
+        let k_rot = k.narrow(candle_core::D::Minus1, 0, self.rope_dim)?;
+        let k_pass = k.narrow(candle_core::D::Minus1, self.rope_dim, k.dim(candle_core::D::Minus1)? - self.rope_dim)?;
+
+        // Apply RoPE to rotated parts only
+        let (q_rotated, k_rotated) = self.inner.forward(&q_rot, &k_rot, seqlen_offsets)?;
+
+        // Concatenate back: rotated + pass-through
+        let q_out = Tensor::cat(&[&q_rotated, &q_pass], candle_core::D::Minus1)?;
+        let k_out = Tensor::cat(&[&k_rotated, &k_pass], candle_core::D::Minus1)?;
+
+        Ok((q_out, k_out))
+    }
+}
+
+impl crate::attention::PositionEncoding for PartialRotaryEmbedding {
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+        PartialRotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
 

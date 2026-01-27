@@ -280,6 +280,29 @@ impl CausalAttention {
         self.paged_attn.is_some()
     }
 
+    // =========================================================================
+    // Mutable Accessors (for ISQ quantization)
+    // =========================================================================
+
+    /// Get mutable references to all projection weights (for ISQ).
+    /// Returns (q_proj, k_proj, v_proj, o_proj).
+    #[allow(clippy::type_complexity)]
+    pub fn projections_mut(
+        &mut self,
+    ) -> (
+        &mut Arc<dyn QuantMethod>,
+        &mut Arc<dyn QuantMethod>,
+        &mut Arc<dyn QuantMethod>,
+        &mut Arc<dyn QuantMethod>,
+    ) {
+        (
+            &mut self.q_proj,
+            &mut self.k_proj,
+            &mut self.v_proj,
+            &mut self.o_proj,
+        )
+    }
+
     /// Forward pass through the attention layer.
     ///
     /// # Arguments

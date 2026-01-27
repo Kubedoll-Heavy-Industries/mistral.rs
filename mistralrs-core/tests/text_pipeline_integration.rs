@@ -2,6 +2,9 @@
 //!
 //! By default, tests download Qwen3-0.6B-Q4_K_M from HuggingFace Hub.
 //! To use a different model, set `TEST_GGUF_MODEL=/path/to/model.gguf`.
+//!
+//! **Note**: Tests are annotated with `#[serial]` to prevent parallel execution,
+//! which could overload the system when loading multiple models simultaneously.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -9,6 +12,7 @@ use std::sync::OnceLock;
 use candle_core::{DType, Device, Tensor};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use mistralrs_core::{load_text_pipeline, AttentionImplementation, GgufLoader, MetadataMixin};
+use serial_test::serial;
 
 /// Default test model: Qwen3-0.6B quantized (small, fast to load)
 const DEFAULT_MODEL_REPO: &str = "unsloth/Qwen3-0.6B-GGUF";
@@ -45,6 +49,7 @@ fn get_test_model_path() -> PathBuf {
 }
 
 #[test]
+#[serial]
 fn test_load_text_pipeline_basic() {
     let model_path = get_test_model_path();
 
@@ -75,6 +80,7 @@ fn test_load_text_pipeline_basic() {
 }
 
 #[test]
+#[serial]
 fn test_load_text_pipeline_with_layer_range() {
     let model_path = get_test_model_path();
 
@@ -107,6 +113,7 @@ fn test_load_text_pipeline_with_layer_range() {
 }
 
 #[test]
+#[serial]
 fn test_load_text_pipeline_forward_pass() {
     let model_path = get_test_model_path();
 
@@ -149,6 +156,7 @@ fn test_load_text_pipeline_forward_pass() {
 }
 
 #[test]
+#[serial]
 fn test_architecture_detection() {
     let model_path = get_test_model_path();
 
@@ -264,6 +272,7 @@ fn test_pp_stage_detection_tail() {
 }
 
 #[test]
+#[serial]
 fn test_pp_head_and_tail_stage_loading() {
     let model_path = get_test_model_path();
 
@@ -336,6 +345,7 @@ fn test_pp_head_and_tail_stage_loading() {
 use mistralrs_core::CausalLMLoaderBuilder;
 
 #[test]
+#[serial]
 fn test_builder_from_paths() {
     let model_path = get_test_model_path();
 
@@ -353,6 +363,7 @@ fn test_builder_from_paths() {
 }
 
 #[test]
+#[serial]
 fn test_builder_with_layer_range() {
     let model_path = get_test_model_path();
 
@@ -389,6 +400,7 @@ fn test_builder_with_layer_range() {
 }
 
 #[test]
+#[serial]
 fn test_builder_from_hf_gguf() {
     // This test downloads from HuggingFace Hub
     // Using the same small model as other tests
@@ -410,6 +422,7 @@ fn test_builder_from_hf_gguf() {
 }
 
 #[test]
+#[serial]
 fn test_builder_build_async() {
     // Test build_async() which returns Arc<Mutex<dyn Pipeline>>
     let model_path = get_test_model_path();
@@ -440,6 +453,7 @@ fn test_builder_build_async() {
 use mistralrs_core::{CausalLMLoader, DeviceMapSetting, Loader, ModelDType, TokenSource, LoaderBuilder, ModelSelected};
 
 #[test]
+#[serial]
 fn test_loader_builder_gguf_uses_causal_lm_loader() {
     // Test that LoaderBuilder with ModelSelected::GGUF creates a working loader
     // This validates the migration from GGUFLoader to CausalLMLoader
@@ -471,6 +485,7 @@ fn test_loader_builder_gguf_uses_causal_lm_loader() {
 }
 
 #[test]
+#[serial]
 fn test_causal_lm_loader_from_hf() {
     // Test CausalLMLoader implementing Loader trait
     println!("Testing CausalLMLoader::load_model_from_hf()");
@@ -659,6 +674,7 @@ fn find_model_family(name: &str) -> Option<&'static ModelTestInfo> {
 }
 
 #[test]
+#[serial]
 fn test_llama_family() {
     let info = find_model_family("Llama").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -669,6 +685,7 @@ fn test_llama_family() {
 }
 
 #[test]
+#[serial]
 fn test_mixtral_family() {
     let info = find_model_family("Mixtral").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -679,6 +696,7 @@ fn test_mixtral_family() {
 }
 
 #[test]
+#[serial]
 fn test_qwen2_family() {
     let info = find_model_family("Qwen2").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -689,6 +707,7 @@ fn test_qwen2_family() {
 }
 
 #[test]
+#[serial]
 fn test_qwen3_family() {
     let info = find_model_family("Qwen3").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -699,6 +718,7 @@ fn test_qwen3_family() {
 }
 
 #[test]
+#[serial]
 fn test_phi2_family() {
     let info = find_model_family("Phi2").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -709,6 +729,7 @@ fn test_phi2_family() {
 }
 
 #[test]
+#[serial]
 fn test_phi3_family() {
     let info = find_model_family("Phi3").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -719,6 +740,7 @@ fn test_phi3_family() {
 }
 
 #[test]
+#[serial]
 fn test_mistral3_family() {
     let info = find_model_family("Mistral3").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -729,6 +751,7 @@ fn test_mistral3_family() {
 }
 
 #[test]
+#[serial]
 fn test_starcoder2_family() {
     let info = find_model_family("Starcoder2").unwrap();
     if std::env::var(info.env_var).is_ok() {
@@ -739,6 +762,7 @@ fn test_starcoder2_family() {
 }
 
 #[test]
+#[serial]
 fn test_all_model_families() {
     println!("\n=== Testing All Available Model Families ===\n");
 

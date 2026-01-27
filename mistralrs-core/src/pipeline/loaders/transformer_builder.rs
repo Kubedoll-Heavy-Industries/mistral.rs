@@ -1350,8 +1350,8 @@ where
         let down_proj = mistralrs_quant::linear_no_bias(intermediate_size, hidden_size, &quant_cfg, vb_mlp.pp("down_proj"))?;
 
         // Load normalization layers
-        let attn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(&naming.attn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
-        let ffn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(&naming.ffn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
+        let attn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(naming.attn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
+        let ffn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(naming.ffn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
 
         // Build layer config
         let layer_config = LayerConfig::new(
