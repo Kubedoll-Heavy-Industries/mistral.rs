@@ -1027,6 +1027,7 @@ impl Pipeline for GGUFPipeline {
             flash_meta_full,
             request_id,
             inference_step,
+            adapters: _, // TODO: wire up per-request adapter selection in GGUFPipeline
         } = *inputs.downcast().expect("Downcast failed.");
 
         // Set request context on hook BEFORE forward (proper design: context on hook, not threaded through model)

@@ -777,6 +777,8 @@ pub mod text_models_inputs_processor {
         pub flash_meta_full: Option<FlashParams>,
         pub request_id: uuid::Uuid,
         pub inference_step: InferenceStep,
+        /// Per-request LoRA adapters (from first sequence in batch).
+        pub adapters: Option<Vec<String>>,
     }
 
     pub struct TextInputsProcessor;
@@ -864,6 +866,7 @@ pub mod text_models_inputs_processor {
                     flash_meta_full: Some(flash_meta_full),
                     request_id: input_seqs[0].request_id(),
                     inference_step,
+                    adapters: input_seqs[0].adapters().map(|a| a.to_vec()),
                 });
                 Ok(InputProcessorOutput {
                     inputs,
@@ -913,6 +916,7 @@ pub mod text_models_inputs_processor {
                     flash_meta_full: Some(flash_meta),
                     request_id: input_seqs[0].request_id(),
                     inference_step,
+                    adapters: input_seqs[0].adapters().map(|a| a.to_vec()),
                 });
                 Ok(InputProcessorOutput {
                     inputs,
@@ -991,6 +995,7 @@ pub mod text_models_inputs_processor {
                     flash_meta_full: None,
                     request_id: input_seqs[0].request_id(),
                     inference_step,
+                    adapters: input_seqs[0].adapters().map(|a| a.to_vec()),
                 });
                 Ok(InputProcessorOutput {
                     inputs,
@@ -1041,6 +1046,7 @@ pub mod text_models_inputs_processor {
                     flash_meta_full: None,
                     request_id: input_seqs[0].request_id(),
                     inference_step,
+                    adapters: input_seqs[0].adapters().map(|a| a.to_vec()),
                 });
                 Ok(InputProcessorOutput {
                     inputs,

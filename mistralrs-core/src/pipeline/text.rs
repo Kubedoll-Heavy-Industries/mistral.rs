@@ -412,7 +412,13 @@ impl<M: LanguageModel + Send + Sync + 'static> Pipeline for TextPipeline<M> {
             flash_meta_full: _,
             request_id,
             inference_step,
+            adapters,
         } = *inputs.downcast().expect("Downcast failed.");
+
+        // Activate per-request LoRA adapters if configured
+        if let (Some(registry), Some(adapter_names)) = (&self.adapter_registry, &adapters) {
+            registry.set_active(&adapter_names)?;
+        }
 
         // Set request context on hook BEFORE forward
         if let Some(hook) = self.hook.as_ref() {

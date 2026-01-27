@@ -1193,6 +1193,7 @@ impl Pipeline for SafetensorsPipeline {
             flash_meta_full,
             request_id,  // Capture request_id for hook orchestration
             inference_step,  // Used for prefill/decode detection in pipeline
+            adapters: _, // TODO: wire up per-request adapter selection in SafetensorsPipeline
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
