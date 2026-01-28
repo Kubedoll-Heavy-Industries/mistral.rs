@@ -47,11 +47,11 @@ use crate::utils::{
     tokens::get_token,
     varbuilder_utils::from_mmaped_safetensors,
 };
-use crate::xlora_models::NonGranularState;
+// NonGranularState removed - XLoRA via SafetensorsPipeline is deprecated
 use crate::{
-    api_dir_list, api_get_file, get_mut_arcmutex, get_paths, get_uqff_paths, lora_model_loader,
-    normal_model_loader, normal_model_loader_sharded, xlora_model_loader, DeviceMapSetting,
-    PagedAttentionConfig, Pipeline, Topology, TryIntoDType, GLOBAL_HF_CACHE,
+    api_dir_list, api_get_file, get_paths, get_uqff_paths, lora_model_loader,
+    normal_model_loader, normal_model_loader_sharded, DeviceMapSetting, PagedAttentionConfig,
+    Pipeline, Topology, TryIntoDType, GLOBAL_HF_CACHE,
 };
 use anyhow::Result;
 use candle_core::{Device, Tensor, Var};
@@ -79,7 +79,6 @@ pub struct SafetensorsPipeline {
     tokenizer: Arc<Tokenizer>,
     no_kv_cache: bool,
     chat_template: Arc<ChatTemplate>,
-    non_granular_state: Option<NonGranularState>,
     model_id: String,
     metadata: Arc<GeneralMetadata>,
     topology: Option<Topology>,
@@ -192,6 +191,29 @@ impl SafetensorsLoaderBuilder {
         self
     }
 
+    /// Configure XLoRA adapter loading.
+    ///
+    /// # Deprecated
+    ///
+    /// XLoRA support via `SafetensorsLoader` is deprecated. Use `CausalLMLoaderBuilder`
+    /// with `.with_xlora()` instead, which provides a cleaner typed pipeline approach.
+    ///
+    /// ```ignore
+    /// // Old way (deprecated):
+    /// let loader = SafetensorsLoaderBuilder::new(...)
+    ///     .with_xlora(xlora_model_id, order, false, None)
+    ///     .build()?;
+    ///
+    /// // New way:
+    /// let pipeline = CausalLMLoaderBuilder::from_hf_safetensors(model_id)
+    ///     .with_xlora(xlora_repo_id)
+    ///     .build()
+    ///     .await?;
+    /// ```
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use CausalLMLoaderBuilder::with_xlora() instead"
+    )]
     pub fn with_xlora(
         mut self,
         xlora_model_id: String,
@@ -655,20 +677,12 @@ impl Loader for SafetensorsLoader {
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
-                } => xlora_model_loader!(
-                    paths,
-                    Some(dtype),
-                    &load_device,
-                    layer_devices.clone(),
-                    config,
-                    self.inner,
-                    silent,
-                    mapper,
-                    loading_isq,
-                    device.clone(),
-                    multi_progress.clone(),
-                    matformer_slicing_config.clone(),
-                ),
+                } => {
+                    anyhow::bail!(
+                        "XLoRA via SafetensorsLoader is deprecated. \
+                         Use CausalLMLoaderBuilder::with_xlora() instead."
+                    );
+                }
                 ModelKind::Adapter {
                     adapter: AdapterKind::Lora,
                 } => lora_model_loader!(
@@ -712,20 +726,12 @@ impl Loader for SafetensorsLoader {
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
-                } => xlora_model_loader!(
-                    paths,
-                    Some(dtype),
-                    &load_device,
-                    layer_devices.clone(),
-                    config,
-                    self.inner,
-                    silent,
-                    mapper,
-                    loading_isq,
-                    device.clone(),
-                    multi_progress.clone(),
-                    matformer_slicing_config.clone(),
-                ),
+                } => {
+                    anyhow::bail!(
+                        "XLoRA via SafetensorsLoader is deprecated. \
+                         Use CausalLMLoaderBuilder::with_xlora() instead."
+                    );
+                }
                 ModelKind::Adapter {
                     adapter: AdapterKind::Lora,
                 } => lora_model_loader!(
@@ -1013,12 +1019,6 @@ impl Loader for SafetensorsLoader {
             tokenizer: tokenizer.into(),
             no_kv_cache: self.no_kv_cache,
             chat_template: Arc::new(chat_template),
-            non_granular_state: self.tgt_non_granular_index.map(|tgt_non_granular_index| {
-                NonGranularState {
-                    non_granular_index: Arc::new(Mutex::new(0)),
-                    tgt_non_granular_index,
-                }
-            }),
             model_id: self.model_id.clone(),
             metadata: Arc::new(GeneralMetadata {
                 max_seq_len,
@@ -1137,9 +1137,8 @@ impl CacheManagerMixin for SafetensorsPipeline {
                 load_preallocated_cache,
             ),
         }
-        if reset_non_granular {
-            self.reset_non_granular_state()
-        }
+        // reset_non_granular parameter deprecated - XLoRA state removed
+        let _ = reset_non_granular;
     }
     fn cache(&self) -> &EitherCache {
         self.model.cache()
@@ -1157,10 +1156,7 @@ impl MetadataMixin for SafetensorsPipeline {
         self.model_id.clone()
     }
     fn reset_non_granular_state(&self) {
-        if let Some(s) = self.non_granular_state.as_ref() {
-            *self.cache().full().get_scalings_cache() = None;
-            *get_mut_arcmutex!(s.non_granular_index) = 0;
-        }
+        // XLoRA via SafetensorsPipeline is deprecated - no-op
     }
     fn get_metadata(&self) -> Arc<GeneralMetadata> {
         self.metadata.clone()
@@ -1185,15 +1181,15 @@ impl Pipeline for SafetensorsPipeline {
             input_ids,
             input_ids_full,
             seqlen_offsets,
-            seqlen_offsets_full,
+            seqlen_offsets_full: _, // XLoRA-only, deprecated
             context_lens,
             position_ids,
             paged_attn_meta,
             flash_meta,
-            flash_meta_full,
-            request_id,     // Capture request_id for hook orchestration
-            inference_step, // Used for prefill/decode detection in pipeline
-            adapters: _,    // TODO: wire up per-request adapter selection in SafetensorsPipeline
+            flash_meta_full: _, // XLoRA-only, deprecated
+            request_id,         // Capture request_id for hook orchestration
+            inference_step,     // Used for prefill/decode detection in pipeline
+            adapters: _,        // TODO: wire up per-request adapter selection in SafetensorsPipeline
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
@@ -1326,18 +1322,12 @@ impl Pipeline for SafetensorsPipeline {
                     )?
                 }
             }
-            true => self.model.xlora_forward(
-                &input_ids,
-                input_ids_full.as_ref().unwrap_or(&input_ids),
-                &seqlen_offsets,
-                seqlen_offsets_full.as_ref().unwrap_or(&seqlen_offsets),
-                self.no_kv_cache,
-                &self.non_granular_state,
-                context_lens.clone(),
-                position_ids,
-                &flash_meta,
-                flash_meta_full.as_ref().unwrap_or(&flash_meta),
-            )?,
+            true => {
+                candle_core::bail!(
+                    "XLoRA via SafetensorsPipeline is deprecated. \
+                     Use CausalLMLoaderBuilder::with_xlora() instead for XLoRA support."
+                );
+            }
         };
 
         if return_raw_logits {

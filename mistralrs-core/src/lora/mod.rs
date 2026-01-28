@@ -33,8 +33,24 @@ pub use xlora_classifier::XLoraClassifier;
 pub use xlora_config::XLoraConfig;
 
 use std::collections::HashMap;
+use tokio::sync::Mutex;
 
 use crate::layers;
+
+/// State for non-granular XLoRA inference.
+///
+/// # Deprecated
+///
+/// This is part of the legacy XLoRA infrastructure. Use `XLoraClassifier` with
+/// `TextPipeline` or `CausalLMLoaderBuilder` for XLoRA support instead.
+#[deprecated(
+    since = "0.8.0",
+    note = "Use XLoraClassifier with CausalLMLoaderBuilder instead"
+)]
+pub struct NonGranularState {
+    pub non_granular_index: Arc<Mutex<usize>>,
+    pub tgt_non_granular_index: usize,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PreloadAdapter {

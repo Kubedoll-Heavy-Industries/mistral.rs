@@ -8,6 +8,8 @@ use std::{
 
 use crate::{attention::ATTENTION_CHUNK_SIZE, matformer::MatformerSliceConfig};
 
+#[allow(deprecated)]
+use crate::lora::NonGranularState;
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     device_map::DeviceMapper,
@@ -19,7 +21,6 @@ use crate::{
         EitherCache, HookContainer, IsqModel,
     },
     utils::varbuilder_utils::DeviceForLoadTensor,
-    xlora_models::NonGranularState,
 };
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -33,10 +34,9 @@ use pyo3::pyclass;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::{
-    models::{self, TransformContext},
-    xlora_models::{self, XLoraConfig},
-};
+#[allow(deprecated)]
+use crate::xlora_models::{self, XLoraConfig};
+use crate::models::{self, TransformContext};
 
 use super::{AutoDeviceMapParams, DeviceMappedModelLoader};
 
@@ -56,21 +56,39 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> candle_core::Result<Tensor>;
+    /// XLoRA forward pass.
+    ///
+    /// # Deprecated
+    ///
+    /// XLoRA via NormalModel is deprecated. Use `CausalLMLoaderBuilder::with_xlora()`
+    /// with `TextPipeline` instead.
     #[allow(clippy::too_many_arguments)]
     fn xlora_forward(
         &self,
-        input_ids: &Tensor,
-        input_ids_full: &Tensor,
-        seqlen_offsets: &[usize],
-        seqlen_offsets_full: &[usize],
-        no_kv_cache: bool,
-        non_granular_state: &Option<NonGranularState>,
-        context_lens: Vec<(usize, usize)>,
-        position_ids: Vec<usize>,
-        flash_params: &FlashParams,
-        flash_params_full: &FlashParams,
-    ) -> candle_core::Result<Tensor>;
-    fn is_xlora(&self) -> bool;
+        _input_ids: &Tensor,
+        _input_ids_full: &Tensor,
+        _seqlen_offsets: &[usize],
+        _seqlen_offsets_full: &[usize],
+        _no_kv_cache: bool,
+        _non_granular_state: &Option<NonGranularState>,
+        _context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        _flash_params: &FlashParams,
+        _flash_params_full: &FlashParams,
+    ) -> candle_core::Result<Tensor> {
+        candle_core::bail!(
+            "XLoRA via NormalModel is deprecated. Use CausalLMLoaderBuilder::with_xlora() instead."
+        )
+    }
+
+    /// Check if this is an XLoRA model.
+    ///
+    /// # Deprecated
+    ///
+    /// Always returns false. XLoRA support moved to `TextPipeline` orchestration.
+    fn is_xlora(&self) -> bool {
+        false
+    }
     fn device(&self) -> &Device;
     fn cache(&self) -> &EitherCache;
     fn cache_mut(&mut self) -> &mut EitherCache;
@@ -161,17 +179,28 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>>;
+    /// Load an XLoRA model.
+    ///
+    /// # Deprecated
+    ///
+    /// XLoRA loading via `NormalModelLoader` is deprecated. Use
+    /// `CausalLMLoaderBuilder::with_xlora()` instead.
     #[allow(clippy::too_many_arguments)]
     fn load_xlora(
         &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>>;
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        anyhow::bail!(
+            "XLoRA loading via NormalModelLoader is deprecated. \
+             Use CausalLMLoaderBuilder::with_xlora() instead."
+        )
+    }
     fn is_gptx(&self, config: &str) -> Result<bool>;
     fn supports_paged_attention(&self, _config: &str) -> Result<bool> {
         Ok(true)

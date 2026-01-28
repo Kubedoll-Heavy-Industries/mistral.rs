@@ -14,8 +14,6 @@ mod quantized_llama;
 mod quantized_phi3;
 mod starcoder2;
 
-use std::sync::Arc;
-
 use crate::{
     lora::Ordering,
     pipeline::{text_models_inputs_processor::FlashParams, EitherCache},
@@ -32,16 +30,14 @@ pub(crate) use phi3::Model as XLoraPhi3;
 pub(crate) use quantized_llama::ModelWeights as XLoraQLlama;
 pub(crate) use quantized_phi3::ModelWeights as XLoraQPhi3;
 pub(crate) use starcoder2::Model as XLoraStarcoder2;
-use tokio::sync::Mutex;
 
 use crate::{get_mut_arcmutex, pipeline::Cache};
 
 use self::classifier::XLoraClassifier;
 
-pub struct NonGranularState {
-    pub non_granular_index: Arc<Mutex<usize>>,
-    pub tgt_non_granular_index: usize,
-}
+// Re-export NonGranularState from lora module for backwards compatibility
+#[allow(deprecated)]
+pub use crate::lora::NonGranularState;
 
 trait ScalingsMaker {
     fn get_classifier(&self) -> &XLoraClassifier;
