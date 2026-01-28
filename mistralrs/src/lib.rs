@@ -1,3 +1,6 @@
+// Allow deprecated APIs during migration to typed loader builders
+#![allow(deprecated)]
+
 //! This crate provides an asynchronous API to `mistral.rs`.
 //!
 //! To get started loading a model, check out the following builders:

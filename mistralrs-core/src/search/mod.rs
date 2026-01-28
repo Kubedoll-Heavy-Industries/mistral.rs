@@ -23,8 +23,7 @@ pub type SearchCallbackFuture =
 /// vector must be sorted in decreasing order of relevance.
 ///
 /// The callback is async to support non-blocking network calls.
-pub type SearchCallback =
-    dyn Fn(SearchFunctionParameters) -> SearchCallbackFuture + Send + Sync;
+pub type SearchCallback = dyn Fn(SearchFunctionParameters) -> SearchCallbackFuture + Send + Sync;
 
 pub(crate) fn search_tool_called(name: &str) -> bool {
     name == SEARCH_TOOL_NAME || name == EXTRACT_TOOL_NAME

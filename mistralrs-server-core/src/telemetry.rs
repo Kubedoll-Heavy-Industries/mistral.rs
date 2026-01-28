@@ -306,6 +306,7 @@ pub fn record_token_usage(span: &tracing::Span, prompt_tokens: usize, completion
 ///
 /// Note: OTel recommends native span timing for duration. The custom timing
 /// attributes provide additional granularity (prompt vs completion phases).
+#[allow(clippy::too_many_arguments)]
 pub fn record_full_usage(
     span: &tracing::Span,
     prompt_tokens: usize,
@@ -389,6 +390,7 @@ pub fn record_ttft_event(ttft: std::time::Duration, model_name: &str) {
 ///
 /// This records the inference parameters used for generation, following
 /// OpenInference and OTel GenAI semantic conventions.
+#[allow(clippy::too_many_arguments)]
 pub fn record_sampling_params(
     span: &tracing::Span,
     temperature: Option<f64>,

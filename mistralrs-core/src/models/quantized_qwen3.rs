@@ -197,9 +197,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         let meta = ct.get_metadata();
         let arch: String = {
             use crate::utils::gguf_metadata::TryValueInto;
-            meta.get("general.architecture")
-                .cloned()
-                .try_value_into()?
+            meta.get("general.architecture").cloned().try_value_into()?
         };
         if arch != "qwen3" {
             candle_core::bail!("Expected `qwen3` architecture, got `{arch}`.");
@@ -230,9 +228,19 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         // Load output weights (tie to embeddings if not present)
         let output = if weights.has_tensor(&naming.output()) {
-            weights.load_linear(&naming.output(), config.hidden_size, config.vocab_size, device)?
+            weights.load_linear(
+                &naming.output(),
+                config.hidden_size,
+                config.vocab_size,
+                device,
+            )?
         } else {
-            weights.load_linear(&naming.token_embd(), config.hidden_size, config.vocab_size, device)?
+            weights.load_linear(
+                &naming.token_embd(),
+                config.hidden_size,
+                config.vocab_size,
+                device,
+            )?
         };
 
         // Load transformer layers using generic infrastructure with Qwen3-specific customizer
@@ -329,7 +337,12 @@ impl TransformerModel for ModelWeights {
         standard_embed(self, tokens)
     }
 
-    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
         standard_transform(self, hidden, ctx, cache)
     }
 }
@@ -352,7 +365,9 @@ impl TransformerModelExt for ModelWeights {
     }
 
     fn mapper(&self) -> Option<&dyn DeviceMapper> {
-        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+        self.mapper
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn DeviceMapper)
     }
 
     fn model_dtype(&self) -> DType {

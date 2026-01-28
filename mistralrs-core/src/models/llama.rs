@@ -365,7 +365,9 @@ impl TransformerModelExt for Llama {
     }
 
     fn mapper(&self) -> Option<&dyn DeviceMapper> {
-        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+        self.mapper
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn DeviceMapper)
     }
 
     fn model_dtype(&self) -> DType {
@@ -418,7 +420,16 @@ impl Llama {
         let dtype = vb.dtype();
 
         // Use FromSafetensors implementation
-        Self::from_safetensors(cfg, vb, device, mapper, attention_mechanism, dtype, None, None)
+        Self::from_safetensors(
+            cfg,
+            vb,
+            device,
+            mapper,
+            attention_mechanism,
+            dtype,
+            None,
+            None,
+        )
     }
 
     /// Get input embeddings for tokens.
@@ -457,10 +468,11 @@ impl Llama {
         let seq_len = input_embeds.dim(1)?;
         let position_offset = seqlen_offsets.first().copied().unwrap_or(0);
 
-        let paged_attn_ctx = metadata.map(|(kv_cache, meta)| crate::models::PagedAttentionContext {
-            kv_cache,
-            metadata: meta,
-        });
+        let paged_attn_ctx =
+            metadata.map(|(kv_cache, meta)| crate::models::PagedAttentionContext {
+                kv_cache,
+                metadata: meta,
+            });
 
         let ctx = TransformContext {
             seq_len,

@@ -17,11 +17,11 @@ pub(crate) mod llg;
 pub mod loaders;
 mod macros;
 pub mod model_traits;
-mod safetensors;
 mod paths;
 mod processing;
 mod rerank;
 mod response;
+mod safetensors;
 mod sampling;
 mod speculative;
 mod speech;
@@ -39,8 +39,6 @@ pub use auto::{AutoLoader, AutoLoaderBuilder};
 use chat_template::ChatTemplate;
 pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
 pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
-#[allow(unused_imports)]
-pub use rerank::{RerankInputs, RerankLoader, RerankPipeline};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
 #[allow(unused_imports)]
@@ -48,22 +46,22 @@ pub use gguf_embedding::{
     GGUFEmbeddingLoader, GGUFEmbeddingLoaderBuilder, GGUFEmbeddingSpecificConfig,
 };
 use image::DynamicImage;
-pub use inputs_processor::InputProcessorOutput;
 pub use inputs_processor::text_models_inputs_processor::InferenceStep;
+pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;
 pub use isq::{parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER};
 use llguidance::toktrie::TokEnv;
 pub use loaders::{
     estimate_kv_cache_bytes, load_text_pipeline, AdapterKind, AutoDeviceMapParams,
-    CausalLMLoader, CausalLMLoaderBuilder, AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader,
-    DeepSeekV2Loader, DeepSeekV3Loader,
-    DeviceMappedModelLoader, DiffusionLoaderType, DiffusionModel, DiffusionModelLoader,
-    EmbeddingGemmaLoader, EmbeddingLoaderType, EmbeddingModel, EmbeddingModelLoader,
-    EmbeddingModelPaths, EmbeddingModule, EmbeddingModulePaths, EmbeddingModuleType, FluxLoader,
-    GgufContentConfig, GgufLoader, GgufMetadata, GLM4Loader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader,
-    GptOssLoader, GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader,
-    MistralLoader, MixtralLoader, ModelKind, ModelPaths, NonMappedSubModel, NormalLoaderType,
+    AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader, CausalLMLoader, CausalLMLoaderBuilder,
+    DeepSeekV2Loader, DeepSeekV3Loader, DeviceMappedModelLoader, DiffusionLoaderType,
+    DiffusionModel, DiffusionModelLoader, EmbeddingGemmaLoader, EmbeddingLoaderType,
+    EmbeddingModel, EmbeddingModelLoader, EmbeddingModelPaths, EmbeddingModule,
+    EmbeddingModulePaths, EmbeddingModuleType, FluxLoader, GLM4Loader, Gemma2Loader, Gemma3Loader,
+    Gemma3nLoader, GemmaLoader, GgufContentConfig, GgufLoader, GgufMetadata, GptOssLoader,
+    GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
+    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader,
+    MixtralLoader, ModelKind, ModelPaths, NonMappedSubModel, NormalLoaderType,
     NormalLoadingMetadata, NormalModel, NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader,
     Phi3_5MoELoader, Phi4MMLoader, PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader,
     Qwen2_5VLLoader, Qwen3EmbeddingLoader, Qwen3Loader, Qwen3MoELoader, Qwen3VLLoader,
@@ -71,16 +69,20 @@ pub use loaders::{
     VisionLoaderType, VisionModel, VisionModelLoader,
 };
 use mistralrs_quant::IsqType;
-pub use safetensors::{SafetensorsLoader, SafetensorsLoaderBuilder, SafetensorsConfig};
+#[allow(unused_imports)]
+pub use rerank::{RerankInputs, RerankLoader, RerankPipeline};
+pub use safetensors::{SafetensorsConfig, SafetensorsLoader, SafetensorsLoaderBuilder};
 // Backwards compatibility aliases (deprecated)
-#[allow(deprecated)]
-pub use safetensors::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
+pub use causal_lm::CausalLMPipeline;
+pub use hooks::{ActivationResult, HookContainer, LayerActivation, PipelineHook};
 pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths};
 pub use paths::{AdapterPaths, LoraAdapterPaths};
 pub(crate) use processing::{
     apply_chat_template, BasicProcessor, MessagesAction, Processor, ProcessorCreator,
 };
 use rand_isaac::Isaac64Rng;
+#[allow(deprecated)]
+pub use safetensors::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;
@@ -88,11 +90,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+pub use text::TextPipeline;
 use tokenizers::Tokenizer;
 pub use vision::{VisionLoader, VisionLoaderBuilder, VisionSpecificConfig};
-pub use hooks::{ActivationResult, HookContainer, LayerActivation, PipelineHook};
-pub use text::TextPipeline;
-pub use causal_lm::CausalLMPipeline;
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, Var};
@@ -501,7 +501,10 @@ impl ForwardInputsResult {
                 channels: vec![channels[bs_idx]],
             }),
             Self::PipelineCompleted { reason } => Ok(Self::PipelineCompleted { reason: *reason }),
-            Self::PipelineLogits { logits, inference_step } => Ok(Self::PipelineLogits {
+            Self::PipelineLogits {
+                logits,
+                inference_step,
+            } => Ok(Self::PipelineLogits {
                 logits: logits.i(bs_idx)?,
                 inference_step: inference_step.clone(),
             }),
@@ -531,7 +534,10 @@ impl ForwardInputsResult {
             Self::Image { .. } => Ok(self.clone()),
             Self::Speech { .. } => Ok(self.clone()),
             Self::PipelineCompleted { reason } => Ok(Self::PipelineCompleted { reason: *reason }),
-            Self::PipelineLogits { logits, inference_step } => Ok(Self::PipelineLogits {
+            Self::PipelineLogits {
+                logits,
+                inference_step,
+            } => Ok(Self::PipelineLogits {
                 logits: logits.to_device(device)?,
                 inference_step: inference_step.clone(),
             }),
@@ -578,8 +584,10 @@ pub trait Pipeline:
     ) -> Result<Tensor, candle_core::Error> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
-                let InputProcessorOutput { inputs, .. } =
-                    self.get_processor().inputs_processor().process_inputs(
+                let InputProcessorOutput { inputs, .. } = self
+                    .get_processor()
+                    .inputs_processor()
+                    .process_inputs(
                         self.tokenizer(),
                         input_seqs,
                         is_prompt,
@@ -591,7 +599,8 @@ pub trait Pipeline:
                         self.get_input_processor_config(),
                         None,
                         self.device_mapper(),
-                    ).map_err(candle_core::Error::msg)?;
+                    )
+                    .map_err(candle_core::Error::msg)?;
 
                 match pre_op {
                     CacheInstruction::In => self.clone_in_cache(input_seqs),
@@ -641,8 +650,10 @@ pub trait Pipeline:
                     .expect("PagedAttention must have cache engines.")
                     .execute_scheduler_ops(&blocks_to_copy)?;
 
-                let InputProcessorOutput { inputs, .. } =
-                    self.get_processor().inputs_processor().process_inputs(
+                let InputProcessorOutput { inputs, .. } = self
+                    .get_processor()
+                    .inputs_processor()
+                    .process_inputs(
                         self.tokenizer(),
                         input_seqs,
                         is_prompt,
@@ -654,7 +665,8 @@ pub trait Pipeline:
                         self.get_input_processor_config(),
                         Some(metadata),
                         self.device_mapper(),
-                    ).map_err(candle_core::Error::msg)?;
+                    )
+                    .map_err(candle_core::Error::msg)?;
 
                 let result = self.forward_inputs(inputs, false)?;
 
@@ -687,8 +699,13 @@ pub trait Pipeline:
     ) -> Result<Duration, candle_core::Error> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
-                let InputProcessorOutput { inputs, seq_indices } =
-                    self.get_processor().inputs_processor().process_inputs(
+                let InputProcessorOutput {
+                    inputs,
+                    seq_indices,
+                } = self
+                    .get_processor()
+                    .inputs_processor()
+                    .process_inputs(
                         self.tokenizer(),
                         input_seqs,
                         is_prompt,
@@ -700,7 +717,8 @@ pub trait Pipeline:
                         self.get_input_processor_config(),
                         None,
                         self.device_mapper(),
-                    ).map_err(candle_core::Error::msg)?;
+                    )
+                    .map_err(candle_core::Error::msg)?;
 
                 match pre_op {
                     CacheInstruction::In => self.clone_in_cache(input_seqs),
@@ -736,7 +754,15 @@ pub trait Pipeline:
                     _ => unreachable!("Unreachable POST cache op."),
                 }
 
-                self.handle_result(input_seqs, result, seq_indices, prefix_cacher, disable_eos_stop, rng).await?;
+                self.handle_result(
+                    input_seqs,
+                    result,
+                    seq_indices,
+                    prefix_cacher,
+                    disable_eos_stop,
+                    rng,
+                )
+                .await?;
                 Ok(exec_duration)
             }
             CacheBackendMetadata::PagedAttention {
@@ -749,8 +775,13 @@ pub trait Pipeline:
                     .expect("PagedAttention must have cache engines.")
                     .execute_scheduler_ops(&blocks_to_copy)?;
 
-                let InputProcessorOutput { inputs, seq_indices } =
-                    self.get_processor().inputs_processor().process_inputs(
+                let InputProcessorOutput {
+                    inputs,
+                    seq_indices,
+                } = self
+                    .get_processor()
+                    .inputs_processor()
+                    .process_inputs(
                         self.tokenizer(),
                         input_seqs,
                         is_prompt,
@@ -762,13 +793,22 @@ pub trait Pipeline:
                         self.get_input_processor_config(),
                         Some(metadata),
                         self.device_mapper(),
-                    ).map_err(candle_core::Error::msg)?;
+                    )
+                    .map_err(candle_core::Error::msg)?;
 
                 let start = Instant::now();
                 let result = self.forward_inputs(inputs, return_raw_logits)?;
                 let exec_duration = start.elapsed();
 
-                self.handle_result(input_seqs, result, seq_indices, prefix_cacher, disable_eos_stop, rng).await?;
+                self.handle_result(
+                    input_seqs,
+                    result,
+                    seq_indices,
+                    prefix_cacher,
+                    disable_eos_stop,
+                    rng,
+                )
+                .await?;
                 Ok(exec_duration)
             }
         }
@@ -804,7 +844,10 @@ pub trait Pipeline:
                     // For PP decode steps, increment token_offset after forward completes.
                     for seq in input_seqs.iter_mut() {
                         if seq.return_raw_logits
-                            && matches!(seq.getstate(), crate::sequence::SequenceState::RunningCompletion)
+                            && matches!(
+                                seq.getstate(),
+                                crate::sequence::SequenceState::RunningCompletion
+                            )
                         {
                             seq.increment_token_offset();
                         }
@@ -815,16 +858,27 @@ pub trait Pipeline:
                         .into_iter()
                         .map(|idx| logits.i(idx).unwrap())
                         .collect();
-                    self.sample_causal_gen(input_seqs, logits_list, prefix_cacher, disable_eos_stop, rng).await?;
+                    self.sample_causal_gen(
+                        input_seqs,
+                        logits_list,
+                        prefix_cacher,
+                        disable_eos_stop,
+                        rng,
+                    )
+                    .await?;
                 }
             }
             ForwardInputsResult::Embeddings { embeddings } => {
                 let emb_list: Vec<Vec<f32>> = seq_indices
                     .into_iter()
                     .map(|idx| {
-                        embeddings.i(idx).unwrap()
-                            .to_dtype(DType::F32).unwrap()
-                            .to_vec1().unwrap()
+                        embeddings
+                            .i(idx)
+                            .unwrap()
+                            .to_dtype(DType::F32)
+                            .unwrap()
+                            .to_vec1()
+                            .unwrap()
                     })
                     .collect();
                 response::send_embedding_responses(input_seqs, emb_list).await?;
@@ -834,7 +888,14 @@ pub trait Pipeline:
                     .into_iter()
                     .map(|idx| logits.i(idx).unwrap())
                     .collect();
-                self.sample_causal_gen(input_seqs, logits_list, prefix_cacher, disable_eos_stop, rng).await?;
+                self.sample_causal_gen(
+                    input_seqs,
+                    logits_list,
+                    prefix_cacher,
+                    disable_eos_stop,
+                    rng,
+                )
+                .await?;
             }
             ForwardInputsResult::Image { images } => {
                 let img_list: Vec<DynamicImage> = seq_indices
@@ -843,14 +904,23 @@ pub trait Pipeline:
                     .collect();
                 response::send_image_responses(input_seqs, img_list).await?;
             }
-            ForwardInputsResult::Speech { pcms, rates, channels } => {
+            ForwardInputsResult::Speech {
+                pcms,
+                rates,
+                channels,
+            } => {
                 let (p, r, c): (Vec<_>, Vec<_>, Vec<_>) = seq_indices
                     .into_iter()
                     .map(|idx| (pcms[idx].clone(), rates[idx], channels[idx]))
-                    .fold((vec![], vec![], vec![]), |(mut p, mut r, mut c), (pcm, rate, ch)| {
-                        p.push(pcm); r.push(rate); c.push(ch);
-                        (p, r, c)
-                    });
+                    .fold(
+                        (vec![], vec![], vec![]),
+                        |(mut p, mut r, mut c), (pcm, rate, ch)| {
+                            p.push(pcm);
+                            r.push(rate);
+                            c.push(ch);
+                            (p, r, c)
+                        },
+                    );
                 response::send_speech_responses(input_seqs, &p, &r, &c).await?;
             }
             ForwardInputsResult::Rerank { .. } => {
@@ -863,7 +933,10 @@ pub trait Pipeline:
                     seq.set_state(crate::sequence::SequenceState::Done(reason));
                 }
             }
-            ForwardInputsResult::PipelineLogits { logits, inference_step } => {
+            ForwardInputsResult::PipelineLogits {
+                logits,
+                inference_step,
+            } => {
                 // Pipeline parallelism: TAIL stage logits with InferenceStep state machine.
                 // The InferenceStep (computed from activation shape) drives state transition.
                 let raw_logits: Vec<Vec<Tensor>> = seq_indices

@@ -195,7 +195,9 @@ impl TeiBackend {
 }
 
 // Re-export core types for convenience
-pub use text_embeddings_backend_core::{Embedding as TeiEmbedding, BackendError as TeiBackendError};
+pub use text_embeddings_backend_core::{
+    BackendError as TeiBackendError, Embedding as TeiEmbedding,
+};
 
 /// Specifies whether to load an embedding or reranking model
 #[derive(Debug, Clone, Copy, Default)]

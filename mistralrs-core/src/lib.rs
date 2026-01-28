@@ -9,9 +9,12 @@ pub use engine::{
     EngineInstruction, SearchEmbeddingModel, ENGINE_INSTRUCTIONS, TERMINATE_ALL_NEXT_STEP,
 };
 use hf_hub::Cache;
-pub use lora::{wrap_with_lora, AdapterRegistry, Ordering, RegistryLoraLinear};
-pub use pipeline::{AutoregressivePipeline, ModelCategory, ModelCategoryKind};
+pub use lora::{
+    wrap_with_lora, AdapterRegistry, AdapterWeights, Ordering, RegistryLoraLinear,
+    PROJECTIONS_PER_LAYER,
+};
 pub use pipeline::Pipeline;
+pub use pipeline::{AutoregressivePipeline, ModelCategory, ModelCategoryKind};
 #[cfg(feature = "pyo3_macros")]
 use pyo3::exceptions::PyValueError;
 use std::collections::HashMap;
@@ -35,9 +38,9 @@ mod device_map;
 mod engine;
 mod lora;
 mod model_loader;
-pub mod profiling;
 mod moe;
 mod ops;
+pub mod profiling;
 pub use model_loader::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
 };
@@ -90,7 +93,6 @@ pub use tei_backend::{
 pub use tei_backend::{TeiBackendError, TeiEmbedding};
 
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
-pub use sequence::StopReason;
 pub use device_map::{
     DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, LayerDeviceMapper,
     SingleDeviceMapper,
@@ -128,19 +130,20 @@ pub use pipeline::{
     VisionLoader, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
     UQFF_MULTI_FILE_DELIMITER,
 };
+pub use sequence::StopReason;
 // Backwards compatibility re-exports (deprecated)
 #[allow(deprecated)]
 pub use pipeline::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub use request::{
-    ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
-    DetokenizeInput, InferenceExec, InferenceInput, InferenceOperation, LlguidanceGrammar,
-    MessageContent, ChatAttachment, NormalRequest, PipelineContinueInput, PipelineContinueRequest,
-    ReasoningEffort, Request, SearchContextSize, ThinkingMode, TokenizationRequest, TokenizeInput,
-    WebSearchOptions, WebSearchUserLocation,
+    ApproximateUserLocation, ChatAttachment, Constraint, DetokenizationRequest, DetokenizeInput,
+    ImageGenerationResponseFormat, InferenceExec, InferenceInput, InferenceOperation,
+    LlguidanceGrammar, MessageContent, NormalRequest, PipelineContinueInput,
+    PipelineContinueRequest, ReasoningEffort, Request, SearchContextSize, ThinkingMode,
+    TokenizationRequest, TokenizeInput, WebSearchOptions, WebSearchUserLocation,
 };
 pub use response::*;
 pub use sampler::{
-    CustomLogitsProcessor, DryTokenSamplingParams, TokenSamplingParams, StopTokens, TopLogprob,
+    CustomLogitsProcessor, DryTokenSamplingParams, StopTokens, TokenSamplingParams, TopLogprob,
 };
 pub use scheduler::{DefaultSchedulerMethod, SchedulerConfig};
 pub use search::{SearchCallback, SearchCallbackFuture, SearchFunctionParameters, SearchResult};

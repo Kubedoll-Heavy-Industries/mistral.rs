@@ -69,8 +69,7 @@ impl Engine {
                     !self.tool_callbacks.is_empty() || !self.tool_callbacks_with_tools.is_empty();
                 let has_search = match &request.input.op {
                     InferenceOperation::Chat {
-                        web_search_options,
-                        ..
+                        web_search_options, ..
                     } => web_search_options.is_some(),
                     _ => false,
                 };
@@ -104,14 +103,9 @@ impl Engine {
         response: &tokio::sync::mpsc::Sender<Response>,
     ) -> (Vec<u32>, String) {
         let pipeline = &*get_mut_arcmutex!(self.pipeline);
-        let template = pipeline.get_processor().process(
-            pipeline,
-            messages,
-            true,
-            true,
-            thinking,
-            tools,
-        );
+        let template = pipeline
+            .get_processor()
+            .process(pipeline, messages, true, true, thinking, tools);
         match template {
             Ok((toks, txt)) => (toks, txt),
             Err(e) => {
@@ -130,9 +124,12 @@ impl Engine {
         response: &tokio::sync::mpsc::Sender<Response>,
     ) -> Option<(Vec<u32>, String)> {
         let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
-            send_error_none!(response, Response::ValidationError(
-                "Completion requests require the pipeline to have a tokenizer".into()
-            ));
+            send_error_none!(
+                response,
+                Response::ValidationError(
+                    "Completion requests require the pipeline to have a tokenizer".into()
+                )
+            );
         };
 
         let prompt = tokenizer
@@ -189,9 +186,12 @@ impl Engine {
             ) => (),
             (ModelCategory::Rerank, InferenceOperation::Rerank { .. }) => (),
             _ => {
-                send_error!(request.response, Response::ValidationError(
-                    "Received a request incompatible for this model's category.".into()
-                ));
+                send_error!(
+                    request.response,
+                    Response::ValidationError(
+                        "Received a request incompatible for this model's category.".into()
+                    )
+                );
             }
         }
 
@@ -257,18 +257,14 @@ impl Engine {
                 ..
             } => {
                 let tools = tools.clone().unwrap_or_default();
-                self.handle_chat(
-                    messages.clone(),
-                    thinking.clone(),
-                    tools,
-                    &request.response,
-                )
-                .await
+                self.handle_chat(messages.clone(), thinking.clone(), tools, &request.response)
+                    .await
             }
             InferenceOperation::Completion { text, .. }
             | InferenceOperation::Embedding { prompt: text } => {
-                let Some((prompt_tokens, prompt_text)) =
-                    self.handle_text_generation(text.clone(), &request.response).await
+                let Some((prompt_tokens, prompt_text)) = self
+                    .handle_text_generation(text.clone(), &request.response)
+                    .await
                 else {
                     return;
                 };
@@ -295,9 +291,10 @@ impl Engine {
             }
         };
         if prompt_tokens.is_empty() {
-            send_error!(request.response, Response::ValidationError(
-                "Received an empty prompt.".into()
-            ));
+            send_error!(
+                request.response,
+                Response::ValidationError("Received an empty prompt.".into())
+            );
         }
 
         if matches!(
@@ -321,12 +318,15 @@ impl Engine {
                 // If user specified max_len (generation length), reserve that many tokens (capped to max_len)
                 // Otherwise, reserve just 1 token minimum to allow at least some generation
                 let sampling_max = match &request.input.op {
-                    InferenceOperation::Chat { sampling_params, .. }
-                    | InferenceOperation::Completion { sampling_params, .. }
-                    | InferenceOperation::CompletionTokens { sampling_params, .. } => sampling_params
-                        .max_len
-                        .unwrap_or(1)
-                        .min(max_len),
+                    InferenceOperation::Chat {
+                        sampling_params, ..
+                    }
+                    | InferenceOperation::Completion {
+                        sampling_params, ..
+                    }
+                    | InferenceOperation::CompletionTokens {
+                        sampling_params, ..
+                    } => sampling_params.max_len.unwrap_or(1).min(max_len),
                     _ => 1,
                 };
 
@@ -350,9 +350,15 @@ impl Engine {
         }
 
         let sampling_params = match &request.input.op {
-            InferenceOperation::Chat { sampling_params, .. }
-            | InferenceOperation::Completion { sampling_params, .. }
-            | InferenceOperation::CompletionTokens { sampling_params, .. } => sampling_params,
+            InferenceOperation::Chat {
+                sampling_params, ..
+            }
+            | InferenceOperation::Completion {
+                sampling_params, ..
+            }
+            | InferenceOperation::CompletionTokens {
+                sampling_params, ..
+            } => sampling_params,
             _ => &TokenSamplingParams::deterministic(),
         };
 
@@ -420,9 +426,13 @@ impl Engine {
 
                 for stop_txt in s {
                     let Some(tokenizer) = &tokenizer else {
-                        send_error!(request.response, Response::ValidationError(
-                            "Completion requests require the pipeline to have a tokenizer".into()
-                        ));
+                        send_error!(
+                            request.response,
+                            Response::ValidationError(
+                                "Completion requests require the pipeline to have a tokenizer"
+                                    .into()
+                            )
+                        );
                     };
                     let encoded = tokenizer.encode_fast(stop_txt.to_string(), true);
                     let toks = handle_seq_error!(encoded, request.response)
@@ -468,9 +478,10 @@ impl Engine {
         };
 
         if sampling_params.n_choices == 0 {
-            send_error!(request.response, Response::ValidationError(
-                "n_choices must be greater than 0".into()
-            ));
+            send_error!(
+                request.response,
+                Response::ValidationError("n_choices must be greater than 0".into())
+            );
         }
 
         // Add sequences
@@ -482,9 +493,10 @@ impl Engine {
             let recognizer = match Self::build_sequence_recognizer(&factory, constraint) {
                 Ok(recognizer) => recognizer,
                 Err(err) => {
-                    send_error!(request.response, Response::ValidationError(
-                        format!("Invalid grammar. {err}").into()
-                    ));
+                    send_error!(
+                        request.response,
+                        Response::ValidationError(format!("Invalid grammar. {err}").into())
+                    );
                 }
             };
 
@@ -535,9 +547,14 @@ impl Engine {
                     match k_seq_cache {
                         Ok(x) => x,
                         Err(_) => {
-                            send_error!(request.response, Response::InternalError(
-                                "Failed to allocate preallocated KV cache.".to_string().into()
-                            ));
+                            send_error!(
+                                request.response,
+                                Response::InternalError(
+                                    "Failed to allocate preallocated KV cache."
+                                        .to_string()
+                                        .into()
+                                )
+                            );
                         }
                     }
                 };
@@ -549,9 +566,14 @@ impl Engine {
                     match v_seq_cache {
                         Ok(x) => x,
                         Err(_) => {
-                            send_error!(request.response, Response::InternalError(
-                                "Failed to allocate preallocated KV cache.".to_string().into()
-                            ));
+                            send_error!(
+                                request.response,
+                                Response::InternalError(
+                                    "Failed to allocate preallocated KV cache."
+                                        .to_string()
+                                        .into()
+                                )
+                            );
                         }
                     }
                 };
@@ -577,11 +599,15 @@ impl Engine {
                 stop_strings.clone(),
                 sampling_params.max_len,
                 match &request.input.op {
-                    InferenceOperation::Chat { return_logprobs, .. }
-                    | InferenceOperation::Completion { return_logprobs, .. }
-                    | InferenceOperation::CompletionTokens { return_logprobs, .. } => {
-                        *return_logprobs
+                    InferenceOperation::Chat {
+                        return_logprobs, ..
                     }
+                    | InferenceOperation::Completion {
+                        return_logprobs, ..
+                    }
+                    | InferenceOperation::CompletionTokens {
+                        return_logprobs, ..
+                    } => *return_logprobs,
                     _ => false,
                 },
                 get_mut_arcmutex!(self.pipeline).get_metadata().is_xlora,
@@ -605,7 +631,7 @@ impl Engine {
                 seq_preallocated_cache,
                 return_raw_logits,
                 eos_toks,
-                None, // pipeline_continue_op_id
+                None,                           // pipeline_continue_op_id
                 None, // logical_seq_len - normal requests use tokens.len()
                 request.input.adapters.clone(), // per-request LoRA adapters
             );
@@ -741,11 +767,12 @@ impl Engine {
                     messages,
                     request.input.add_generation_prompt,
                     request.input.add_special_tokens,
-                    match (request.input.enable_thinking, request.input.reasoning_effort) {
+                    match (
+                        request.input.enable_thinking,
+                        request.input.reasoning_effort,
+                    ) {
                         (Some(b), None) => Some(crate::request::ThinkingMode::Bool(b)),
-                        (None, Some(effort)) => {
-                            Some(crate::request::ThinkingMode::Effort(effort))
-                        }
+                        (None, Some(effort)) => Some(crate::request::ThinkingMode::Effort(effort)),
                         (Some(_b), Some(effort)) => {
                             Some(crate::request::ThinkingMode::Effort(effort))
                         }
@@ -856,9 +883,12 @@ impl Engine {
                 truncate,
             } => (query.clone(), documents.clone(), *truncate),
             _ => {
-                send_error!(request.response, Response::InternalError(
-                    "handle_rerank_request called with non-Rerank message".into()
-                ));
+                send_error!(
+                    request.response,
+                    Response::InternalError(
+                        "handle_rerank_request called with non-Rerank message".into()
+                    )
+                );
             }
         };
 
@@ -887,9 +917,12 @@ impl Engine {
                 let scores_vec = match scores.to_vec1::<f32>() {
                     Ok(v) => v,
                     Err(e) => {
-                        send_error!(request.response, Response::InternalError(
-                            format!("Failed to convert scores: {e}").into()
-                        ));
+                        send_error!(
+                            request.response,
+                            Response::InternalError(
+                                format!("Failed to convert scores: {e}").into()
+                            )
+                        );
                     }
                 };
 
@@ -904,14 +937,18 @@ impl Engine {
                     .unwrap_or_else(|_| warn!("Receiver disconnected"));
             }
             Ok(_) => {
-                send_error!(request.response, Response::InternalError(
-                    "RerankPipeline returned unexpected result type".into()
-                ));
+                send_error!(
+                    request.response,
+                    Response::InternalError(
+                        "RerankPipeline returned unexpected result type".into()
+                    )
+                );
             }
             Err(e) => {
-                send_error!(request.response, Response::InternalError(
-                    format!("Reranking failed: {e}").into()
-                ));
+                send_error!(
+                    request.response,
+                    Response::InternalError(format!("Reranking failed: {e}").into())
+                );
             }
         }
     }
@@ -979,7 +1016,9 @@ impl Engine {
 
             let sampling_params = request.input.sampling_params.clone();
 
-            let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(1, false, false, None)));
+            let group = Arc::new(tokio::sync::Mutex::new(SequenceGroup::new(
+                1, false, false, None,
+            )));
 
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1021,7 +1060,7 @@ impl Engine {
                 None, // seq_preallocated_cache
                 true, // return_raw_logits
                 eos_toks,
-                None, // pipeline_continue_op_id
+                None,                  // pipeline_continue_op_id
                 Some(initial_seq_len), // logical_seq_len - PP continuation uses initial_seq_len
                 None, // adapters - PP continuation doesn't support per-request adapters yet
             );
@@ -1088,5 +1127,4 @@ impl Engine {
         // Engine::run() will do the actual forward pass - the hook blocks until
         // activation data is available (which we just set above)
     }
-
 }

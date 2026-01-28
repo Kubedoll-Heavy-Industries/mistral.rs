@@ -114,9 +114,9 @@ where
 
         // Move mask to same device as x (for device mapping support)
         let mask = mask.map(|m| m.to_device(x.device()).unwrap());
-        let attn_out = self
-            .attention
-            .forward(&x, mask.as_ref(), cache, position_offsets, metadata)?;
+        let attn_out =
+            self.attention
+                .forward(&x, mask.as_ref(), cache, position_offsets, metadata)?;
         let x = (attn_out + residual)?;
 
         // FFN with pre-norm and residual
@@ -206,9 +206,9 @@ where
         let mask = mask.map(|m| m.to_device(x.device()).unwrap());
 
         // Parallel: attention and FFN both receive the same normalized input
-        let attn_out = self
-            .attention
-            .forward(&x, mask.as_ref(), cache, position_offsets, metadata)?;
+        let attn_out =
+            self.attention
+                .forward(&x, mask.as_ref(), cache, position_offsets, metadata)?;
         let ffn_out = self.ffn.forward(&x)?;
 
         // Combine: residual + attention_output + ffn_output
@@ -236,7 +236,14 @@ where
         cache: &mut KvCache,
         paged_attn_meta: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        ParallelTransformerBlock::forward(self, hidden, mask, position_offsets, cache, paged_attn_meta)
+        ParallelTransformerBlock::forward(
+            self,
+            hidden,
+            mask,
+            position_offsets,
+            cache,
+            paged_attn_meta,
+        )
     }
 }
 
@@ -2503,7 +2510,12 @@ impl RotaryEmbedding {
 }
 
 impl crate::attention::PositionEncoding for RotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         RotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
@@ -2572,10 +2584,18 @@ impl PartialRotaryEmbedding {
         // Split into rotated and pass-through parts
         // q/k shape: [batch, n_heads, seq_len, head_dim]
         let q_rot = q.narrow(candle_core::D::Minus1, 0, self.rope_dim)?;
-        let q_pass = q.narrow(candle_core::D::Minus1, self.rope_dim, q.dim(candle_core::D::Minus1)? - self.rope_dim)?;
+        let q_pass = q.narrow(
+            candle_core::D::Minus1,
+            self.rope_dim,
+            q.dim(candle_core::D::Minus1)? - self.rope_dim,
+        )?;
 
         let k_rot = k.narrow(candle_core::D::Minus1, 0, self.rope_dim)?;
-        let k_pass = k.narrow(candle_core::D::Minus1, self.rope_dim, k.dim(candle_core::D::Minus1)? - self.rope_dim)?;
+        let k_pass = k.narrow(
+            candle_core::D::Minus1,
+            self.rope_dim,
+            k.dim(candle_core::D::Minus1)? - self.rope_dim,
+        )?;
 
         // Apply RoPE to rotated parts only
         let (q_rotated, k_rotated) = self.inner.forward(&q_rot, &k_rot, seqlen_offsets)?;
@@ -2589,7 +2609,12 @@ impl PartialRotaryEmbedding {
 }
 
 impl crate::attention::PositionEncoding for PartialRotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         PartialRotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
@@ -2781,7 +2806,12 @@ impl GptOssRotaryEmbedding {
 }
 
 impl crate::attention::PositionEncoding for GptOssRotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         GptOssRotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
@@ -2791,31 +2821,56 @@ impl crate::attention::PositionEncoding for GptOssRotaryEmbedding {
 // ============================================================================
 
 impl crate::attention::PositionEncoding for Llama3RotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         self.0.forward(q, k, seqlen_offsets)
     }
 }
 
 impl crate::attention::PositionEncoding for SmolLm3RotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         self.0.forward(q, k, seqlen_offsets)
     }
 }
 
 impl crate::attention::PositionEncoding for Gemma3nRotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         self.0.forward(q, k, seqlen_offsets)
     }
 }
 
 impl crate::attention::PositionEncoding for Gemma3RotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         self.0.forward(q, k, seqlen_offsets)
     }
 }
 
 impl crate::attention::PositionEncoding for DeepSeekV2RotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         DeepSeekV2RotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
@@ -3259,7 +3314,11 @@ pub struct NonGatedMlp {
 
 impl NonGatedMlp {
     /// Create from pre-loaded weight tensors (for GGUF models).
-    pub fn from_weights(up: Arc<dyn QuantMethod>, down: Arc<dyn QuantMethod>, act: Activation) -> Self {
+    pub fn from_weights(
+        up: Arc<dyn QuantMethod>,
+        down: Arc<dyn QuantMethod>,
+        act: Activation,
+    ) -> Self {
         Self { up, down, act }
     }
 }

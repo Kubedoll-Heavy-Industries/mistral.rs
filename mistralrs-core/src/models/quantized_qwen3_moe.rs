@@ -19,7 +19,9 @@ use std::sync::Arc;
 use crate::attention::SdpaParams;
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{self, Activation, CausalMasker, FeedForward, MatMul, RmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{
+    self, Activation, CausalMasker, FeedForward, MatMul, RmsNorm, RotaryEmbedding, Sdpa,
+};
 use crate::layers_masker::PastKvLenCache;
 use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
 use crate::moe::routing::{RoutingConfig, SoftmaxTopK};
@@ -33,7 +35,10 @@ use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module};
-use mistralrs_quant::{ColumnParallelLayer, GgufMatMul, QuantMethod, QuantMethodConfig, QuantizedConfig, ReplicatedLayer, RowParallelLayer, ShardedVarBuilder};
+use mistralrs_quant::{
+    ColumnParallelLayer, GgufMatMul, QuantMethod, QuantMethodConfig, QuantizedConfig,
+    ReplicatedLayer, RowParallelLayer, ShardedVarBuilder,
+};
 
 // Default fallback for models that don't specify context_length
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
@@ -99,7 +104,6 @@ impl Config {
             && (self.num_experts > 0 && (layer_idx + 1) % self.decoder_sparse_step == 0)
     }
 }
-
 
 /// Unified FFN layer for Qwen3 MoE models.
 ///
@@ -394,11 +398,7 @@ fn load_gguf_experts<R: std::io::Seek + std::io::Read>(
     let down_chunks = down_exps.dequantize(device)?.chunk(num_experts, 0)?;
     let up_chunks = up_exps.dequantize(device)?.chunk(num_experts, 0)?;
 
-    for ((gate, down), up) in gate_chunks
-        .into_iter()
-        .zip(down_chunks)
-        .zip(up_chunks)
-    {
+    for ((gate, down), up) in gate_chunks.into_iter().zip(down_chunks).zip(up_chunks) {
         gate_proj.push(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
             q_weight: Arc::new(QTensor::quantize(&gate, gate_type)?),
             b: None,
@@ -477,7 +477,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
         // PP: Only load norm and output (LM head) for last stage
         let is_last_stage = layer_end >= total_layers;
         let norm = if is_last_stage {
-            Some(RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
+            Some(RmsNorm::from_qtensor(
+                ct.tensor("output_norm.weight", device)?,
+                rms_norm_eps,
+            )?)
         } else {
             None
         };
@@ -544,7 +547,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             {
                 // Load MoE gate
                 let gate = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?),
+                    q_weight: Arc::new(
+                        ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?,
+                    ),
                     b: None,
                 })?) as Arc<dyn QuantMethod>;
 
@@ -658,10 +663,13 @@ impl ModelConfig::FromGGUF for ModelWeights {
             layers,
             norm,
             output: output.map(|q_tensor| {
-                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(q_tensor),
-                    b: None,
-                }).unwrap()) as Arc<dyn QuantMethod>
+                Arc::new(
+                    GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(q_tensor),
+                        b: None,
+                    })
+                    .unwrap(),
+                ) as Arc<dyn QuantMethod>
             }),
             device: device.clone(),
             max_seq_len,
@@ -800,11 +808,8 @@ impl ModelConfig::FromSafetensors for ModelWeights {
                 &comm,
                 vb_attn.pp("q_proj"),
             )?;
-            let kv_shard = mistralrs_quant::compute_kv_shard(
-                cfg.num_key_value_heads,
-                head_dim,
-                &comm,
-            );
+            let kv_shard =
+                mistralrs_quant::compute_kv_shard(cfg.num_key_value_heads, head_dim, &comm);
             let attention_wk = ColumnParallelLayer::new_with_shard(
                 cfg.hidden_size,
                 cfg.num_key_value_heads * head_dim,
@@ -943,8 +948,7 @@ impl ModelWeights {
             let x = layer.attention_norm.forward(&hidden)?;
             let attn = layer.forward_attn(
                 &x,
-                mask.map(|m| m.to_device(x.device()).unwrap())
-                    .as_ref(),
+                mask.map(|m| m.to_device(x.device()).unwrap()).as_ref(),
                 position_offsets,
                 &mut cache[i],
                 metadata
@@ -987,7 +991,12 @@ impl TransformerModel for ModelWeights {
         self.tok_embeddings.forward(tokens)
     }
 
-    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
         let seq_len = hidden.dim(1)?;
         let start_offsets: Vec<usize> = vec![ctx.position_offset];
 

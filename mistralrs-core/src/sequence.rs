@@ -632,7 +632,8 @@ impl Sequence {
             custom_metadata.append_tokens_to_blocks(vec![0usize; seq_len]);
         } else {
             // Normal path: allocate blocks based on actual tokens
-            custom_metadata.append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
+            custom_metadata
+                .append_tokens_to_blocks(tokens.iter().map(|x| *x as usize).collect::<Vec<_>>());
         }
         Self {
             tokens,
@@ -1828,8 +1829,6 @@ impl SequenceGroup {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// Helper struct for testing chunked prefill without full Sequence construction.
     /// Mirrors the relevant fields and methods from Sequence.
     struct ChunkedPrefillState {

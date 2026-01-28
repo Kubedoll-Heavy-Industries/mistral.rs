@@ -773,7 +773,7 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
-                layer_range: None,  // TOML config doesn't support layer_range yet
+                layer_range: None, // TOML config doesn't support layer_range yet
             },
             args.no_kv_cache,
             args.jinja_explicit,
@@ -800,7 +800,7 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
-                layer_range: None,  // TOML config doesn't support layer_range yet
+                layer_range: None, // TOML config doesn't support layer_range yet
             },
             args.no_kv_cache,
             args.jinja_explicit,
@@ -833,7 +833,7 @@ fn loader_from_selected(
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
-                layer_range: None,  // TOML config doesn't support layer_range yet
+                layer_range: None, // TOML config doesn't support layer_range yet
             },
             args.no_kv_cache,
             args.jinja_explicit,

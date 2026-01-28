@@ -165,7 +165,12 @@ pub trait PipelineHook: Send + Sync {
     /// * `request_id` - The request UUID (UUID7) for correlation
     /// * `total_prompt_tokens` - Total tokens in the complete prompt (not per-chunk)
     /// * `starting_position` - RoPE starting position (prefix cache offset from HEAD)
-    fn init_pipeline_request(&self, _request_id: uuid::Uuid, _total_prompt_tokens: usize, _starting_position: usize) {
+    fn init_pipeline_request(
+        &self,
+        _request_id: uuid::Uuid,
+        _total_prompt_tokens: usize,
+        _starting_position: usize,
+    ) {
         // Default: no-op
     }
 
@@ -274,7 +279,12 @@ impl HookContainer {
     /// * `request_id` - Request UUID for correlation
     /// * `total_prompt_tokens` - Total tokens in the complete prompt
     /// * `starting_position` - RoPE starting position (prefix cache offset)
-    pub fn call_init_pipeline_request(&self, request_id: uuid::Uuid, total_prompt_tokens: usize, starting_position: usize) {
+    pub fn call_init_pipeline_request(
+        &self,
+        request_id: uuid::Uuid,
+        total_prompt_tokens: usize,
+        starting_position: usize,
+    ) {
         if let Some(hook) = &self.hook {
             hook.init_pipeline_request(request_id, total_prompt_tokens, starting_position);
         }
@@ -299,7 +309,9 @@ impl HookContainer {
     ///
     /// Returns true for PP first stage that receives logits from the last stage.
     pub fn needs_external_logits(&self) -> bool {
-        self.hook.as_ref().is_some_and(|h| h.needs_external_logits())
+        self.hook
+            .as_ref()
+            .is_some_and(|h| h.needs_external_logits())
     }
 
     /// Receive response logits from the last pipeline stage.

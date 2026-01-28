@@ -417,8 +417,7 @@ impl PagedAttentionScheduler {
             if seq_guard.is_prompt() {
                 if let Some(chunk_size) = seq_guard.prefill_chunk_size() {
                     if let Some(toks) = seq_guard.prefill_prompt_toks() {
-                        let remaining =
-                            toks.len().saturating_sub(seq_guard.prefill_chunk_offset());
+                        let remaining = toks.len().saturating_sub(seq_guard.prefill_chunk_offset());
                         let advance_by = chunk_size.min(remaining);
                         seq_guard.advance_prefill_chunk_offset(advance_by);
                     }
@@ -573,8 +572,13 @@ impl Scheduler for PagedAttentionScheduler {
     }
 
     fn has_sequence(&self, request_id: uuid::Uuid) -> bool {
-        self.running.iter().any(|s| get_mut_arcmutex!(s).request_id() == request_id)
-            || self.waiting.iter().any(|s| get_mut_arcmutex!(s).request_id() == request_id)
+        self.running
+            .iter()
+            .any(|s| get_mut_arcmutex!(s).request_id() == request_id)
+            || self
+                .waiting
+                .iter()
+                .any(|s| get_mut_arcmutex!(s).request_id() == request_id)
     }
 
     fn get_sequence_mut(&mut self, request_id: uuid::Uuid) -> Option<&mut Sequence> {
@@ -587,13 +591,21 @@ impl Scheduler for PagedAttentionScheduler {
 
     fn remove_sequence(&mut self, request_id: uuid::Uuid) -> Option<Sequence> {
         // Check running first
-        if let Some(pos) = self.running.iter().position(|s| get_mut_arcmutex!(s).request_id() == request_id) {
+        if let Some(pos) = self
+            .running
+            .iter()
+            .position(|s| get_mut_arcmutex!(s).request_id() == request_id)
+        {
             let arc = self.running.remove(pos)?;
             // Extract the inner Sequence from Arc<Mutex<>>
             return Some(Arc::try_unwrap(arc).ok()?.into_inner().unwrap());
         }
         // Then check waiting
-        if let Some(pos) = self.waiting.iter().position(|s| get_mut_arcmutex!(s).request_id() == request_id) {
+        if let Some(pos) = self
+            .waiting
+            .iter()
+            .position(|s| get_mut_arcmutex!(s).request_id() == request_id)
+        {
             let arc = self.waiting.remove(pos)?;
             return Some(Arc::try_unwrap(arc).ok()?.into_inner().unwrap());
         }

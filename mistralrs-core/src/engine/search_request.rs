@@ -9,8 +9,8 @@ use tokenizers::InputSequence;
 
 use crate::{
     get_mut_arcmutex,
-    request::SearchContextSize,
     request::InferenceOperation,
+    request::SearchContextSize,
     search::{self, ExtractFunctionParameters, SearchFunctionParameters, SearchResult},
     MessageContent, NormalRequest, Response, ToolCallResponse, ToolChoice, WebSearchOptions,
 };
@@ -44,8 +44,7 @@ async fn do_search(
     tool_calls: &ToolCallResponse,
     web_search_options: &WebSearchOptions,
 ) -> NormalRequest {
-    let (messages, _tools, tool_choice, ws_opts) =
-        chat_op_fields_mut(&mut second_request.input.op);
+    let (messages, _tools, tool_choice, ws_opts) = chat_op_fields_mut(&mut second_request.input.op);
 
     // Add assistant call message
     {

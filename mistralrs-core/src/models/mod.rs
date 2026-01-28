@@ -96,10 +96,7 @@ pub trait TransformerLayer: Send + Sync {
         mask: Option<&Tensor>,
         position_offsets: &[usize],
         cache: &mut KvCache,
-        paged_attn_meta: Option<(
-            (Tensor, Tensor),
-            &PagedAttentionInputMetadata,
-        )>,
+        paged_attn_meta: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor>;
 }
 
@@ -216,7 +213,10 @@ pub trait LanguageModelExt: LanguageModel + TransformerModelExt {
 /// Standard implementation of `embed` for models with `TransformerModelExt`.
 ///
 /// Simply forwards tokens through the token embeddings layer.
-pub fn standard_embed<M: TransformerModelExt + ?Sized>(model: &M, tokens: &Tensor) -> Result<Tensor> {
+pub fn standard_embed<M: TransformerModelExt + ?Sized>(
+    model: &M,
+    tokens: &Tensor,
+) -> Result<Tensor> {
     model.tok_embeddings().forward(tokens)
 }
 

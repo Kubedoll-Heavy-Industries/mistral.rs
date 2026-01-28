@@ -5,8 +5,8 @@ use either::Either;
 use indexmap::IndexMap;
 
 use crate::{
-    vision_models::{preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig},
     request::ThinkingMode,
+    vision_models::{preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig},
     MessageContent, Pipeline, Tool,
 };
 

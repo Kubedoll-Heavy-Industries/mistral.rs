@@ -182,7 +182,8 @@ impl ModelConfig::FromSafetensors for ModelWeights {
         )?;
 
         // Load output norm (LayerNorm for StarCoder2)
-        let output_norm = weights.load_layer_norm(&naming.output_norm(), cfg.norm_epsilon, device)?;
+        let output_norm =
+            weights.load_layer_norm(&naming.output_norm(), cfg.norm_epsilon, device)?;
 
         // Load output weights (may be tied to embeddings)
         let output: Arc<dyn QuantMethod> = if !cfg.tie_word_embeddings {
@@ -222,7 +223,8 @@ impl ModelConfig::FromSafetensors for ModelWeights {
         let mut ropes: HashMap<candle_core::DeviceLocation, Arc<RotaryEmbedding>> = HashMap::new();
         for layer_idx in layer_start..layer_end {
             let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            if let std::collections::hash_map::Entry::Vacant(e) = ropes.entry(layer_device.location())
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                ropes.entry(layer_device.location())
             {
                 e.insert(Arc::new(RotaryEmbedding::new(
                     cfg.rope_theta as f32,
@@ -309,7 +311,8 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             )?;
 
             // Build CausalAttention
-            let attn_config = AttentionConfig::new(cfg.num_attention_heads, cfg.num_key_value_heads, head_dim);
+            let attn_config =
+                AttentionConfig::new(cfg.num_attention_heads, cfg.num_key_value_heads, head_dim);
             let mut attention = CausalAttention::new(
                 attn_config,
                 q_proj,
@@ -321,7 +324,8 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             .with_attn_dtype(dtype);
 
             if let AttentionImplementation::PagedAttention = &attention_mechanism {
-                attention = attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
+                attention =
+                    attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
             }
 
             layers.push(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp));
@@ -358,9 +362,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         let meta = ct.get_metadata();
         let arch: String = {
             use crate::utils::gguf_metadata::TryValueInto;
-            meta.get("general.architecture")
-                .cloned()
-                .try_value_into()?
+            meta.get("general.architecture").cloned().try_value_into()?
         };
         if arch != "starcoder2" {
             candle_core::bail!("Expected `starcoder2` architecture, got `{arch}`.");
@@ -379,23 +381,32 @@ impl ModelConfig::FromGGUF for ModelWeights {
             .map_err(|e| candle_core::Error::Msg(e.to_string()))? as usize;
         let head_count_kv = metadata
             .get_value::<u32>("attention.head_count_kv")
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))? as usize;
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            as usize;
         let block_count = metadata
             .get_value::<u32>("block_count")
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))? as usize;
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            as usize;
         let embedding_length = metadata
             .get_value::<u32>("embedding_length")
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))? as usize;
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            as usize;
         let intermediate_size = metadata
             .get_value::<u32>("feed_forward_length")
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))? as usize;
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            as usize;
         let layer_norm_epsilon = metadata
             .get_value::<f32>("attention.layer_norm_epsilon")
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))? as f64;
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            as f64;
         let context_window = metadata
             .get_value::<u32>("context_length")
-            .map_err(|e| candle_core::Error::Msg(e.to_string()))? as usize;
-        let rope_freq_base = metadata.get_value("rope.freq_base").ok().unwrap_or(100_000_f32);
+            .map_err(|e| candle_core::Error::Msg(e.to_string()))?
+            as usize;
+        let rope_freq_base = metadata
+            .get_value("rope.freq_base")
+            .ok()
+            .unwrap_or(100_000_f32);
 
         let head_dim = embedding_length / head_count;
 
@@ -434,7 +445,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
         let mut ropes: HashMap<candle_core::DeviceLocation, Arc<RotaryEmbedding>> = HashMap::new();
         for layer_idx in layer_start..layer_end {
             let layer_device = mapper.device_for(layer_idx, false).unwrap_or(device);
-            if let std::collections::hash_map::Entry::Vacant(e) = ropes.entry(layer_device.location())
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                ropes.entry(layer_device.location())
             {
                 e.insert(Arc::new(RotaryEmbedding::new(
                     rope_freq_base,
@@ -529,7 +541,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
             .with_attn_dtype(dtype);
 
             if let AttentionImplementation::PagedAttention = &attention_mechanism {
-                attention = attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
+                attention =
+                    attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
             }
 
             layers.push(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp));
@@ -600,7 +613,9 @@ impl TransformerModelExt for ModelWeights {
     }
 
     fn mapper(&self) -> Option<&dyn DeviceMapper> {
-        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+        self.mapper
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn DeviceMapper)
     }
 
     fn model_dtype(&self) -> DType {

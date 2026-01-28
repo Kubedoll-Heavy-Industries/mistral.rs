@@ -67,8 +67,8 @@ pub use imatrix::{CollectedImatrixData, ImatrixLayerStats};
 #[allow(deprecated)] // Re-exporting deprecated functions for backwards compatibility
 pub use lora::{
     clear_applied_loras, get_applied_loras, linear_no_bias_static_lora,
-    merge_lora_weights_with_adapters, push_applied_lora, LoraAdapter, LoraConfig,
-    StaticLoraConfig, MULTI_LORA_DELIMITER,
+    merge_lora_weights_with_adapters, push_applied_lora, LoraAdapter, LoraConfig, StaticLoraConfig,
+    MULTI_LORA_DELIMITER,
 };
 pub use mxfp4::MXFP4Layer;
 pub use pertensor_fp8::PerTensorFP8Linear;

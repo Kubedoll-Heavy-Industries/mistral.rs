@@ -522,12 +522,12 @@ impl Engine {
                             // 1. PP sequences (return_raw_logits=true) - wait for activation to arrive
                             //    via PipelineContinue before transitioning
                             // 2. Chunked prefill with remaining chunks - need to complete all chunks first
-                            let should_transition = !seq.return_raw_logits && !seq.has_remaining_prefill();
+                            let should_transition =
+                                !seq.return_raw_logits && !seq.has_remaining_prefill();
                             if should_transition {
                                 match seq.sequence_stepping_type() {
-                                    SeqStepType::OneShot => {
-                                        seq.set_state(SequenceState::Done(StopReason::GeneratedImage))
-                                    }
+                                    SeqStepType::OneShot => seq
+                                        .set_state(SequenceState::Done(StopReason::GeneratedImage)),
                                     SeqStepType::PromptAndDecode => {
                                         seq.set_state(SequenceState::RunningCompletion)
                                     }

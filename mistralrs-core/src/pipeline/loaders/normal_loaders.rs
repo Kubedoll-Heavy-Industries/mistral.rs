@@ -1147,9 +1147,15 @@ impl IsqModelLoader for MixtralLoader {
             Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
             Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
             // MoE experts (type-safe MoE uses gate_proj, up_proj, down_proj)
-            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.gate_proj\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.up_proj\.(weight|bias)$")?,
-            Regex::new(r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.down_proj\.(weight|bias)$")?,
+            Regex::new(
+                r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.gate_proj\.(weight|bias)$",
+            )?,
+            Regex::new(
+                r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.up_proj\.(weight|bias)$",
+            )?,
+            Regex::new(
+                r"layers\.(\d+)\.block_sparse_moe\.experts\.(\d+)\.down_proj\.(weight|bias)$",
+            )?,
         ])
     }
     fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {

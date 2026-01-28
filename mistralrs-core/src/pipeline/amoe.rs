@@ -576,8 +576,8 @@ fn new_dummy_seq(
         None, // tools
         None, // image_gen_response_format
         SeqStepType::PromptAndDecode,
-        None, // diffusion_params
-        None, // seq_preallocated_cache
+        None,  // diffusion_params
+        None,  // seq_preallocated_cache
         false, // return_raw_logits
         eos_toks,
         None, // pipeline_continue_op_id

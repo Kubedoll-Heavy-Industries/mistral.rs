@@ -20,8 +20,7 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata,
-        NormalModel,
+        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
     },
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},

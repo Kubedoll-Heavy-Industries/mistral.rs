@@ -13,16 +13,24 @@ mod loralinear;
 mod qloralinear;
 mod registry;
 mod registry_linear;
+mod xlora_classifier;
+mod xlora_config;
 
 // Re-export registry types for per-request adapter selection
 // These are intentionally exported for external use even if not used internally
 #[allow(unused_imports)]
 pub use registry::{
-    AdapterLoadState, AdapterRegistry, AdapterWeights, LoadedAdapter, PROJECTIONS_PER_LAYER,
-    PROJECTION_OFFSETS,
+    AdapterLoadState, AdapterRegistry, AdapterSelection, AdapterWeights, LoadedAdapter,
+    PROJECTIONS_PER_LAYER, PROJECTION_OFFSETS,
 };
 #[allow(unused_imports)]
 pub use registry_linear::{wrap_with_lora, RegistryLoraLinear};
+
+// Re-export XLoRA types
+#[allow(unused_imports)]
+pub use xlora_classifier::XLoraClassifier;
+#[allow(unused_imports)]
+pub use xlora_config::XLoraConfig;
 
 use std::collections::HashMap;
 

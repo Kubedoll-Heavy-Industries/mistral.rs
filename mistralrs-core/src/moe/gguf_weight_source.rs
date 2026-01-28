@@ -68,12 +68,17 @@ impl<'a, 'r, R: Seek + Read + Send + Sync> GgufWeightSource<'a, 'r, R> {
     }
 
     /// Get the GGUF tensor info for introspection.
-    pub fn tensor_info(&self, name: &str) -> Option<&candle_core::quantized::gguf_file::TensorInfo> {
+    pub fn tensor_info(
+        &self,
+        name: &str,
+    ) -> Option<&candle_core::quantized::gguf_file::TensorInfo> {
         self.content.tensor_infos.get(name)
     }
 
     /// Get metadata from the GGUF file.
-    pub fn metadata(&self) -> &std::collections::HashMap<String, candle_core::quantized::gguf_file::Value> {
+    pub fn metadata(
+        &self,
+    ) -> &std::collections::HashMap<String, candle_core::quantized::gguf_file::Value> {
         &self.content.metadata
     }
 
@@ -258,9 +263,7 @@ impl<'a, 'r, R: Seek + Read + Send + Sync> GgufWeightSource<'a, 'r, R> {
         let gate_chunks = gate_stacked
             .dequantize(&self.device)?
             .chunk(num_experts, 0)?;
-        let up_chunks = up_stacked
-            .dequantize(&self.device)?
-            .chunk(num_experts, 0)?;
+        let up_chunks = up_stacked.dequantize(&self.device)?.chunk(num_experts, 0)?;
         let down_chunks = down_stacked
             .dequantize(&self.device)?
             .chunk(num_experts, 0)?;
@@ -269,11 +272,7 @@ impl<'a, 'r, R: Seek + Read + Send + Sync> GgufWeightSource<'a, 'r, R> {
         let mut up_proj = Vec::with_capacity(num_experts);
         let mut down_proj = Vec::with_capacity(num_experts);
 
-        for ((gate, up), down) in gate_chunks
-            .into_iter()
-            .zip(up_chunks)
-            .zip(down_chunks)
-        {
+        for ((gate, up), down) in gate_chunks.into_iter().zip(up_chunks).zip(down_chunks) {
             use candle_core::quantized::QTensor;
 
             gate_proj.push(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
@@ -422,14 +421,8 @@ mod tests {
     #[test]
     fn test_llama_naming() {
         let naming = GgufExpertNaming::llama();
-        assert_eq!(
-            naming.expert_gate("blk.0", 3),
-            "blk.0.ffn_gate.3.weight"
-        );
-        assert_eq!(
-            naming.stacked_gate("blk.0"),
-            "blk.0.ffn_gate_exps.weight"
-        );
+        assert_eq!(naming.expert_gate("blk.0", 3), "blk.0.ffn_gate.3.weight");
+        assert_eq!(naming.stacked_gate("blk.0"), "blk.0.ffn_gate_exps.weight");
     }
 
     #[test]

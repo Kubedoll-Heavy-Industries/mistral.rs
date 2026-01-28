@@ -11,7 +11,6 @@ use super::{
     ForwardInputsResult, HookContainer, IsqOrganization, IsqPipelineMixin, MetadataMixin,
     ModelCategory, PreProcessingMixin,
 };
-use crate::pipeline::hooks::ActivationResult;
 use super::{
     AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, GLM4Loader, Gemma2Loader, GemmaLoader,
     GptOssLoader, GraniteMoeHybridLoader, LlamaLoader, MistralLoader, MixtralLoader,
@@ -24,11 +23,13 @@ use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
+use crate::models::{PagedAttentionContext, TransformContext};
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
     ModelConfigMetadata,
 };
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
+use crate::pipeline::hooks::ActivationResult;
 use crate::pipeline::isq::UqffFullSer;
 use crate::pipeline::loaders::auto_device_map;
 use crate::pipeline::loaders::QuantizationConfigShim;
@@ -37,6 +38,7 @@ use crate::pipeline::text_models_inputs_processor::make_prompt_chunk;
 use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
 use crate::pipeline::{ChatTemplate, LocalModelPaths};
 use crate::prefix_cacher::PrefixCacheManagerV2;
+use crate::sampler::{Logprobs, Sampler, TokenSamplingParams};
 use crate::sequence::Sequence;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
@@ -45,9 +47,7 @@ use crate::utils::{
     tokens::get_token,
     varbuilder_utils::from_mmaped_safetensors,
 };
-use crate::sampler::{Logprobs, Sampler, TokenSamplingParams};
 use crate::xlora_models::NonGranularState;
-use crate::models::{PagedAttentionContext, TransformContext};
 use crate::{
     api_dir_list, api_get_file, get_mut_arcmutex, get_paths, get_uqff_paths, lora_model_loader,
     normal_model_loader, normal_model_loader_sharded, xlora_model_loader, DeviceMapSetting,
@@ -1191,9 +1191,9 @@ impl Pipeline for SafetensorsPipeline {
             paged_attn_meta,
             flash_meta,
             flash_meta_full,
-            request_id,  // Capture request_id for hook orchestration
-            inference_step,  // Used for prefill/decode detection in pipeline
-            adapters: _, // TODO: wire up per-request adapter selection in SafetensorsPipeline
+            request_id,     // Capture request_id for hook orchestration
+            inference_step, // Used for prefill/decode detection in pipeline
+            adapters: _,    // TODO: wire up per-request adapter selection in SafetensorsPipeline
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
@@ -1244,7 +1244,10 @@ impl Pipeline for SafetensorsPipeline {
                         match hook.receive_stage_input(request_id)? {
                             Some(ActivationResult::Data { tensor }) => {
                                 // Position from cache (stream cursor model)
-                                let cache_position = self.cache().normal().0
+                                let cache_position = self
+                                    .cache()
+                                    .normal()
+                                    .0
                                     .first()
                                     .map(|kv| kv.current_seq_len())
                                     .unwrap_or(0);
@@ -1565,7 +1568,10 @@ impl AutoregressivePipeline for SafetensorsPipeline {
 pub type NormalLoader = SafetensorsLoader;
 
 /// Deprecated: Use `SafetensorsLoaderBuilder` instead.
-#[deprecated(since = "0.8.0", note = "Renamed to SafetensorsLoaderBuilder for clarity")]
+#[deprecated(
+    since = "0.8.0",
+    note = "Renamed to SafetensorsLoaderBuilder for clarity"
+)]
 pub type NormalLoaderBuilder = SafetensorsLoaderBuilder;
 
 /// Deprecated: Use `SafetensorsConfig` instead.

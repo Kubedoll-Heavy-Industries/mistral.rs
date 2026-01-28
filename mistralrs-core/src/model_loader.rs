@@ -68,7 +68,10 @@ impl LoaderBuilder {
     }
 
     /// Optionally set the layer range for pipeline parallelism.
-    pub fn with_layer_range_optional(mut self, layer_range: Option<std::ops::Range<usize>>) -> Self {
+    pub fn with_layer_range_optional(
+        mut self,
+        layer_range: Option<std::ops::Range<usize>>,
+    ) -> Self {
         self.layer_range = layer_range;
         self
     }

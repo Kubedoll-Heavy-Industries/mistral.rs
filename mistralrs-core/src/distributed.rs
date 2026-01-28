@@ -154,7 +154,9 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
                             let req = Request::PipelineContinue(x);
 
                             if request_sender.send(req).await.is_err() {
-                                tracing::error!("Daemon channel closed for PipelineContinue request");
+                                tracing::error!(
+                                    "Daemon channel closed for PipelineContinue request"
+                                );
                                 continue;
                             }
                             match receiver.recv().await {

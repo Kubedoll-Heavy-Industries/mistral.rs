@@ -126,7 +126,8 @@ pub trait PositionEncoding: Send + Sync {
     ///
     /// # Returns
     /// (q_with_pos, k_with_pos) with same shapes as input
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)>;
+    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize])
+        -> Result<(Tensor, Tensor)>;
 }
 
 /// Attention mechanism trait - abstracts over attention implementations.
@@ -885,7 +886,8 @@ pub fn reshape_for_attn(
     head_dim: usize,
 ) -> Result<Tensor> {
     if seq_len != 1 {
-        x.reshape((b_sz, seq_len, n_heads, head_dim))?.transpose(1, 2)
+        x.reshape((b_sz, seq_len, n_heads, head_dim))?
+            .transpose(1, 2)
     } else {
         x.reshape((b_sz, n_heads, seq_len, head_dim))
     }
@@ -900,7 +902,12 @@ pub fn reshape_for_attn(
 /// * `b_sz` - Batch size
 /// * `seq_len` - Sequence length
 /// * `had_mask` - Whether a mask was used (indicates prefill vs decode)
-pub fn reshape_attn_output(y: Tensor, b_sz: usize, seq_len: usize, had_mask: bool) -> Result<Tensor> {
+pub fn reshape_attn_output(
+    y: Tensor,
+    b_sz: usize,
+    seq_len: usize,
+    had_mask: bool,
+) -> Result<Tensor> {
     if had_mask {
         y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))
     } else {
@@ -935,8 +942,8 @@ pub fn sdpa_with_cache(
 ) -> Result<Tensor> {
     match paged_attn {
         Some(pa) => {
-            let ((key_cache, value_cache), input_metadata) = paged_metadata
-                .expect("paged_metadata required when using PagedAttention");
+            let ((key_cache, value_cache), input_metadata) =
+                paged_metadata.expect("paged_metadata required when using PagedAttention");
             pa.forward(
                 q,
                 k,

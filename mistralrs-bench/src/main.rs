@@ -1,3 +1,6 @@
+// Allow deprecated APIs during migration to typed loader builders
+#![allow(deprecated)]
+
 use candle_core::Device;
 use clap::Parser;
 use cli_table::{format::Justify, print_stdout, Cell, CellStruct, Style, Table};
@@ -5,9 +8,9 @@ use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, initialize_logging, paged_attn_supported,
     parse_isq_value, Constraint, DefaultSchedulerMethod, DeviceLayerMapMetadata, DeviceMapMetadata,
     DeviceMapSetting, DryTokenSamplingParams, InferenceExec, InferenceInput, InferenceOperation,
-    Loader, LoaderBuilder, MemoryGpuConfig, MistralRs, MistralRsBuilder, MistralRsConfig,
-    MistralRsError, ModelSelected, NormalRequest, PagedAttentionConfig, PagedCacheType, Pipeline,
-    Request, Response, SchedulerConfig, TokenSamplingParams, TokenSource, Usage,
+    Loader, LoaderBuilder, MemoryGpuConfig, MistralRs, MistralRsBuilder, ModelSelected,
+    NormalRequest, PagedAttentionConfig, PagedCacheType, Request, Response, SchedulerConfig,
+    TokenSamplingParams, TokenSource, Usage,
 };
 use std::fmt::Display;
 use std::sync::Arc;
@@ -54,7 +57,7 @@ async fn run_bench(
     repetitions: usize,
     test_name: TestName,
 ) -> anyhow::Result<BenchResult> {
-    let sampling_params = TokenSamplingParams {
+    let _sampling_params = TokenSamplingParams {
         temperature: Some(0.1),
         top_k: Some(32),
         top_p: Some(0.1),

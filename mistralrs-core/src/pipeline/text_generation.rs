@@ -35,8 +35,8 @@ use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
 use crate::paged_attention::ModelConfigMetadata;
 use crate::pipeline::hooks::{ActivationResult, HookContainer};
 use crate::pipeline::{
-    AnyMoePipelineMixin, CacheManager, CacheManagerMixin, EitherCache,
-    GeneralMetadata, IsqPipelineMixin, MetadataMixin, PreProcessingMixin,
+    AnyMoePipelineMixin, CacheManager, CacheManagerMixin, EitherCache, GeneralMetadata,
+    IsqPipelineMixin, MetadataMixin, PreProcessingMixin,
 };
 use crate::sequence::Sequence;
 
@@ -151,7 +151,10 @@ impl TextGenerationPipeline {
         tokens: &Tensor,
         position_offset: usize,
         request_id: uuid::Uuid,
-        paged_attn_meta: Option<(&[(Tensor, Tensor)], &crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata)>,
+        paged_attn_meta: Option<(
+            &[(Tensor, Tensor)],
+            &crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata,
+        )>,
     ) -> Result<StageOutput> {
         // Step 1: Get input (embed tokens or receive activation)
         let hidden = if self.receives_activation() {
@@ -171,11 +174,9 @@ impl TextGenerationPipeline {
         };
 
         // Step 2: Build transform context
-        let paged_attn_ctx = paged_attn_meta.map(|(kv_cache, metadata)| {
-            PagedAttentionContext {
-                kv_cache: kv_cache.to_vec(),
-                metadata
-            }
+        let paged_attn_ctx = paged_attn_meta.map(|(kv_cache, metadata)| PagedAttentionContext {
+            kv_cache: kv_cache.to_vec(),
+            metadata,
         });
         let ctx = TransformContext {
             seq_len: hidden.dims()[1],
@@ -188,7 +189,9 @@ impl TextGenerationPipeline {
         // Step 3: Transform through our layers
         let hidden = {
             let mut cache_guard = self.cache.normal();
-            self.config.model.transform(hidden, &ctx, &mut cache_guard.0)?
+            self.config
+                .model
+                .transform(hidden, &ctx, &mut cache_guard.0)?
         };
 
         // Step 4: Output (send activation or compute logits)
@@ -333,10 +336,10 @@ mod tests {
     fn test_stage_input_variants() {
         // Just verify the types compile correctly
         let _tokens = StageInput::Tokens(
-            Tensor::zeros(&[1, 10], candle_core::DType::U32, &Device::Cpu).unwrap()
+            Tensor::zeros(&[1, 10], candle_core::DType::U32, &Device::Cpu).unwrap(),
         );
         let _activation = StageInput::Activation(
-            Tensor::zeros(&[1, 10, 512], candle_core::DType::F32, &Device::Cpu).unwrap()
+            Tensor::zeros(&[1, 10, 512], candle_core::DType::F32, &Device::Cpu).unwrap(),
         );
     }
 }

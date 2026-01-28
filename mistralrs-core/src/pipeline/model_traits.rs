@@ -64,22 +64,18 @@ impl AttentionPattern {
         }
 
         match self {
-            Self::Causal => {
-                CausalMasker.make_causal_mask(seq_len, device, past_kv_len, dtype)
-            }
+            Self::Causal => CausalMasker.make_causal_mask(seq_len, device, past_kv_len, dtype),
             Self::Bidirectional => {
                 // No masking for bidirectional attention
                 Ok(None)
             }
-            Self::SlidingWindow { window_size } => {
-                CausalMasker.make_sliding_window_mask(
-                    seq_len,
-                    device,
-                    past_kv_len,
-                    *window_size,
-                    dtype,
-                )
-            }
+            Self::SlidingWindow { window_size } => CausalMasker.make_sliding_window_mask(
+                seq_len,
+                device,
+                past_kv_len,
+                *window_size,
+                dtype,
+            ),
             Self::Chunked { chunk_size: _ } => {
                 // TODO: Implement chunked mask properly
                 // For now, fall back to causal

@@ -1,16 +1,13 @@
 use super::llg::build_llg_factory;
 use super::{
-    get_model_paths, get_xlora_paths,
-    text_models_inputs_processor::ModelInputs,
-    AdapterKind, CacheManager, GeneralMetadata, HookContainer, Loader, ModelKind, ModelPaths,
-    PrettyName, QuantizationKind, TokenSource,
+    get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
+    CacheManager, GeneralMetadata, HookContainer, Loader, ModelKind, ModelPaths, PrettyName,
+    QuantizationKind, TokenSource,
 };
 use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
     MetadataMixin, ModelCategory, PreProcessingMixin,
 };
-use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
-use crate::pipeline::hooks::ActivationResult;
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
 use crate::gguf::{
@@ -19,11 +16,13 @@ use crate::gguf::{
 use crate::gguf::{Content, GGUFArchitecture};
 use crate::kv_cache::{FullCacheManager, NormalCache, NormalCacheManager};
 use crate::lora::Ordering;
+use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
     ModelConfigMetadata,
 };
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
+use crate::pipeline::hooks::ActivationResult;
 use crate::pipeline::loaders::DeviceMappedModelLoader;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::ChatTemplate;
@@ -119,7 +118,6 @@ impl ModelVariant {
     }
 }
 
-
 /// Pipeline for GGUF models using runtime polymorphism.
 ///
 /// For better type safety and monomorphized hot paths, use `TextPipeline<M>`
@@ -168,7 +166,10 @@ fn forward_transformer(
     input_ids: &Tensor,
     seqlen_offsets: &[usize],
     context_lens: Vec<(usize, usize)>,
-    paged_attn_meta: Option<(Vec<(Tensor, Tensor)>, &crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata)>,
+    paged_attn_meta: Option<(
+        Vec<(Tensor, Tensor)>,
+        &crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata,
+    )>,
     request_id: uuid::Uuid,
 ) -> candle_core::Result<ForwardInputsResult> {
     let has_embedding = hook.as_ref().is_none_or(|h| h.is_first_stage());
@@ -199,12 +200,13 @@ fn forward_transformer(
         cache.first().map_or(0, |c| c.current_seq_len())
     };
 
-    let paged_attn_ctx = paged_attn_meta.as_ref().map(|(kv_cache, metadata)| {
-        PagedAttentionContext {
-            kv_cache: kv_cache.clone(),
-            metadata,
-        }
-    });
+    let paged_attn_ctx =
+        paged_attn_meta
+            .as_ref()
+            .map(|(kv_cache, metadata)| PagedAttentionContext {
+                kv_cache: kv_cache.clone(),
+                metadata,
+            });
     let ctx = TransformContext {
         seq_len: hidden.dims()[1],
         position_offset,
@@ -219,7 +221,9 @@ fn forward_transformer(
     if !has_lm_head {
         // HEAD/MIDDLE: send activation to next stage
         // Note: tokens are not used by streaming_hook - only hidden states matter
-        hook.as_ref().unwrap().send_stage_output(&hidden, &[], request_id, position_offset)?;
+        hook.as_ref()
+            .unwrap()
+            .send_stage_output(&hidden, &[], request_id, position_offset)?;
 
         if hook.as_ref().unwrap().needs_external_logits() {
             // HEAD: wait for logits from TAIL
@@ -582,11 +586,13 @@ impl Loader for GGUFLoader {
                         // output.weight (lm_head) - may be tied to token_embd
                         if model.model.has_tensor("output.weight") {
                             if let Ok(t) = model.model.tensor_info("output.weight") {
-                                size += t.shape.elem_count() / t.ggml_dtype.block_size() * t.ggml_dtype.type_size();
+                                size += t.shape.elem_count() / t.ggml_dtype.block_size()
+                                    * t.ggml_dtype.type_size();
                             }
                         } else if let Ok(t) = model.model.tensor_info("token_embd.weight") {
                             // Tied embeddings - reuse token_embd for output
-                            size += t.shape.elem_count() / t.ggml_dtype.block_size() * t.ggml_dtype.type_size();
+                            size += t.shape.elem_count() / t.ggml_dtype.block_size()
+                                * t.ggml_dtype.type_size();
                         }
                     }
 
@@ -702,7 +708,7 @@ impl Loader for GGUFLoader {
                     AttentionImplementation::Eager
                 },
                 internal_dtype,
-                self.config.layer_range.clone(),  // Pipeline parallelism layer range
+                self.config.layer_range.clone(), // Pipeline parallelism layer range
             );
 
             // With optional adapter config:
@@ -1035,8 +1041,17 @@ impl Pipeline for GGUFPipeline {
             hook.set_request_context(request_id);
 
             use crate::pipeline::text_models_inputs_processor::InferenceStep;
-            if let InferenceStep::Prefill { total_prompt_tokens, chunk_start_position, .. } = inference_step {
-                hook.call_init_pipeline_request(request_id, total_prompt_tokens, chunk_start_position);
+            if let InferenceStep::Prefill {
+                total_prompt_tokens,
+                chunk_start_position,
+                ..
+            } = inference_step
+            {
+                hook.call_init_pipeline_request(
+                    request_id,
+                    total_prompt_tokens,
+                    chunk_start_position,
+                );
             }
         }
 

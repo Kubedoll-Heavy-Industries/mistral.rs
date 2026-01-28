@@ -1,6 +1,6 @@
 use super::{
     EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingSpecificConfig, Loader, ModelKind,
-    ModelPaths, SafetensorsLoaderBuilder, NormalLoaderType, SafetensorsConfig, TokenSource,
+    ModelPaths, NormalLoaderType, SafetensorsConfig, SafetensorsLoaderBuilder, TokenSource,
     VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
 };
 use crate::api_get_file;

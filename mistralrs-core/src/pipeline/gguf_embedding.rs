@@ -5,21 +5,23 @@
 
 use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, GeneralMetadata,
-    IsqPipelineMixin, KvCache, Loader, MetadataMixin, ModelCategory, ModelKind, ModelPaths,
-    Modalities, NormalCache, PreProcessingMixin, Processor, SupportedModality,
+    IsqPipelineMixin, KvCache, Loader, MetadataMixin, Modalities, ModelCategory, ModelKind,
+    ModelPaths, NormalCache, PreProcessingMixin, Processor, SupportedModality,
 };
 use crate::device_map::DeviceMapper;
 use crate::embedding_models::inputs_processor::{EmbeddingProcessor, ModelInputs};
-use crate::gguf::{convert_gguf_to_hf_tokenizer, Content, GGUFArchitecture, GgufTokenizerConversion};
+use crate::gguf::{
+    convert_gguf_to_hf_tokenizer, Content, GGUFArchitecture, GgufTokenizerConversion,
+};
 use crate::models::quantized_qwen::ModelWeights as QQwen;
 use crate::models::quantized_qwen3::ModelWeights as QQwen3;
 use crate::models::TransformerModel;
 use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::loaders::QuantizationKind;
-use crate::utils::model_config as ModelConfig;
 use crate::pipeline::ChatTemplate;
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
+use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::ProgressScopeGuard;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::utils::tokens::get_token;
@@ -173,8 +175,8 @@ impl Loader for GGUFEmbeddingLoader {
         // Create paths struct
         let paths: Box<dyn ModelPaths> = Box::new(LocalModelPaths::new(
             tokenizer_filename.unwrap_or_default(),
-            PathBuf::new(),                             // No separate config file for GGUF
-            PathBuf::new(),                             // No template file
+            PathBuf::new(), // No separate config file for GGUF
+            PathBuf::new(), // No template file
             weight_filenames,
             crate::pipeline::paths::AdapterPaths::None, // No adapter paths
             None,                                       // No gen_conf
@@ -183,7 +185,15 @@ impl Loader for GGUFEmbeddingLoader {
             None,                                       // No chat_template_json
         ));
 
-        self.load_model_from_path(&paths, dtype, device, silent, mapper, in_situ_quant, paged_attn_config)
+        self.load_model_from_path(
+            &paths,
+            dtype,
+            device,
+            silent,
+            mapper,
+            in_situ_quant,
+            paged_attn_config,
+        )
     }
 
     fn load_model_from_path(
@@ -220,8 +230,7 @@ impl Loader for GGUFEmbeddingLoader {
 
         let pipeline_mapper =
             mapper.into_mapper(num_layers, device, self.config.topology.as_ref())?;
-        let model_mapper =
-            mapper.into_mapper(num_layers, device, self.config.topology.as_ref())?;
+        let model_mapper = mapper.into_mapper(num_layers, device, self.config.topology.as_ref())?;
 
         // Get tokenizer
         let GgufTokenizerConversion {
@@ -408,9 +417,9 @@ impl Pipeline for GGUFEmbeddingPipeline {
         let ModelInputs {
             input_ids,
             flash_meta: _,
-        } = *inputs
-            .downcast::<ModelInputs>()
-            .map_err(|_| candle_core::Error::Msg("Invalid input type for embedding pipeline".to_string()))?;
+        } = *inputs.downcast::<ModelInputs>().map_err(|_| {
+            candle_core::Error::Msg("Invalid input type for embedding pipeline".to_string())
+        })?;
 
         // Get hidden states from model
         let cache = &mut self.cache.normal().0;

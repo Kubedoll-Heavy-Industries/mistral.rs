@@ -21,7 +21,9 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use candle_core::{Device, IndexOp, Result, Tensor};
-use mistralrs_quant::{NonZeroOp, QuantMethod, QuantizedConfig, ReplicatedLayer, ShardedVarBuilder};
+use mistralrs_quant::{
+    NonZeroOp, QuantMethod, QuantizedConfig, ReplicatedLayer, ShardedVarBuilder,
+};
 
 use super::experts::{MoEExperts, MoEExpertsConfig};
 use super::routing::{RoutingConfig, RoutingStrategy, SoftmaxTopK, SparseMixer};
@@ -68,7 +70,11 @@ impl MoELayerConfig {
         if self.norm_topk_prob {
             RoutingConfig::new_normalized(self.num_experts, self.num_experts_per_tok)
         } else {
-            RoutingConfig::new_scaled(self.num_experts, self.num_experts_per_tok, self.routed_scaling_factor)
+            RoutingConfig::new_scaled(
+                self.num_experts,
+                self.num_experts_per_tok,
+                self.routed_scaling_factor,
+            )
         }
     }
 }
@@ -212,7 +218,9 @@ impl<R: RoutingStrategy> FeedForward for MoE<R> {
         let route_output = R::route(&router_logits, &self.routing_config)?;
 
         // 3. Forward through experts
-        let mut output = self.experts.forward(xs, route_output.weights, &route_output.indices)?;
+        let mut output = self
+            .experts
+            .forward(xs, route_output.weights, &route_output.indices)?;
 
         // 4. Add shared expert output if present
         if let Some(ref shared) = self.shared_expert {
@@ -331,10 +339,14 @@ impl FeedForward for GroupLimitedMoE {
         let router_logits = self.gate.forward(&xs_flat)?;
 
         // 2. Route using group-limited strategy
-        let route_output = self.group_strategy.route_with_config(&router_logits, &self.routing_config)?;
+        let route_output = self
+            .group_strategy
+            .route_with_config(&router_logits, &self.routing_config)?;
 
         // 3. Forward through experts
-        let mut output = self.experts.forward(xs, route_output.weights, &route_output.indices)?;
+        let mut output = self
+            .experts
+            .forward(xs, route_output.weights, &route_output.indices)?;
 
         // 4. Add shared expert output if present
         if let Some(ref shared) = self.shared_expert {
@@ -460,16 +472,14 @@ impl FeedForward for SparseMixerMoE {
         let router_logits = self.gate.forward(&xs_flat)?;
 
         // 2. Route using SparseMixer strategy
-        let route_output = self.sparse_mixer.route_with_config(&router_logits, &self.routing_config)?;
+        let route_output = self
+            .sparse_mixer
+            .route_with_config(&router_logits, &self.routing_config)?;
 
         // 3. Create one-hot expert mask for efficient indexing
-        let experts_mask = candle_nn::encoding::one_hot(
-            route_output.indices.clone(),
-            self.num_experts,
-            1u8,
-            0u8,
-        )?
-        .permute((2, 1, 0))?; // [num_experts, top_k, batch*seq]
+        let experts_mask =
+            candle_nn::encoding::one_hot(route_output.indices.clone(), self.num_experts, 1u8, 0u8)?
+                .permute((2, 1, 0))?; // [num_experts, top_k, batch*seq]
 
         // 4. Process each expert
         let mut final_hidden_states = xs_flat.zeros_like()?;
@@ -498,7 +508,9 @@ impl FeedForward for SparseMixerMoE {
 
             // Forward through expert
             let exp_out = expert.forward(&current_state.unsqueeze(0)?)?;
-            let current_hidden_states = exp_out.squeeze(0)?.broadcast_mul(&current_routing_weights)?;
+            let current_hidden_states = exp_out
+                .squeeze(0)?
+                .broadcast_mul(&current_routing_weights)?;
 
             // Accumulate results
             final_hidden_states = final_hidden_states.index_add(
@@ -557,7 +569,6 @@ impl<R: RoutingStrategy> MoEOrMlp<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{DType, Device};
 
     #[test]
     fn test_moe_layer_config() {

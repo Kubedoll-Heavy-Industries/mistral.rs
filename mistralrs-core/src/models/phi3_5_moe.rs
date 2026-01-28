@@ -613,7 +613,10 @@ impl IsqModel for Model {
                 .pp("post_attention_layernorm")
                 .add(&layer.post_attention_layernorm);
             // Add MoE gate to residuals
-            uvb_l.pp("block_sparse_moe").pp("gate").add(layer.moe.gate());
+            uvb_l
+                .pp("block_sparse_moe")
+                .pp("gate")
+                .add(layer.moe.gate());
         }
 
         uvb.to_safetensors()
@@ -639,7 +642,10 @@ impl IsqModel for Model {
             uvb_attn.pp("v_proj").add(&layer.self_attn.v_proj);
             uvb_attn.pp("o_proj").add(&layer.self_attn.o_proj);
             // Add MoE gate to residuals (attention is already included above)
-            uvb_l.pp("block_sparse_moe").pp("gate").add(layer.moe.gate());
+            uvb_l
+                .pp("block_sparse_moe")
+                .pp("gate")
+                .add(layer.moe.gate());
         }
 
         Some(uvb.to_safetensors())

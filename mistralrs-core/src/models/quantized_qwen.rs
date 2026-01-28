@@ -172,8 +172,10 @@ impl ModelConfig::FromSafetensors for ModelWeights {
                 let k_norm_name = naming.attn_k_norm(ctx.layer_idx);
 
                 if weights.has_tensor(&q_norm_name) && weights.has_tensor(&k_norm_name) {
-                    let q_norm = weights.load_rms_norm(&q_norm_name, ctx.rms_norm_eps, ctx.device)?;
-                    let k_norm = weights.load_rms_norm(&k_norm_name, ctx.rms_norm_eps, ctx.device)?;
+                    let q_norm =
+                        weights.load_rms_norm(&q_norm_name, ctx.rms_norm_eps, ctx.device)?;
+                    let k_norm =
+                        weights.load_rms_norm(&k_norm_name, ctx.rms_norm_eps, ctx.device)?;
                     Ok(builder.with_qk_norm(Arc::new(RmsNormQkNorm::new(q_norm, k_norm))))
                 } else {
                     // No Q/K norm (standard Qwen2)
@@ -213,9 +215,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         let meta = ct.get_metadata();
         let arch: String = {
             use crate::utils::gguf_metadata::TryValueInto;
-            meta.get("general.architecture")
-                .cloned()
-                .try_value_into()?
+            meta.get("general.architecture").cloned().try_value_into()?
         };
         if arch != "qwen2" && arch != "qwen3" {
             candle_core::bail!("Expected `qwen2` or `qwen3` architecture, got `{arch}`.");
@@ -248,9 +248,19 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         // Load output weights (tie to embeddings if not present)
         let output = if weights.has_tensor(&naming.output()) {
-            weights.load_linear(&naming.output(), config.hidden_size, config.vocab_size, device)?
+            weights.load_linear(
+                &naming.output(),
+                config.hidden_size,
+                config.vocab_size,
+                device,
+            )?
         } else {
-            weights.load_linear(&naming.token_embd(), config.hidden_size, config.vocab_size, device)?
+            weights.load_linear(
+                &naming.token_embd(),
+                config.hidden_size,
+                config.vocab_size,
+                device,
+            )?
         };
 
         // Load transformer layers using generic infrastructure
@@ -271,8 +281,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 let k_norm_name = naming.attn_k_norm(ctx.layer_idx);
 
                 if weights.has_tensor(&q_norm_name) && weights.has_tensor(&k_norm_name) {
-                    let q_norm = weights.load_rms_norm(&q_norm_name, ctx.rms_norm_eps, ctx.device)?;
-                    let k_norm = weights.load_rms_norm(&k_norm_name, ctx.rms_norm_eps, ctx.device)?;
+                    let q_norm =
+                        weights.load_rms_norm(&q_norm_name, ctx.rms_norm_eps, ctx.device)?;
+                    let k_norm =
+                        weights.load_rms_norm(&k_norm_name, ctx.rms_norm_eps, ctx.device)?;
                     let qk_norm: Arc<dyn crate::attention::QkNorm> =
                         Arc::new(RmsNormQkNorm::new(q_norm, k_norm));
                     Ok(builder.with_qk_norm(qk_norm))
@@ -343,7 +355,12 @@ impl TransformerModel for ModelWeights {
         standard_embed(self, tokens)
     }
 
-    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
         standard_transform(self, hidden, ctx, cache)
     }
 }
@@ -366,7 +383,9 @@ impl TransformerModelExt for ModelWeights {
     }
 
     fn mapper(&self) -> Option<&dyn DeviceMapper> {
-        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+        self.mapper
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn DeviceMapper)
     }
 
     fn model_dtype(&self) -> DType {

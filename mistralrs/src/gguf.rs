@@ -263,7 +263,7 @@ impl GgufModelBuilder {
         }
 
         if let Some(ref paged_attn_cfg) = self.paged_attn_cfg {
-            builder = builder.with_paged_attention(paged_attn_cfg.clone());
+            builder = builder.with_paged_attention(*paged_attn_cfg);
         }
 
         let pipeline = builder.build_async()?;

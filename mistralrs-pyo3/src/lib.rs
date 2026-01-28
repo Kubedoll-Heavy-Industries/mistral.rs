@@ -1,4 +1,6 @@
 #![allow(clippy::too_many_arguments)]
+// Allow deprecated APIs during migration to typed loader builders
+#![allow(deprecated)]
 
 use anyhow::Context;
 use anymoe::{AnyMoeConfig, AnyMoeExpertType};

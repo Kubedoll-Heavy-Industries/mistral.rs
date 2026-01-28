@@ -390,20 +390,34 @@ impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
 
     fn get_sequence_mut(&mut self, request_id: uuid::Uuid) -> Option<&mut Sequence> {
         // Check running first (more likely for active sequences)
-        if let Some(seq) = self.running.iter_mut().find(|s| s.request_id() == request_id) {
+        if let Some(seq) = self
+            .running
+            .iter_mut()
+            .find(|s| s.request_id() == request_id)
+        {
             return Some(seq);
         }
         // Then check waiting
-        self.waiting.iter_mut().find(|s| s.request_id() == request_id)
+        self.waiting
+            .iter_mut()
+            .find(|s| s.request_id() == request_id)
     }
 
     fn remove_sequence(&mut self, request_id: uuid::Uuid) -> Option<Sequence> {
         // Check running first
-        if let Some(pos) = self.running.iter().position(|s| s.request_id() == request_id) {
+        if let Some(pos) = self
+            .running
+            .iter()
+            .position(|s| s.request_id() == request_id)
+        {
             return Some(self.running.remove(pos));
         }
         // Then check waiting
-        if let Some(pos) = self.waiting.iter().position(|s| s.request_id() == request_id) {
+        if let Some(pos) = self
+            .waiting
+            .iter()
+            .position(|s| s.request_id() == request_id)
+        {
             return self.waiting.remove(pos);
         }
         None

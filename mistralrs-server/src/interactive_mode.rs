@@ -768,7 +768,7 @@ async fn audio_interactive_mode(
     unimplemented!("Using audio models isn't supported yet")
 }
 
-async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) {
+async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, _do_search: bool) {
     let sender = mistralrs.get_sender(None).unwrap();
 
     let diffusion_params = DiffusionGenerationParams::default();
@@ -858,7 +858,7 @@ async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) 
     rl.save_history(&history_file_path()).unwrap();
 }
 
-async fn speech_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) {
+async fn speech_interactive_mode(mistralrs: Arc<MistralRs>, _do_search: bool) {
     let sender = mistralrs.get_sender(None).unwrap();
 
     info!("Starting interactive loop for speech");

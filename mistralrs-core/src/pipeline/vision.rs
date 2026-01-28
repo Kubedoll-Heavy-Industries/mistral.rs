@@ -1,8 +1,8 @@
 use super::isq::ImatrixDataSource;
 use super::isq::UqffFullSer;
 use super::{
-    get_model_paths, get_xlora_paths, AdapterKind, AnyMoePipelineMixin, AutoregressivePipeline,
-    AutoVisionLoader, CacheManager, CacheManagerMixin, EitherCache, ForwardInputsResult,
+    get_model_paths, get_xlora_paths, AdapterKind, AnyMoePipelineMixin, AutoVisionLoader,
+    AutoregressivePipeline, CacheManager, CacheManagerMixin, EitherCache, ForwardInputsResult,
     Gemma3Loader, GeneralMetadata, IsqPipelineMixin, Loader, MetadataMixin, MiniCpmOLoader,
     ModelCategory, ModelKind, ModelPaths, MultimodalPromptPrefixer, Phi4MMLoader,
     PreProcessingMixin, Processor, Qwen2VLLoader, Qwen3VLLoader, Qwen3VLMoELoader, TokenSource,
@@ -25,6 +25,7 @@ use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::text_models_inputs_processor::make_prompt_chunk;
 use crate::pipeline::{get_chat_template, ChatTemplate, IsqOrganization, LocalModelPaths};
 use crate::prefix_cacher::PrefixCacheManagerV2;
+use crate::sampler::{Logprobs, Sampler, TokenSamplingParams};
 use crate::sequence::Sequence;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
@@ -33,7 +34,6 @@ use crate::utils::{
     tokens::get_token,
     varbuilder_utils::from_mmaped_safetensors,
 };
-use crate::sampler::{Logprobs, Sampler, TokenSamplingParams};
 use crate::vision_models::preprocessor_config::PreProcessorConfig;
 use crate::vision_models::processor_config::ProcessorConfig;
 use crate::vision_models::ModelInputs;

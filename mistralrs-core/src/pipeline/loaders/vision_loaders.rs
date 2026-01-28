@@ -4971,11 +4971,8 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
             use crate::vision_models::gemma3n::text::handle_matformer_slicing;
 
             let mapper = SingleDeviceMapper::new(Device::Cpu);
-            let (adjusted_cfg, _, _, _, _) = handle_matformer_slicing(
-                &cfg.text_config,
-                &Some(matformer_cfg.clone()),
-                &mapper,
-            )?;
+            let (adjusted_cfg, _, _, _, _) =
+                handle_matformer_slicing(&cfg.text_config, &Some(matformer_cfg.clone()), &mapper)?;
             adjusted_cfg
         } else {
             cfg.text_config.clone()
@@ -5356,11 +5353,8 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
             use crate::vision_models::gemma3n::text::handle_matformer_slicing;
 
             let mapper = SingleDeviceMapper::new(Device::Cpu);
-            let (adjusted_cfg, _, _, layer_rename_map, layers_skipped) = handle_matformer_slicing(
-                &cfg.text_config,
-                &Some(matformer_cfg.clone()),
-                &mapper,
-            )?;
+            let (adjusted_cfg, _, _, layer_rename_map, layers_skipped) =
+                handle_matformer_slicing(&cfg.text_config, &Some(matformer_cfg.clone()), &mapper)?;
             (adjusted_cfg, layer_rename_map, layers_skipped)
         } else {
             (cfg.text_config.clone(), None, None)

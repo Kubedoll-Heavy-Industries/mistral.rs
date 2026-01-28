@@ -348,10 +348,12 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
                 .ok()
                 .map(|x| x as usize)
                 .or_else(|| {
-                    c.metadata.get("tokenizer.ggml.tokens").and_then(|v| match v {
-                        candle_core::quantized::gguf_file::Value::Array(arr) => Some(arr.len()),
-                        _ => None,
-                    })
+                    c.metadata
+                        .get("tokenizer.ggml.tokens")
+                        .and_then(|v| match v {
+                            candle_core::quantized::gguf_file::Value::Array(arr) => Some(arr.len()),
+                            _ => None,
+                        })
                 })
                 .unwrap_or(32000), // Common default for Llama
             rope_dim: c.get_value::<u32>("rope.dimension_count")? as usize,
@@ -452,8 +454,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
             head_count_kv,
             block_count,
             embedding_length,
-            feed_forward_length: _,  // Used via LlamaConfig trait
-            vocab_size: _,           // Used via LlamaConfig trait
+            feed_forward_length: _, // Used via LlamaConfig trait
+            vocab_size: _,          // Used via LlamaConfig trait
             rope_dim,
             rms_norm_eps,
             max_seq_len,
@@ -484,7 +486,10 @@ impl ModelConfig::FromGGUF for ModelWeights {
         // PP: Only load norm and output (LM head) for last stage
         let is_last_stage = layer_end >= total_layers;
         let norm = if is_last_stage {
-            Some(RmsNorm::from_qtensor(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?)
+            Some(RmsNorm::from_qtensor(
+                ct.tensor("output_norm.weight", device)?,
+                rms_norm_eps,
+            )?)
         } else {
             None
         };
@@ -692,10 +697,13 @@ impl ModelConfig::FromGGUF for ModelWeights {
             layers,
             norm,
             output: output.map(|q_tensor| {
-                Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
-                    q_weight: Arc::new(q_tensor),
-                    b: None,
-                }).unwrap()) as Arc<dyn QuantMethod>
+                Arc::new(
+                    GgufMatMul::new(QuantMethodConfig::Gguf {
+                        q_weight: Arc::new(q_tensor),
+                        b: None,
+                    })
+                    .unwrap(),
+                ) as Arc<dyn QuantMethod>
             }),
             device: device.clone(),
             max_seq_len,
@@ -725,8 +733,7 @@ impl ModelWeights {
             let x = layer.attention_norm.forward(&hidden)?;
             let attn = layer.forward_attn(
                 &x,
-                mask.map(|m| m.to_device(x.device()).unwrap())
-                    .as_ref(),
+                mask.map(|m| m.to_device(x.device()).unwrap()).as_ref(),
                 position_offsets,
                 &mut cache[i],
                 metadata
@@ -767,7 +774,12 @@ impl TransformerModel for ModelWeights {
         self.tok_embeddings.forward(tokens)
     }
 
-    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
         let seq_len = hidden.dim(1)?;
         let start_offsets: Vec<usize> = vec![ctx.position_offset];
 

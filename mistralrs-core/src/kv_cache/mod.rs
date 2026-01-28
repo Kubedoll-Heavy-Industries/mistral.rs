@@ -484,7 +484,13 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         // reset the model-level cache directly. The engine sends CacheInstruction::Reset
         // for new requests and CacheInstruction::In for continuations, so we respect that.
         if seqs.iter().any(|seq| seq.preallocated_cache().is_none()) {
-            let cache_len_before = pipeline.cache().normal().0.first().map(|kv| kv.current_seq_len()).unwrap_or(0);
+            let cache_len_before = pipeline
+                .cache()
+                .normal()
+                .0
+                .first()
+                .map(|kv| kv.current_seq_len())
+                .unwrap_or(0);
 
             tracing::info!(
                 cache_len_before,
@@ -495,7 +501,13 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
             for layer in pipeline.cache().normal().0.iter_mut() {
                 layer.reset();
             }
-            let cache_len_after = pipeline.cache().normal().0.first().map(|kv| kv.current_seq_len()).unwrap_or(0);
+            let cache_len_after = pipeline
+                .cache()
+                .normal()
+                .0
+                .first()
+                .map(|kv| kv.current_seq_len())
+                .unwrap_or(0);
             tracing::info!(
                 cache_len_after,
                 "NormalCacheManager::set_none_cache - AFTER reset"

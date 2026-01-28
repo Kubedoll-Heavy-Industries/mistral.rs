@@ -194,13 +194,13 @@ fn load_test_pipeline(
     Ok(pipeline)
 }
 
-/// Cache for loaded pipelines (avoid reloading in multiple tests).
-static PIPELINE_CACHE: OnceLock<
-    std::sync::Mutex<HashMap<String, Arc<Mutex<dyn Pipeline + Send + Sync>>>>,
-> = OnceLock::new();
+/// Type alias for the pipeline cache to reduce complexity.
+type PipelineCache = std::sync::Mutex<HashMap<String, Arc<Mutex<dyn Pipeline + Send + Sync>>>>;
 
-fn get_pipeline_cache(
-) -> &'static std::sync::Mutex<HashMap<String, Arc<Mutex<dyn Pipeline + Send + Sync>>>> {
+/// Cache for loaded pipelines (avoid reloading in multiple tests).
+static PIPELINE_CACHE: OnceLock<PipelineCache> = OnceLock::new();
+
+fn get_pipeline_cache() -> &'static PipelineCache {
     PIPELINE_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -270,7 +270,7 @@ fn run_smoke_test(config: &SafetensorsTestConfig) -> Result<(), Box<dyn std::err
             .encode(test_text.as_str(), false)
             .expect("Tokenization should succeed");
         println!("Tokenized '{}' -> {} tokens", test_text, encoding.len());
-        assert!(encoding.len() > 0, "Tokenization should produce tokens");
+        assert!(!encoding.is_empty(), "Tokenization should produce tokens");
 
         println!("=== {} PASSED ===\n", config.name);
     });

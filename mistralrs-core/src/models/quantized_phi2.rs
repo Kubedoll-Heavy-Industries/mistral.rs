@@ -22,13 +22,12 @@ use crate::attention::{AttentionConfig, FusedQkvCausalAttention, PositionEncodin
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
 use crate::layers::{
-    Activation, CausalMasker, MatMul, NonGatedMlp, ParallelTransformerBlock, PartialRotaryEmbedding,
-    QLinear,
+    Activation, CausalMasker, MatMul, NonGatedMlp, ParallelTransformerBlock,
+    PartialRotaryEmbedding, QLinear,
 };
 use crate::layers_masker::PastKvLenCache;
 use crate::models::{
-    LanguageModel, LanguageModelExt, Model, TransformContext, TransformerModel,
-    TransformerModelExt,
+    LanguageModel, LanguageModelExt, Model, TransformContext, TransformerModel, TransformerModelExt,
 };
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::KvCache;
@@ -249,13 +248,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             };
 
             // Create fused QKV attention
-            let mut attention = FusedQkvCausalAttention::new(
-                attn_config,
-                qkv_proj,
-                o_proj,
-                rope.clone(),
-            )
-            .with_attn_dtype(dtype);
+            let mut attention =
+                FusedQkvCausalAttention::new(attn_config, qkv_proj, o_proj, rope.clone())
+                    .with_attn_dtype(dtype);
 
             if let Some(pa) = paged_attn {
                 attention = attention.with_paged_attn(pa);
@@ -363,7 +358,13 @@ impl TransformerModel for ModelWeights {
                 .as_ref()
                 .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta));
 
-            x = layer.forward(x, mask.as_ref(), &start_offsets, &mut cache[i], layer_metadata)?;
+            x = layer.forward(
+                x,
+                mask.as_ref(),
+                &start_offsets,
+                &mut cache[i],
+                layer_metadata,
+            )?;
         }
 
         Ok(x)
@@ -410,7 +411,9 @@ impl TransformerModelExt for ModelWeights {
     }
 
     fn mapper(&self) -> Option<&dyn DeviceMapper> {
-        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+        self.mapper
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn DeviceMapper)
     }
 
     fn model_dtype(&self) -> DType {

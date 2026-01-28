@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use candle_core::{DType, Result, Tensor};
+use candle_core::{DType, IndexOp, Result, Tensor};
 use mistralrs_quant::QuantMethod;
 
 use super::{AdapterRegistry, LinearLayerLike, Merge};
@@ -84,7 +84,11 @@ impl RegistryLoraLinear {
     /// * `base` - The base linear layer (can be quantized)
     /// * `registry` - Shared adapter registry
     /// * `layer_idx` - Index of this layer (for fetching weights)
-    pub fn new(base: Arc<dyn QuantMethod>, registry: Arc<AdapterRegistry>, layer_idx: usize) -> Self {
+    pub fn new(
+        base: Arc<dyn QuantMethod>,
+        registry: Arc<AdapterRegistry>,
+        layer_idx: usize,
+    ) -> Self {
         Self {
             base,
             registry,
@@ -119,9 +123,9 @@ impl RegistryLoraLinear {
         // Check if all adapters have compatible shapes for stacking
         let first_a_shape = weights[0].0.dims();
         let first_b_shape = weights[0].1.dims();
-        let can_stack = weights.iter().all(|(a, b, _)| {
-            a.dims() == first_a_shape && b.dims() == first_b_shape
-        });
+        let can_stack = weights
+            .iter()
+            .all(|(a, b, _)| a.dims() == first_a_shape && b.dims() == first_b_shape);
 
         if !can_stack || weights.len() == 1 {
             // Can't stack or only one adapter - no benefit from stacking
@@ -182,7 +186,7 @@ impl RegistryLoraLinear {
         let out = out.reshape((cache.scales.len(), b, s, o_h))?;
 
         // Sum over adapters and apply global scaling
-        Ok((out.sum(0)? * global_scaling_weight)?)
+        out.sum(0)? * global_scaling_weight
     }
 
     /// Forward pass iterating over adapters (slow path for incompatible shapes).
@@ -212,11 +216,70 @@ impl RegistryLoraLinear {
         }
 
         // Reshape back to (batch, seq, out_features)
-        let result = result.ok_or_else(|| {
-            candle_core::Error::Msg("No adapter weights to iterate".to_string())
-        })?;
+        let result = result
+            .ok_or_else(|| candle_core::Error::Msg("No adapter weights to iterate".to_string()))?;
         let out_features = result.dim(1)?;
         result.reshape((b_size, s, out_features))
+    }
+
+    /// Forward pass with XLoRA per-token scalings.
+    ///
+    /// Each adapter's output is weighted by the corresponding scaling value
+    /// at each token position.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - Input tensor of shape `[batch, seq, hidden]`
+    /// * `scalings` - Scalings tensor of shape `[batch, seq, n_adapters]` or
+    ///   `[batch, seq, n_layers, n_adapters]` for layerwise
+    /// * `weights` - Adapter weights `[(A, B, scale)]` in adapter_order
+    /// * `global_scaling_weight` - Global multiplier for all adapter outputs
+    fn forward_with_scalings(
+        &self,
+        input: &Tensor,
+        scalings: &Tensor,
+        weights: &[(Tensor, Tensor, f64)],
+        global_scaling_weight: f64,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len, h) = input.dims3()?;
+
+        // Extract scalings for this layer if layerwise
+        // Shape: [batch, seq, n_adapters]
+        let layer_scalings = if scalings.dims().len() == 4 {
+            // Layerwise: [batch, seq, n_layers, n_adapters] -> [batch, seq, n_adapters]
+            scalings.i((.., .., self.layer_idx, ..))?
+        } else {
+            // Global: [batch, seq, n_adapters]
+            scalings.clone()
+        };
+
+        let input_flat = input.reshape((b_size * seq_len, h))?;
+        let mut result: Option<Tensor> = None;
+
+        for (adapter_idx, (a, b_mat, scale)) in weights.iter().enumerate() {
+            // Compute adapter output: (batch*seq, out)
+            let input_dtype = input_flat.to_dtype(a.dtype())?;
+            let adapter_out = input_dtype.matmul(&a.t()?)?.matmul(&b_mat.t()?)?;
+            let out_features = adapter_out.dim(1)?;
+
+            // Reshape to (batch, seq, out)
+            let adapter_out = adapter_out.reshape((b_size, seq_len, out_features))?;
+
+            // Get per-token scaling for this adapter: [batch, seq, 1]
+            let adapter_scaling = layer_scalings.i((.., .., adapter_idx))?.unsqueeze(2)?;
+
+            // Apply per-token scaling + fixed scale + global weight
+            let scaled = adapter_out
+                .broadcast_mul(&adapter_scaling)?
+                .affine(*scale * global_scaling_weight, 0.0)?;
+
+            result = Some(match result {
+                Some(r) => (r + scaled)?,
+                None => scaled,
+            });
+        }
+
+        result.ok_or_else(|| candle_core::Error::Msg("No adapter weights to apply".to_string()))
     }
 }
 
@@ -232,7 +295,7 @@ impl Merge for RegistryLoraLinear {
         }
 
         let (a, b, scale) = &weights[adapter_idx];
-        Ok((MatMul.matmul(b, a)? * *scale)?)
+        MatMul.matmul(b, a)? * *scale
     }
 
     fn merge_weights(&mut self) -> Result<()> {
@@ -281,7 +344,7 @@ impl LinearLayerLike for RegistryLoraLinear {
     fn lora_forward(
         &self,
         input: &Tensor,
-        _scalings: Option<Tensor>, // XLoRA scalings - handled separately
+        _scalings: Option<Tensor>, // XLoRA scalings - now pulled from registry
         global_scaling_weight: f64,
         is_scaling_pass: Option<f64>,
     ) -> Result<Tensor> {
@@ -298,7 +361,20 @@ impl LinearLayerLike for RegistryLoraLinear {
             return Ok(result);
         }
 
-        // Get current active adapters
+        // Check if we're in XLoRA Scalings mode
+        if let Some(scalings) = self.registry.get_scalings()? {
+            // XLoRA mode: apply all adapters with per-token scalings
+            let weights = self.registry.get_all_weights_for_layer(self.layer_idx)?;
+            if weights.is_empty() {
+                return Ok(result);
+            }
+
+            let adapter_out =
+                self.forward_with_scalings(input, &scalings, &weights, global_scaling_weight)?;
+            return result + adapter_out;
+        }
+
+        // Active mode: standard LoRA with named adapters
         let active_names = self.registry.get_active_names()?;
         if active_names.is_empty() {
             return Ok(result);
@@ -422,10 +498,10 @@ impl mistralrs_quant::QuantMethod for RegistryLoraLinear {
         guard: mistralrs_quant::QuantizeOntoGuard,
     ) -> Result<Arc<dyn QuantMethod>> {
         // Apply ISQ to base layer, rewrap with LoRA
-        let new_base = self
-            .base
-            .clone()
-            .apply_isq(dtype, device, n_quantized, imatrix_weight, guard)?;
+        let new_base =
+            self.base
+                .clone()
+                .apply_isq(dtype, device, n_quantized, imatrix_weight, guard)?;
         Ok(Arc::new(RegistryLoraLinear {
             base: new_base,
             registry: self.registry.clone(),
@@ -626,7 +702,10 @@ mod tests {
         assert_eq!(output_with_adapter.dims(), &[1, 8, out_features]);
 
         // Outputs should be different (adapter adds a delta)
-        let diff = (&output - &output_with_adapter)?.abs()?.sum_all()?.to_scalar::<f32>()?;
+        let diff = (&output - &output_with_adapter)?
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
         assert!(diff > 0.0, "Adapter should change the output");
 
         Ok(())
@@ -642,6 +721,107 @@ mod tests {
 
         assert_eq!(dtype, DType::F32);
         assert!(device.is_cpu());
+
+        Ok(())
+    }
+
+    /// Test XLoRA scalings mode forward pass.
+    #[test]
+    fn test_xlora_scalings_forward() -> Result<()> {
+        use crate::lora::AdapterSelection;
+
+        let (layer, registry) = create_test_layer()?;
+        let device = Device::Cpu;
+
+        // Register two adapters
+        let mut weights1 = AdapterWeights::new();
+        weights1.add_layer(
+            0,
+            Tensor::randn(0.0f32, 0.1, (4, 16), &device)?,
+            Tensor::randn(0.0f32, 0.1, (32, 4), &device)?,
+        );
+        registry.register("adapter-1", test_config(), weights1)?;
+
+        let mut weights2 = AdapterWeights::new();
+        weights2.add_layer(
+            0,
+            Tensor::randn(0.0f32, 0.1, (4, 16), &device)?,
+            Tensor::randn(0.0f32, 0.1, (32, 4), &device)?,
+        );
+        registry.register("adapter-2", test_config(), weights2)?;
+
+        // Create input: batch=1, seq=4, hidden=16
+        let input = Tensor::randn(0.0f32, 1.0, (1, 4, 16), &device)?;
+
+        // Get baseline output with no adapters
+        let baseline = layer.lora_forward(&input, None, 1.0, None)?;
+        assert_eq!(baseline.dims(), &[1, 4, 32]);
+
+        // Create scalings tensor: [batch=1, seq=4, adapters=2]
+        // First adapter weight=0.7, second adapter weight=0.3
+        let scalings_data: Vec<f32> = vec![
+            0.7, 0.3, // token 0
+            0.7, 0.3, // token 1
+            0.7, 0.3, // token 2
+            0.7, 0.3, // token 3
+        ];
+        let scalings = Tensor::from_vec(scalings_data, (1, 4, 2), &device)?;
+
+        // Set Scalings mode
+        registry.set_selection(AdapterSelection::Scalings(scalings))?;
+        assert!(registry.is_scalings_mode()?);
+
+        // Forward with scalings
+        let output = layer.lora_forward(&input, None, 1.0, None)?;
+        assert_eq!(output.dims(), &[1, 4, 32]);
+
+        // Output should differ from baseline (adapters applied)
+        let diff = (&baseline - &output)?
+            .abs()?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert!(diff > 0.0, "Scalings should change the output");
+
+        Ok(())
+    }
+
+    /// Test XLoRA layerwise scalings (4D tensor).
+    #[test]
+    fn test_xlora_layerwise_scalings() -> Result<()> {
+        use crate::lora::AdapterSelection;
+
+        let device = Device::Cpu;
+        let in_features = 16;
+        let out_features = 32;
+
+        // Create base linear for layer 0
+        let weight = Tensor::randn(0.0f32, 1.0, (out_features, in_features), &device)?;
+        let base = Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
+            candle_nn::Linear::new(weight, None),
+        ))?) as Arc<dyn QuantMethod>;
+
+        let registry = Arc::new(AdapterRegistry::new(device.clone()));
+        let layer = RegistryLoraLinear::new(base, registry.clone(), 0); // layer_idx = 0
+
+        // Register adapter
+        let mut weights = AdapterWeights::new();
+        weights.add_layer(
+            0,
+            Tensor::randn(0.0f32, 0.1, (4, 16), &device)?,
+            Tensor::randn(0.0f32, 0.1, (32, 4), &device)?,
+        );
+        registry.register("adapter-1", test_config(), weights)?;
+
+        let input = Tensor::randn(0.0f32, 1.0, (1, 4, 16), &device)?;
+
+        // Create layerwise scalings: [batch=1, seq=4, n_layers=2, adapters=1]
+        // This simulates 2 layers, we're layer 0
+        let scalings = Tensor::ones((1, 4, 2, 1), candle_core::DType::F32, &device)?;
+
+        registry.set_selection(AdapterSelection::Scalings(scalings))?;
+
+        let output = layer.lora_forward(&input, None, 1.0, None)?;
+        assert_eq!(output.dims(), &[1, 4, 32]);
 
         Ok(())
     }

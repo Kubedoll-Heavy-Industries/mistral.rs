@@ -45,7 +45,8 @@ use rand_isaac::Isaac64Rng;
 use tokenizers::Tokenizer;
 
 use crate::device_map::DeviceMapper;
-use crate::kv_cache::{CacheManager, FullCacheManager, NormalCache, NormalCacheManager};
+use crate::kv_cache::{CacheManager, FullCacheManager, KvCache, NormalCache, NormalCacheManager};
+use crate::lora::{AdapterRegistry, AdapterSelection, XLoraClassifier};
 use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
 use crate::pipeline::hooks::{ActivationResult, HookContainer};
 use crate::pipeline::sampling::sample_and_add_toks;
@@ -92,7 +93,10 @@ pub struct TextPipeline<M: LanguageModel + Send + Sync> {
     /// Pipeline hook for distributed inference (PP stage communication).
     hook: Option<HookContainer>,
     /// Adapter registry for per-request LoRA adapter selection.
-    adapter_registry: Option<Arc<crate::lora::AdapterRegistry>>,
+    adapter_registry: Option<Arc<AdapterRegistry>>,
+    /// XLoRA classifier for computing per-token adapter scalings.
+    /// When present, enables XLoRA two-pass inference.
+    xlora_classifier: Option<XLoraClassifier>,
 }
 
 impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
@@ -128,6 +132,7 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
             cache,
             hook: None,
             adapter_registry: None,
+            xlora_classifier: None,
         }
     }
 
@@ -138,8 +143,21 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
     }
 
     /// Configure per-request LoRA adapter registry (builder pattern).
-    pub fn with_adapter_registry(mut self, registry: Arc<crate::lora::AdapterRegistry>) -> Self {
+    pub fn with_adapter_registry(mut self, registry: Arc<AdapterRegistry>) -> Self {
         self.adapter_registry = Some(registry);
+        self
+    }
+
+    /// Configure XLoRA classifier for per-token adapter scalings (builder pattern).
+    ///
+    /// When a classifier is set, the pipeline performs XLoRA two-pass inference:
+    /// 1. Scaling pass: Forward with no adapters to get hidden states
+    /// 2. Classifier: Compute per-token scalings from hidden states
+    /// 3. Main pass: Forward with scalings applied to all adapters
+    ///
+    /// Requires `adapter_registry` to also be set.
+    pub fn with_xlora_classifier(mut self, classifier: XLoraClassifier) -> Self {
+        self.xlora_classifier = Some(classifier);
         self
     }
 
@@ -153,6 +171,19 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
     /// Get the adapter registry if configured.
     pub fn adapter_registry(&self) -> Option<&Arc<crate::lora::AdapterRegistry>> {
         self.adapter_registry.as_ref()
+    }
+
+    /// Set the XLoRA classifier for per-token adapter scalings.
+    ///
+    /// This allows setting the classifier after pipeline construction.
+    /// When set, the pipeline performs XLoRA two-pass inference.
+    pub fn set_xlora_classifier(&mut self, classifier: XLoraClassifier) {
+        self.xlora_classifier = Some(classifier);
+    }
+
+    /// Get the XLoRA classifier if configured.
+    pub fn xlora_classifier(&self) -> Option<&XLoraClassifier> {
+        self.xlora_classifier.as_ref()
     }
 
     /// Whether this stage has embedding weights (first stage).
@@ -204,7 +235,12 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
             self.model.embed(input_ids)?
         } else {
             // TAIL: receive activation from previous stage
-            match self.hook.as_ref().unwrap().receive_stage_input(request_id)? {
+            match self
+                .hook
+                .as_ref()
+                .unwrap()
+                .receive_stage_input(request_id)?
+            {
                 Some(ActivationResult::Data { tensor }) => tensor,
                 Some(ActivationResult::Completed { reason }) => {
                     return Ok(ForwardInputsResult::PipelineCompleted { reason });
@@ -227,12 +263,13 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
                 .map_or(0, |c| c.current_seq_len())
         };
 
-        let paged_attn_ctx = paged_attn_meta.as_ref().map(|(kv_cache, metadata)| {
-            PagedAttentionContext {
-                kv_cache: kv_cache.clone(),
-                metadata,
-            }
-        });
+        let paged_attn_ctx =
+            paged_attn_meta
+                .as_ref()
+                .map(|(kv_cache, metadata)| PagedAttentionContext {
+                    kv_cache: kv_cache.clone(),
+                    metadata,
+                });
         let ctx = TransformContext {
             seq_len: hidden.dims()[1],
             position_offset,
@@ -241,7 +278,37 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
             position_ids: None,
         };
 
+        // XLoRA: Scaling pass with temporary cache to compute adapter scalings
+        // This pass collects hidden states WITHOUT applying adapters, then uses
+        // the classifier to compute per-token scalings for the main pass.
+        if let Some(ref classifier) = self.xlora_classifier {
+            if let Some(ref registry) = self.adapter_registry {
+                // Disable adapters during scaling pass by setting empty Active selection
+                registry.set_selection(AdapterSelection::Active(Vec::new()))?;
+
+                // Create temporary cache that gets dropped after scaling pass
+                // dim=2 (k,v heads dimension), capacity is minimal since it's throwaway
+                let max_seq_len = self.model.max_seq_len();
+                let mut temp_cache: Vec<KvCache> = (0..self.model.num_layers())
+                    .map(|_| KvCache::new_normal(2, max_seq_len, 512))
+                    .collect();
+
+                // Forward through model to get final hidden states (no adapters applied)
+                let scaling_hidden =
+                    self.model
+                        .transform(hidden.clone(), &ctx, &mut temp_cache)?;
+
+                // Compute scalings from hidden states
+                let scalings = classifier.forward(scaling_hidden)?;
+
+                // Set scalings on the adapter registry for the main pass
+                registry.set_selection(AdapterSelection::Scalings(scalings))?;
+                // temp_cache dropped here - scaling pass cache is discarded
+            }
+        }
+
         // Transform through layers - MONOMORPHIZED, zero vtable overhead
+        // If XLoRA is active, adapters now use the computed scalings
         let hidden = self
             .model
             .transform(hidden, &ctx, &mut self.cache.normal().0)?;
@@ -249,10 +316,12 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
         // Step 3: Output (send activation OR compute logits)
         if !self.has_lm_head() {
             // HEAD: send activation to next stage
-            self.hook
-                .as_ref()
-                .unwrap()
-                .send_stage_output(&hidden, &[], request_id, position_offset)?;
+            self.hook.as_ref().unwrap().send_stage_output(
+                &hidden,
+                &[],
+                request_id,
+                position_offset,
+            )?;
 
             if self.hook.as_ref().unwrap().needs_external_logits() {
                 // HEAD: wait for logits from TAIL
@@ -424,7 +493,7 @@ impl<M: LanguageModel + Send + Sync + 'static> Pipeline for TextPipeline<M> {
 
         // Activate per-request LoRA adapters if configured
         if let (Some(registry), Some(adapter_names)) = (&self.adapter_registry, &adapters) {
-            registry.set_active(&adapter_names)?;
+            registry.set_active(adapter_names)?;
         }
 
         // Set request context on hook BEFORE forward

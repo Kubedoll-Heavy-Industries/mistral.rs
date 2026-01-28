@@ -194,9 +194,7 @@ impl TransformerConfig {
             .unwrap_or(head_dim);
 
         if head_dim != value_length {
-            anyhow::bail!(
-                "Expected key_length == value_length, got {head_dim} != {value_length}"
-            );
+            anyhow::bail!("Expected key_length == value_length, got {head_dim} != {value_length}");
         }
 
         // intermediate_size often not in GGUF metadata, use 0 as sentinel
@@ -477,8 +475,14 @@ impl<'a> SafetensorsWeightSource<'a> {
     /// # Arguments
     /// * `vb` - ShardedVarBuilder pointing to model weights (e.g., `vb.pp("model")`)
     /// * `quantization_config` - Optional quantization config for pre-quantized models
-    pub fn new(vb: &'a ShardedVarBuilder, quantization_config: Option<&'a QuantizedConfig>) -> Self {
-        Self { vb, quantization_config }
+    pub fn new(
+        vb: &'a ShardedVarBuilder,
+        quantization_config: Option<&'a QuantizedConfig>,
+    ) -> Self {
+        Self {
+            vb,
+            quantization_config,
+        }
     }
 }
 
@@ -522,7 +526,12 @@ impl WeightSource for SafetensorsWeightSource<'_> {
         hidden_size: usize,
         _device: &Device,
     ) -> Result<Embedding> {
-        embedding(vocab_size, hidden_size, self.vb.pp(name), &self.quantization_config.cloned())
+        embedding(
+            vocab_size,
+            hidden_size,
+            self.vb.pp(name),
+            &self.quantization_config.cloned(),
+        )
     }
 
     fn load_rms_norm(&mut self, name: &str, eps: f64, _device: &Device) -> Result<RmsNorm> {
@@ -530,7 +539,12 @@ impl WeightSource for SafetensorsWeightSource<'_> {
         RmsNorm::new(0, eps, self.vb.pp(name))
     }
 
-    fn load_layer_norm(&mut self, base_name: &str, eps: f64, _device: &Device) -> Result<LayerNorm> {
+    fn load_layer_norm(
+        &mut self,
+        base_name: &str,
+        eps: f64,
+        _device: &Device,
+    ) -> Result<LayerNorm> {
         let vb = self.vb.pp(base_name);
         let weight = vb.get_with_hints((), "weight", Default::default())?;
         let bias = vb.get_with_hints((), "bias", Default::default())?;
@@ -556,7 +570,12 @@ pub struct LayerConfig {
 }
 
 impl LayerConfig {
-    pub fn new(num_heads: usize, num_kv_heads: usize, head_dim: usize, hidden_act: Activation) -> Self {
+    pub fn new(
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        hidden_act: Activation,
+    ) -> Self {
         Self {
             num_heads,
             num_kv_heads,
@@ -771,23 +790,43 @@ impl TransformerLayerBuilder {
     /// are automatically wrapped with `RegistryLoraLinear` for per-request switching.
     pub fn build(self) -> Result<TransformerBlock<RmsNorm, CausalAttention, Mlp>> {
         // Extract projections
-        let q_proj = self.q_proj.ok_or_else(|| candle_core::Error::Msg("q_proj not set".into()))?;
-        let k_proj = self.k_proj.ok_or_else(|| candle_core::Error::Msg("k_proj not set".into()))?;
-        let v_proj = self.v_proj.ok_or_else(|| candle_core::Error::Msg("v_proj not set".into()))?;
-        let o_proj = self.o_proj.ok_or_else(|| candle_core::Error::Msg("o_proj not set".into()))?;
-        let gate_proj = self.gate_proj.ok_or_else(|| candle_core::Error::Msg("gate_proj not set".into()))?;
-        let up_proj = self.up_proj.ok_or_else(|| candle_core::Error::Msg("up_proj not set".into()))?;
-        let down_proj = self.down_proj.ok_or_else(|| candle_core::Error::Msg("down_proj not set".into()))?;
-        let attn_norm = self.attn_norm.ok_or_else(|| candle_core::Error::Msg("attn_norm not set".into()))?;
-        let ffn_norm = self.ffn_norm.ok_or_else(|| candle_core::Error::Msg("ffn_norm not set".into()))?;
-        let rope = self.rope.ok_or_else(|| candle_core::Error::Msg("rope not set".into()))?;
+        let q_proj = self
+            .q_proj
+            .ok_or_else(|| candle_core::Error::Msg("q_proj not set".into()))?;
+        let k_proj = self
+            .k_proj
+            .ok_or_else(|| candle_core::Error::Msg("k_proj not set".into()))?;
+        let v_proj = self
+            .v_proj
+            .ok_or_else(|| candle_core::Error::Msg("v_proj not set".into()))?;
+        let o_proj = self
+            .o_proj
+            .ok_or_else(|| candle_core::Error::Msg("o_proj not set".into()))?;
+        let gate_proj = self
+            .gate_proj
+            .ok_or_else(|| candle_core::Error::Msg("gate_proj not set".into()))?;
+        let up_proj = self
+            .up_proj
+            .ok_or_else(|| candle_core::Error::Msg("up_proj not set".into()))?;
+        let down_proj = self
+            .down_proj
+            .ok_or_else(|| candle_core::Error::Msg("down_proj not set".into()))?;
+        let attn_norm = self
+            .attn_norm
+            .ok_or_else(|| candle_core::Error::Msg("attn_norm not set".into()))?;
+        let ffn_norm = self
+            .ffn_norm
+            .ok_or_else(|| candle_core::Error::Msg("ffn_norm not set".into()))?;
+        let rope = self
+            .rope
+            .ok_or_else(|| candle_core::Error::Msg("rope not set".into()))?;
 
         // Wrap projections with LoRA if adapter registry is configured
         let (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj) =
             if let Some(ref registry) = self.adapter_registry {
                 let base_idx = self.layer_base_idx;
                 (
-                    crate::lora::wrap_with_lora(q_proj, registry.clone(), base_idx + 0),
+                    crate::lora::wrap_with_lora(q_proj, registry.clone(), base_idx),
                     crate::lora::wrap_with_lora(k_proj, registry.clone(), base_idx + 1),
                     crate::lora::wrap_with_lora(v_proj, registry.clone(), base_idx + 2),
                     crate::lora::wrap_with_lora(o_proj, registry.clone(), base_idx + 3),
@@ -796,7 +835,9 @@ impl TransformerLayerBuilder {
                     crate::lora::wrap_with_lora(down_proj, registry.clone(), base_idx + 6),
                 )
             } else {
-                (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj)
+                (
+                    q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj,
+                )
             };
 
         // Build attention config
@@ -851,20 +892,34 @@ impl TransformerLayerBuilder {
         ffn: F,
     ) -> Result<TransformerBlock<RmsNorm, CausalAttention, F>> {
         // Extract attention projections
-        let q_proj = self.q_proj.ok_or_else(|| candle_core::Error::Msg("q_proj not set".into()))?;
-        let k_proj = self.k_proj.ok_or_else(|| candle_core::Error::Msg("k_proj not set".into()))?;
-        let v_proj = self.v_proj.ok_or_else(|| candle_core::Error::Msg("v_proj not set".into()))?;
-        let o_proj = self.o_proj.ok_or_else(|| candle_core::Error::Msg("o_proj not set".into()))?;
-        let attn_norm = self.attn_norm.ok_or_else(|| candle_core::Error::Msg("attn_norm not set".into()))?;
-        let ffn_norm = self.ffn_norm.ok_or_else(|| candle_core::Error::Msg("ffn_norm not set".into()))?;
-        let rope = self.rope.ok_or_else(|| candle_core::Error::Msg("rope not set".into()))?;
+        let q_proj = self
+            .q_proj
+            .ok_or_else(|| candle_core::Error::Msg("q_proj not set".into()))?;
+        let k_proj = self
+            .k_proj
+            .ok_or_else(|| candle_core::Error::Msg("k_proj not set".into()))?;
+        let v_proj = self
+            .v_proj
+            .ok_or_else(|| candle_core::Error::Msg("v_proj not set".into()))?;
+        let o_proj = self
+            .o_proj
+            .ok_or_else(|| candle_core::Error::Msg("o_proj not set".into()))?;
+        let attn_norm = self
+            .attn_norm
+            .ok_or_else(|| candle_core::Error::Msg("attn_norm not set".into()))?;
+        let ffn_norm = self
+            .ffn_norm
+            .ok_or_else(|| candle_core::Error::Msg("ffn_norm not set".into()))?;
+        let rope = self
+            .rope
+            .ok_or_else(|| candle_core::Error::Msg("rope not set".into()))?;
 
         // Wrap attention projections with LoRA if registry is configured
         // (FFN is passed in externally, so caller handles MoE LoRA if needed)
         let (q_proj, k_proj, v_proj, o_proj) = if let Some(ref registry) = self.adapter_registry {
             let base_idx = self.layer_base_idx;
             (
-                crate::lora::wrap_with_lora(q_proj, registry.clone(), base_idx + 0),
+                crate::lora::wrap_with_lora(q_proj, registry.clone(), base_idx),
                 crate::lora::wrap_with_lora(k_proj, registry.clone(), base_idx + 1),
                 crate::lora::wrap_with_lora(v_proj, registry.clone(), base_idx + 2),
                 crate::lora::wrap_with_lora(o_proj, registry.clone(), base_idx + 3),
@@ -920,7 +975,8 @@ pub type MoETransformerBlock<R> = TransformerBlock<RmsNorm, CausalAttention, cra
 /// MoE or MLP transformer block type alias (for models with mixed layers).
 ///
 /// Used by Qwen3 MoE where some layers are MoE and others are standard MLP.
-pub type MoEOrMlpTransformerBlock<R> = TransformerBlock<RmsNorm, CausalAttention, crate::moe::MoEOrMlp<R>>;
+pub type MoEOrMlpTransformerBlock<R> =
+    TransformerBlock<RmsNorm, CausalAttention, crate::moe::MoEOrMlp<R>>;
 
 /// Context passed to the layer customizer closure.
 ///
@@ -1154,7 +1210,11 @@ pub fn load_transformer_layers<W, N, F>(
 where
     W: WeightSource,
     N: TensorNaming,
-    F: FnMut(LayerCustomizerContext<'_>, TransformerLayerBuilder, &mut W) -> Result<TransformerLayerBuilder>,
+    F: FnMut(
+        LayerCustomizerContext<'_>,
+        TransformerLayerBuilder,
+        &mut W,
+    ) -> Result<TransformerLayerBuilder>,
 {
     // Determine layer range
     let layer_start = layer_range.as_ref().map(|r| r.start).unwrap_or(0);
@@ -1216,25 +1276,81 @@ where
         // Use optional bias loading for Q/K/V if enabled (Qwen2-style)
         let (q_proj, k_proj, v_proj) = if config.use_attention_bias {
             (
-                weights.load_linear_with_optional_bias(&naming.attn_q(layer_idx), hidden_size, num_heads * head_dim, layer_device)?,
-                weights.load_linear_with_optional_bias(&naming.attn_k(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
-                weights.load_linear_with_optional_bias(&naming.attn_v(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
+                weights.load_linear_with_optional_bias(
+                    &naming.attn_q(layer_idx),
+                    hidden_size,
+                    num_heads * head_dim,
+                    layer_device,
+                )?,
+                weights.load_linear_with_optional_bias(
+                    &naming.attn_k(layer_idx),
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    layer_device,
+                )?,
+                weights.load_linear_with_optional_bias(
+                    &naming.attn_v(layer_idx),
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    layer_device,
+                )?,
             )
         } else {
             (
-                weights.load_linear(&naming.attn_q(layer_idx), hidden_size, num_heads * head_dim, layer_device)?,
-                weights.load_linear(&naming.attn_k(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
-                weights.load_linear(&naming.attn_v(layer_idx), hidden_size, num_kv_heads * head_dim, layer_device)?,
+                weights.load_linear(
+                    &naming.attn_q(layer_idx),
+                    hidden_size,
+                    num_heads * head_dim,
+                    layer_device,
+                )?,
+                weights.load_linear(
+                    &naming.attn_k(layer_idx),
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    layer_device,
+                )?,
+                weights.load_linear(
+                    &naming.attn_v(layer_idx),
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    layer_device,
+                )?,
             )
         };
-        let o_proj = weights.load_linear(&naming.attn_output(layer_idx), num_heads * head_dim, hidden_size, layer_device)?;
-        let gate_proj = weights.load_linear(&naming.ffn_gate(layer_idx), hidden_size, intermediate_size, layer_device)?;
-        let up_proj = weights.load_linear(&naming.ffn_up(layer_idx), hidden_size, intermediate_size, layer_device)?;
-        let down_proj = weights.load_linear(&naming.ffn_down(layer_idx), intermediate_size, hidden_size, layer_device)?;
-        let attn_norm =
-            weights.load_rms_norm(&naming.attn_norm(layer_idx), config.rms_norm_eps, layer_device)?;
-        let ffn_norm =
-            weights.load_rms_norm(&naming.ffn_norm(layer_idx), config.rms_norm_eps, layer_device)?;
+        let o_proj = weights.load_linear(
+            &naming.attn_output(layer_idx),
+            num_heads * head_dim,
+            hidden_size,
+            layer_device,
+        )?;
+        let gate_proj = weights.load_linear(
+            &naming.ffn_gate(layer_idx),
+            hidden_size,
+            intermediate_size,
+            layer_device,
+        )?;
+        let up_proj = weights.load_linear(
+            &naming.ffn_up(layer_idx),
+            hidden_size,
+            intermediate_size,
+            layer_device,
+        )?;
+        let down_proj = weights.load_linear(
+            &naming.ffn_down(layer_idx),
+            intermediate_size,
+            hidden_size,
+            layer_device,
+        )?;
+        let attn_norm = weights.load_rms_norm(
+            &naming.attn_norm(layer_idx),
+            config.rms_norm_eps,
+            layer_device,
+        )?;
+        let ffn_norm = weights.load_rms_norm(
+            &naming.ffn_norm(layer_idx),
+            config.rms_norm_eps,
+            layer_device,
+        )?;
 
         // Build layer config
         let layer_config = LayerConfig::new(
@@ -1499,27 +1615,89 @@ where
         // Use optional bias loading for Q/K/V if enabled (Qwen2-style)
         let (q_proj, k_proj, v_proj) = if config.use_attention_bias {
             (
-                mistralrs_quant::linear(hidden_size, num_heads * head_dim, &quant_cfg, vb_attn.pp("q_proj"))?,
-                mistralrs_quant::linear(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("k_proj"))?,
-                mistralrs_quant::linear(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("v_proj"))?,
+                mistralrs_quant::linear(
+                    hidden_size,
+                    num_heads * head_dim,
+                    &quant_cfg,
+                    vb_attn.pp("q_proj"),
+                )?,
+                mistralrs_quant::linear(
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    &quant_cfg,
+                    vb_attn.pp("k_proj"),
+                )?,
+                mistralrs_quant::linear(
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    &quant_cfg,
+                    vb_attn.pp("v_proj"),
+                )?,
             )
         } else {
             (
-                mistralrs_quant::linear_no_bias(hidden_size, num_heads * head_dim, &quant_cfg, vb_attn.pp("q_proj"))?,
-                mistralrs_quant::linear_no_bias(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("k_proj"))?,
-                mistralrs_quant::linear_no_bias(hidden_size, num_kv_heads * head_dim, &quant_cfg, vb_attn.pp("v_proj"))?,
+                mistralrs_quant::linear_no_bias(
+                    hidden_size,
+                    num_heads * head_dim,
+                    &quant_cfg,
+                    vb_attn.pp("q_proj"),
+                )?,
+                mistralrs_quant::linear_no_bias(
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    &quant_cfg,
+                    vb_attn.pp("k_proj"),
+                )?,
+                mistralrs_quant::linear_no_bias(
+                    hidden_size,
+                    num_kv_heads * head_dim,
+                    &quant_cfg,
+                    vb_attn.pp("v_proj"),
+                )?,
             )
         };
-        let o_proj = mistralrs_quant::linear_no_bias(num_heads * head_dim, hidden_size, &quant_cfg, vb_attn.pp("o_proj"))?;
+        let o_proj = mistralrs_quant::linear_no_bias(
+            num_heads * head_dim,
+            hidden_size,
+            &quant_cfg,
+            vb_attn.pp("o_proj"),
+        )?;
 
         // Load MLP weights
-        let gate_proj = mistralrs_quant::linear_no_bias(hidden_size, intermediate_size, &quant_cfg, vb_mlp.pp("gate_proj"))?;
-        let up_proj = mistralrs_quant::linear_no_bias(hidden_size, intermediate_size, &quant_cfg, vb_mlp.pp("up_proj"))?;
-        let down_proj = mistralrs_quant::linear_no_bias(intermediate_size, hidden_size, &quant_cfg, vb_mlp.pp("down_proj"))?;
+        let gate_proj = mistralrs_quant::linear_no_bias(
+            hidden_size,
+            intermediate_size,
+            &quant_cfg,
+            vb_mlp.pp("gate_proj"),
+        )?;
+        let up_proj = mistralrs_quant::linear_no_bias(
+            hidden_size,
+            intermediate_size,
+            &quant_cfg,
+            vb_mlp.pp("up_proj"),
+        )?;
+        let down_proj = mistralrs_quant::linear_no_bias(
+            intermediate_size,
+            hidden_size,
+            &quant_cfg,
+            vb_mlp.pp("down_proj"),
+        )?;
 
         // Load normalization layers
-        let attn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(naming.attn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
-        let ffn_norm = RmsNorm::new(hidden_size, config.rms_norm_eps, vb_layer.pp(naming.ffn_norm(layer_idx).replace(&format!("layers.{layer_idx}."), "")))?;
+        let attn_norm = RmsNorm::new(
+            hidden_size,
+            config.rms_norm_eps,
+            vb_layer.pp(naming
+                .attn_norm(layer_idx)
+                .replace(&format!("layers.{layer_idx}."), "")),
+        )?;
+        let ffn_norm = RmsNorm::new(
+            hidden_size,
+            config.rms_norm_eps,
+            vb_layer.pp(naming
+                .ffn_norm(layer_idx)
+                .replace(&format!("layers.{layer_idx}."), "")),
+        )?;
 
         // Build layer config
         let layer_config = LayerConfig::new(
@@ -1556,7 +1734,8 @@ where
 
         // Add paged attention if enabled
         if let AttentionImplementation::PagedAttention = attention_mechanism {
-            builder = builder.with_paged_attn(PagedAttention::new(config.head_dim, layer_device, None)?);
+            builder =
+                builder.with_paged_attn(PagedAttention::new(config.head_dim, layer_device, None)?);
         }
 
         // Apply model-specific customization

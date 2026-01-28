@@ -1191,7 +1191,9 @@ impl IsqModel for DeepSeekV3 {
                 .add(&layer.attn.kv_a_layernorm);
 
             // Add gate weight for MoE layers
-            layer.moe_or_mlp.add_gate_to_uvb(&uvb_l.pp("mlp").pp("gate"));
+            layer
+                .moe_or_mlp
+                .add_gate_to_uvb(&uvb_l.pp("mlp").pp("gate"));
 
             match &layer.attn.q {
                 QProj::Plain(_) => (),
@@ -1224,7 +1226,9 @@ impl IsqModel for DeepSeekV3 {
                 .add(&layer.attn.kv_a_layernorm);
 
             // Add gate weight for MoE layers
-            layer.moe_or_mlp.add_gate_to_uvb(&uvb_l.pp("mlp").pp("gate"));
+            layer
+                .moe_or_mlp
+                .add_gate_to_uvb(&uvb_l.pp("mlp").pp("gate"));
 
             match &layer.attn.q {
                 QProj::Plain(q) => {

@@ -45,8 +45,7 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata,
-        NormalModel,
+        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
     },
     serde_default_fn,
     utils::gguf_metadata::ContentMetadata,
@@ -227,7 +226,9 @@ impl MixtralDecoderLayer {
         )?;
         let xs = (xs + residual)?;
         let residual = &xs;
-        let xs = self.moe.forward(&xs.apply(&self.post_attention_layernorm)?)?;
+        let xs = self
+            .moe
+            .forward(&xs.apply(&self.post_attention_layernorm)?)?;
         residual + xs
     }
 }
@@ -396,7 +397,10 @@ impl IsqModel for Mixtral {
             uvb_l
                 .pp("post_attention_layernorm")
                 .add(&layer.post_attention_layernorm);
-            uvb_l.pp("block_sparse_moe").pp("gate").add(layer.moe.gate());
+            uvb_l
+                .pp("block_sparse_moe")
+                .pp("gate")
+                .add(layer.moe.gate());
         }
 
         uvb.to_safetensors()
@@ -728,10 +732,7 @@ impl ModelConfig::FromGGUF for Mixtral {
             )?;
 
             // Create unified MoE layer
-            let routing_config = RoutingConfig::new_normalized(
-                props.n_expert,
-                props.n_expert_used,
-            );
+            let routing_config = RoutingConfig::new_normalized(props.n_expert, props.n_expert_used);
             let moe = MoE::from_parts(gate, moe_experts, routing_config);
 
             // Load norms
@@ -835,11 +836,7 @@ fn load_gguf_experts<R: std::io::Seek + std::io::Read>(
             let up_type = up_exps.dtype();
             detected_dtype = Some(gate_type);
 
-            for ((gate, down), up) in gate_chunks
-                .into_iter()
-                .zip(down_chunks)
-                .zip(up_chunks)
-            {
+            for ((gate, down), up) in gate_chunks.into_iter().zip(down_chunks).zip(up_chunks) {
                 gate_proj.push(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: Arc::new(QTensor::quantize(&gate, gate_type)?),
                     b: None,
@@ -1034,7 +1031,10 @@ impl Mixtral {
             lm_head: Some(lm_head),
             sliding_window: cfg.sliding_window,
             device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::new(cfg.num_hidden_layers, cfg.max_position_embeddings)),
+            cache: EitherCache::Normal(NormalCache::new(
+                cfg.num_hidden_layers,
+                cfg.max_position_embeddings,
+            )),
             max_seq_len: cfg.max_position_embeddings,
             num_layers: cfg.num_hidden_layers,
             mapper: Some(mapper),

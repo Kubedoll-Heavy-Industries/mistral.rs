@@ -1,3 +1,6 @@
+// Allow deprecated APIs during migration to typed loader builders
+#![allow(deprecated)]
+
 //! > **mistral.rs server core**
 //!
 //! ## About

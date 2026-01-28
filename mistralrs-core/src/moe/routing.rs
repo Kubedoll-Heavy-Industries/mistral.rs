@@ -197,14 +197,21 @@ impl GroupLimitedGreedy {
     /// * `n_groups` - Number of expert groups (must divide num_experts evenly)
     /// * `topk_groups` - Number of top groups to select (must be <= n_groups)
     pub fn new(n_groups: usize, topk_groups: usize) -> Self {
-        Self { n_groups, topk_groups }
+        Self {
+            n_groups,
+            topk_groups,
+        }
     }
 
     /// Route tokens using group-limited greedy strategy.
     ///
     /// This is similar to the trait method but requires `&self` to access
     /// group configuration. For trait-based routing, use `route_with_config`.
-    pub fn route_with_config(&self, logits: &Tensor, config: &RoutingConfig) -> Result<RouteOutput> {
+    pub fn route_with_config(
+        &self,
+        logits: &Tensor,
+        config: &RoutingConfig,
+    ) -> Result<RouteOutput> {
         let (batch_seq_len, num_experts) = logits.dims2()?;
         let experts_per_group = num_experts / self.n_groups;
 
@@ -225,11 +232,7 @@ impl GroupLimitedGreedy {
         // 4. Create group mask: 1 for selected groups, 0 otherwise
         let mut group_mask = group_scores.zeros_like()?;
         let ones_for_scatter = group_indices.ones_like()?.to_dtype(group_mask.dtype())?;
-        group_mask = group_mask.scatter_add(
-            &group_indices,
-            &ones_for_scatter,
-            1,
-        )?;
+        group_mask = group_mask.scatter_add(&group_indices, &ones_for_scatter, 1)?;
 
         // 5. Expand group mask to expert-level mask
         let score_mask = group_mask
@@ -321,7 +324,11 @@ impl SparseMixer {
     ///
     /// # Returns
     /// `RouteOutput` with weights and indices, both shape `[batch * seq_len, 2]`
-    pub fn route_with_config(&self, logits: &Tensor, _config: &RoutingConfig) -> Result<RouteOutput> {
+    pub fn route_with_config(
+        &self,
+        logits: &Tensor,
+        _config: &RoutingConfig,
+    ) -> Result<RouteOutput> {
         let scores = logits.to_dtype(candle_core::DType::F32)?;
 
         // === Top-1 Selection ===
@@ -431,7 +438,11 @@ mod tests {
         let weight_sums = output.weights.sum_keepdim(D::Minus1)?;
         let weight_sums: Vec<f32> = weight_sums.flatten_all()?.to_vec1()?;
         for sum in weight_sums {
-            assert!((sum - 1.0).abs() < 1e-5, "Weights should sum to 1, got {}", sum);
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "Weights should sum to 1, got {}",
+                sum
+            );
         }
 
         Ok(())
@@ -483,7 +494,10 @@ mod tests {
         // Top-1 and top-2 should be different for each token
         let indices_2d: Vec<Vec<u32>> = output.indices.to_vec2()?;
         for row in indices_2d {
-            assert_ne!(row[0], row[1], "Top-1 and top-2 should be different experts");
+            assert_ne!(
+                row[0], row[1],
+                "Top-1 and top-2 should be different experts"
+            );
         }
 
         // Weights should be positive

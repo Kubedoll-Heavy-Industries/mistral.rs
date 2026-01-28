@@ -121,13 +121,11 @@ impl RerankPipeline {
     }
 
     /// Rerank documents against a query.
-    pub fn rerank(
-        &self,
-        query: &str,
-        documents: &[String],
-        truncate: bool,
-    ) -> Result<Vec<f32>> {
-        let backend = self.backend.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+    pub fn rerank(&self, query: &str, documents: &[String], truncate: bool) -> Result<Vec<f32>> {
+        let backend = self
+            .backend
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let result = backend.rerank(query, documents, truncate)?;
         Ok(result.scores)
     }
@@ -203,9 +201,9 @@ impl Pipeline for RerankPipeline {
             query,
             documents,
             truncate,
-        } = *inputs
-            .downcast::<RerankInputs>()
-            .map_err(|_| candle_core::Error::Msg("Failed to downcast to RerankInputs".to_string()))?;
+        } = *inputs.downcast::<RerankInputs>().map_err(|_| {
+            candle_core::Error::Msg("Failed to downcast to RerankInputs".to_string())
+        })?;
 
         let backend = self
             .backend

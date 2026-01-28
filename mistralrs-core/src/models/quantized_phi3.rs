@@ -351,8 +351,12 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             }
 
             // Build MLP with fused gate+up
-            let mlp =
-                FusedGatedMlp::from_weights(gate_up_proj, down_proj, cfg.hidden_act, cfg.intermediate_size);
+            let mlp = FusedGatedMlp::from_weights(
+                gate_up_proj,
+                down_proj,
+                cfg.hidden_act,
+                cfg.intermediate_size,
+            );
 
             layers.push(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp));
         }
@@ -535,11 +539,13 @@ impl ModelConfig::FromGGUF for ModelWeights {
             .with_attn_dtype(dtype);
 
             if let AttentionImplementation::PagedAttention = &attention_mechanism {
-                attention = attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
+                attention =
+                    attention.with_paged_attn(PagedAttention::new(head_dim, layer_device, None)?);
             }
 
             // Build MLP with fused gate+up
-            let mlp = FusedGatedMlp::from_weights(gate_up, down, Activation::Silu, intermediate_size);
+            let mlp =
+                FusedGatedMlp::from_weights(gate_up, down, Activation::Silu, intermediate_size);
 
             layers.push(TransformerBlock::new(attn_norm, attention, ffn_norm, mlp));
         }
@@ -576,7 +582,13 @@ impl ModelWeights {
                 .as_ref()
                 .map(|(kv_cache, meta)| (kv_cache[i].clone(), *meta));
 
-            hidden = layer.forward(hidden, mask, position_offsets, &mut cache[i], layer_metadata)?;
+            hidden = layer.forward(
+                hidden,
+                mask,
+                position_offsets,
+                &mut cache[i],
+                layer_metadata,
+            )?;
         }
         Ok(hidden)
     }
@@ -672,7 +684,9 @@ impl TransformerModelExt for ModelWeights {
     }
 
     fn mapper(&self) -> Option<&dyn DeviceMapper> {
-        self.mapper.as_ref().map(|m| m.as_ref() as &dyn DeviceMapper)
+        self.mapper
+            .as_ref()
+            .map(|m| m.as_ref() as &dyn DeviceMapper)
     }
 
     fn model_dtype(&self) -> DType {

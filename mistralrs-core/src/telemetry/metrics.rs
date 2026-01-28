@@ -107,7 +107,6 @@ pub struct MistralRsMetrics {
 
     /// Prefix cache misses.
     pub cache_misses_total: Counter<u64>,
-
     // =========================================================================
     // Gauges are registered separately via callbacks
     // See register_gauge_callbacks()
@@ -264,18 +263,14 @@ impl MistralRsMetrics {
 
     /// Record time-to-first-token.
     pub fn record_ttft(&self, ttft_secs: f64, model: &str) {
-        self.time_to_first_token.record(
-            ttft_secs,
-            &[KeyValue::new("model", model.to_string())],
-        );
+        self.time_to_first_token
+            .record(ttft_secs, &[KeyValue::new("model", model.to_string())]);
     }
 
     /// Record inter-token latency (time per output token).
     pub fn record_inter_token_latency(&self, latency_secs: f64, model: &str) {
-        self.time_per_output_token.record(
-            latency_secs,
-            &[KeyValue::new("model", model.to_string())],
-        );
+        self.time_per_output_token
+            .record(latency_secs, &[KeyValue::new("model", model.to_string())]);
     }
 
     /// Record prefill duration.
@@ -302,10 +297,8 @@ impl MistralRsMetrics {
 
     /// Record queue wait time.
     pub fn record_queue_wait(&self, wait_secs: f64, model: &str) {
-        self.queue_wait_duration.record(
-            wait_secs,
-            &[KeyValue::new("model", model.to_string())],
-        );
+        self.queue_wait_duration
+            .record(wait_secs, &[KeyValue::new("model", model.to_string())]);
     }
 
     /// Record a cache hit.

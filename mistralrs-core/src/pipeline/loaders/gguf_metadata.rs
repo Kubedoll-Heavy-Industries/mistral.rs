@@ -35,9 +35,9 @@ use tokenizers::Tokenizer;
 use tracing::{debug, info, warn};
 
 use crate::device_map::{self, DeviceMapSetting, DeviceMapper};
-use crate::gguf::{convert_gguf_to_hf_tokenizer, get_gguf_chat_template, Content, GGUFArchitecture};
-use crate::utils::gguf_metadata::GgufDeviceMapLoaderInner;
-use crate::{AutoDeviceMapParams, DeviceMappedModelLoader, NonMappedSubModel};
+use crate::gguf::{
+    convert_gguf_to_hf_tokenizer, get_gguf_chat_template, Content, GGUFArchitecture,
+};
 use crate::models::LanguageModel;
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
@@ -47,7 +47,9 @@ use crate::pipeline::chat_template::calculate_eos_tokens;
 use crate::pipeline::llg::build_llg_factory;
 use crate::pipeline::TokenSource;
 use crate::utils::gguf_metadata::ContentConfig;
+use crate::utils::gguf_metadata::GgufDeviceMapLoaderInner;
 use crate::utils::model_config::FromGGUF;
+use crate::{AutoDeviceMapParams, DeviceMappedModelLoader, NonMappedSubModel};
 use mistralrs_quant::IsqType;
 use regex::Regex;
 
@@ -513,7 +515,6 @@ impl MetadataLoader for GgufLoader {
     }
 }
 
-
 // ============================================================================
 // Text Pipeline Loading
 // ============================================================================
@@ -585,9 +586,8 @@ pub fn load_text_pipeline(
     let arch = loader.gguf_architecture();
 
     // Use provided mapper or default to single-device
-    let mapper = mapper.unwrap_or_else(|| {
-        Box::new(crate::device_map::SingleDeviceMapper::new(device.clone()))
-    });
+    let mapper = mapper
+        .unwrap_or_else(|| Box::new(crate::device_map::SingleDeviceMapper::new(device.clone())));
 
     // Dispatch based on architecture - each arm loads the model and constructs
     // a typed pipeline wrapped in the enum. All forward passes are monomorphized.
@@ -599,39 +599,102 @@ pub fn load_text_pipeline(
                     "Detected MoE model (expert_count={}), using Mixtral",
                     loader.metadata().expert_count
                 );
-                let pipeline = load_pipeline_for_model::<Mixtral>(&loader, device, mapper, attention, dtype, layer_range)?;
+                let pipeline = load_pipeline_for_model::<Mixtral>(
+                    &loader,
+                    device,
+                    mapper,
+                    attention,
+                    dtype,
+                    layer_range,
+                )?;
                 Ok(CausalLMPipeline::Mixtral(pipeline))
             } else {
-                let pipeline = load_pipeline_for_model::<LlamaModel>(&loader, device, mapper, attention, dtype, layer_range)?;
+                let pipeline = load_pipeline_for_model::<LlamaModel>(
+                    &loader,
+                    device,
+                    mapper,
+                    attention,
+                    dtype,
+                    layer_range,
+                )?;
                 Ok(CausalLMPipeline::Llama(pipeline))
             }
         }
         GGUFArchitecture::Mistral3 => {
-            let pipeline = load_pipeline_for_model::<QMistral3>(&loader, device, mapper, attention, dtype, layer_range)?;
+            let pipeline = load_pipeline_for_model::<QMistral3>(
+                &loader,
+                device,
+                mapper,
+                attention,
+                dtype,
+                layer_range,
+            )?;
             Ok(CausalLMPipeline::Mistral3(pipeline))
         }
         GGUFArchitecture::Phi2 => {
-            let pipeline = load_pipeline_for_model::<QPhi2>(&loader, device, mapper, attention, dtype, layer_range)?;
+            let pipeline = load_pipeline_for_model::<QPhi2>(
+                &loader,
+                device,
+                mapper,
+                attention,
+                dtype,
+                layer_range,
+            )?;
             Ok(CausalLMPipeline::Phi2(pipeline))
         }
         GGUFArchitecture::Phi3 => {
-            let pipeline = load_pipeline_for_model::<QPhi3>(&loader, device, mapper, attention, dtype, layer_range)?;
+            let pipeline = load_pipeline_for_model::<QPhi3>(
+                &loader,
+                device,
+                mapper,
+                attention,
+                dtype,
+                layer_range,
+            )?;
             Ok(CausalLMPipeline::Phi3(pipeline))
         }
         GGUFArchitecture::Starcoder2 => {
-            let pipeline = load_pipeline_for_model::<QStarcoder2>(&loader, device, mapper, attention, dtype, layer_range)?;
+            let pipeline = load_pipeline_for_model::<QStarcoder2>(
+                &loader,
+                device,
+                mapper,
+                attention,
+                dtype,
+                layer_range,
+            )?;
             Ok(CausalLMPipeline::Starcoder2(pipeline))
         }
         GGUFArchitecture::Qwen2 => {
-            let pipeline = load_pipeline_for_model::<QQwen>(&loader, device, mapper, attention, dtype, layer_range)?;
+            let pipeline = load_pipeline_for_model::<QQwen>(
+                &loader,
+                device,
+                mapper,
+                attention,
+                dtype,
+                layer_range,
+            )?;
             Ok(CausalLMPipeline::Qwen2(pipeline))
         }
         GGUFArchitecture::Qwen3 => {
-            let pipeline = load_pipeline_for_model::<QQwen3>(&loader, device, mapper, attention, dtype, layer_range)?;
+            let pipeline = load_pipeline_for_model::<QQwen3>(
+                &loader,
+                device,
+                mapper,
+                attention,
+                dtype,
+                layer_range,
+            )?;
             Ok(CausalLMPipeline::Qwen3(pipeline))
         }
         GGUFArchitecture::Qwen3MoE => {
-            let pipeline = load_pipeline_for_model::<QQwen3MoE>(&loader, device, mapper, attention, dtype, layer_range)?;
+            let pipeline = load_pipeline_for_model::<QQwen3MoE>(
+                &loader,
+                device,
+                mapper,
+                attention,
+                dtype,
+                layer_range,
+            )?;
             Ok(CausalLMPipeline::Qwen3MoE(pipeline))
         }
         // Unsupported architectures
@@ -658,7 +721,7 @@ fn load_pipeline_for_model<M: LanguageModel + FromGGUF + Send + Sync + 'static>(
     layer_range: Option<std::ops::Range<usize>>,
 ) -> Result<crate::pipeline::TextPipeline<M>> {
     use crate::pipeline::chat_template::{ChatTemplate, ChatTemplateValue};
-    use crate::pipeline::{GeneralMetadata, ModelKind, Modalities, SupportedModality};
+    use crate::pipeline::{GeneralMetadata, Modalities, ModelKind, SupportedModality};
     use either::Either;
 
     // Open files and parse content
@@ -815,9 +878,15 @@ impl SafetensorsModelMetadata {
         let up_proj = self.hidden_size * self.intermediate_size / weight_pack_factor;
         let down_proj = self.intermediate_size * self.hidden_size / weight_pack_factor;
 
-        input_layernorm + post_attention_layernorm
-            + q_proj + k_proj + v_proj + o_proj
-            + gate_proj + up_proj + down_proj
+        input_layernorm
+            + post_attention_layernorm
+            + q_proj
+            + k_proj
+            + v_proj
+            + o_proj
+            + gate_proj
+            + up_proj
+            + down_proj
     }
 
     /// Compute non-mapped (embedding + output) size in elements.
@@ -846,7 +915,9 @@ impl crate::DeviceMappedModelLoader for SafetensorsModelMetadata {
         else {
             anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
         };
-        Ok(max_batch_size * self.num_attn_heads * max_seq_len.min(&crate::attention::ATTENTION_CHUNK_SIZE))
+        Ok(max_batch_size
+            * self.num_attn_heads
+            * max_seq_len.min(&crate::attention::ATTENTION_CHUNK_SIZE))
     }
 
     fn non_mapped_max_act_size_elems(
@@ -971,6 +1042,9 @@ pub struct CausalLMLoaderBuilder {
     isq: Option<IsqType>,
     /// LoRA adapter repo IDs (from HuggingFace Hub)
     lora_adapters: Vec<String>,
+    /// XLoRA classifier repo ID (from HuggingFace Hub)
+    /// When set, enables XLoRA two-pass inference with per-token adapter scalings.
+    xlora_repo: Option<String>,
 }
 
 impl CausalLMLoaderBuilder {
@@ -998,6 +1072,7 @@ impl CausalLMLoaderBuilder {
             jinja_explicit: None,
             isq: None,
             lora_adapters: Vec::new(),
+            xlora_repo: None,
         }
     }
 
@@ -1029,6 +1104,7 @@ impl CausalLMLoaderBuilder {
             jinja_explicit: None,
             isq: None,
             lora_adapters: Vec::new(),
+            xlora_repo: None,
         }
     }
 
@@ -1070,6 +1146,7 @@ impl CausalLMLoaderBuilder {
             jinja_explicit: None,
             isq: None,
             lora_adapters: Vec::new(),
+            xlora_repo: None,
         }
     }
 
@@ -1142,10 +1219,16 @@ impl CausalLMLoaderBuilder {
     /// Set the HuggingFace revision (branch/tag/commit).
     pub fn with_revision(mut self, revision: String) -> Self {
         match &mut self.source {
-            ModelSource::HuggingFaceGguf { revision: ref mut rev, .. } => {
+            ModelSource::HuggingFaceGguf {
+                revision: ref mut rev,
+                ..
+            } => {
                 *rev = Some(revision);
             }
-            ModelSource::HuggingFaceSafetensors { revision: ref mut rev, .. } => {
+            ModelSource::HuggingFaceSafetensors {
+                revision: ref mut rev,
+                ..
+            } => {
                 *rev = Some(revision);
             }
             ModelSource::LocalGguf(_) => {}
@@ -1258,6 +1341,40 @@ impl CausalLMLoaderBuilder {
         self
     }
 
+    /// Configure XLoRA (mixture of LoRA experts) for per-token adapter selection.
+    ///
+    /// XLoRA uses a classifier network to compute per-token scalings for each adapter,
+    /// allowing dynamic adapter selection based on the input. This requires:
+    /// 1. Multiple LoRA adapters (added via `with_lora_adapter`)
+    /// 2. An XLoRA classifier trained to select between them
+    ///
+    /// The classifier repository should contain:
+    /// - `xlora_config.json` - XLoRA configuration (hidden_size, adapters, etc.)
+    /// - `xlora_classifier.safetensors` - Classifier weights
+    ///
+    /// # Arguments
+    ///
+    /// * `xlora_repo_id` - HuggingFace repository containing the XLoRA classifier
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let pipeline = CausalLMLoaderBuilder::from_hf_safetensors("base/model")
+    ///     .with_lora_adapter("adapter1/repo")
+    ///     .with_lora_adapter("adapter2/repo")
+    ///     .with_xlora("username/xlora-classifier")
+    ///     .build()?;
+    /// ```
+    ///
+    /// # Note
+    ///
+    /// The XLoRA classifier must be trained for the specific set of adapters.
+    /// The `adapters` field in `xlora_config.json` should match the loaded adapters.
+    pub fn with_xlora(mut self, xlora_repo_id: impl Into<String>) -> Self {
+        self.xlora_repo = Some(xlora_repo_id.into());
+        self
+    }
+
     /// Build the pipeline, loading the model.
     ///
     /// This downloads the model (if from HF Hub), detects the architecture,
@@ -1270,9 +1387,7 @@ impl CausalLMLoaderBuilder {
             ModelSource::LocalGguf(_) | ModelSource::HuggingFaceGguf { .. } => {
                 self.build_from_gguf()
             }
-            ModelSource::HuggingFaceSafetensors { .. } => {
-                self.build_from_safetensors()
-            }
+            ModelSource::HuggingFaceSafetensors { .. } => self.build_from_safetensors(),
         }
     }
 
@@ -1311,7 +1426,10 @@ impl CausalLMLoaderBuilder {
         };
 
         if !self.silent {
-            info!("Downloading safetensors model from HuggingFace: {}", repo_id);
+            info!(
+                "Downloading safetensors model from HuggingFace: {}",
+                repo_id
+            );
         }
 
         // Download files from HuggingFace
@@ -1379,7 +1497,9 @@ impl CausalLMLoaderBuilder {
         repo_id: &str,
     ) -> Result<Vec<PathBuf>> {
         // List files in repo to find safetensors
-        let files = repo.info().map_err(|e| anyhow!("Failed to get repo info: {}", e))?;
+        let files = repo
+            .info()
+            .map_err(|e| anyhow!("Failed to get repo info: {}", e))?;
 
         let safetensor_files: Vec<_> = files
             .siblings
@@ -1398,9 +1518,9 @@ impl CausalLMLoaderBuilder {
 
         let mut paths = Vec::new();
         for filename in &safetensor_files {
-            let path = repo.get(filename).map_err(|e| {
-                anyhow!("Failed to download {}/{}: {}", repo_id, filename, e)
-            })?;
+            let path = repo
+                .get(filename)
+                .map_err(|e| anyhow!("Failed to download {}/{}: {}", repo_id, filename, e))?;
             paths.push(path);
         }
 
@@ -1432,17 +1552,31 @@ impl CausalLMLoaderBuilder {
             let repo = api.repo(Repo::new(adapter_repo_id.clone(), RepoType::Model));
 
             // Download adapter config
-            let config_path = repo
-                .get("adapter_config.json")
-                .map_err(|e| anyhow!("Failed to download adapter_config.json from {}: {}", adapter_repo_id, e))?;
+            let config_path = repo.get("adapter_config.json").map_err(|e| {
+                anyhow!(
+                    "Failed to download adapter_config.json from {}: {}",
+                    adapter_repo_id,
+                    e
+                )
+            })?;
             let config_str = std::fs::read_to_string(&config_path)?;
-            let config: mistralrs_quant::LoraConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow!("Failed to parse adapter_config.json from {}: {}", adapter_repo_id, e))?;
+            let config: mistralrs_quant::LoraConfig =
+                serde_json::from_str(&config_str).map_err(|e| {
+                    anyhow!(
+                        "Failed to parse adapter_config.json from {}: {}",
+                        adapter_repo_id,
+                        e
+                    )
+                })?;
 
             // Download adapter weights
-            let weights_path = repo
-                .get("adapter_model.safetensors")
-                .map_err(|e| anyhow!("Failed to download adapter_model.safetensors from {}: {}", adapter_repo_id, e))?;
+            let weights_path = repo.get("adapter_model.safetensors").map_err(|e| {
+                anyhow!(
+                    "Failed to download adapter_model.safetensors from {}: {}",
+                    adapter_repo_id,
+                    e
+                )
+            })?;
 
             // Create VarBuilder for adapter weights
             let weights = from_mmaped_safetensors(
@@ -1451,9 +1585,9 @@ impl CausalLMLoaderBuilder {
                 Some(self.dtype),
                 &self.device,
                 Vec::new(), // layer_devices
-                true, // silent for adapter loading
-                None, // make_dummy_regexes
-                |_| true, // predicate
+                true,       // silent for adapter loading
+                None,       // make_dummy_regexes
+                |_| true,   // predicate
                 Arc::new(move |_| DeviceForLoadTensor::Base),
             )?;
 
@@ -1526,8 +1660,8 @@ impl CausalLMLoaderBuilder {
                 )
             })?;
             let config_str = std::fs::read_to_string(&config_path)?;
-            let config: mistralrs_quant::LoraConfig = serde_json::from_str(&config_str)
-                .map_err(|e| {
+            let config: mistralrs_quant::LoraConfig =
+                serde_json::from_str(&config_str).map_err(|e| {
                     anyhow!(
                         "Failed to parse adapter_config.json from {}: {}",
                         adapter_repo_id,
@@ -1577,6 +1711,96 @@ impl CausalLMLoaderBuilder {
         Ok(Some(registry))
     }
 
+    /// Load XLoRA classifier from HuggingFace repository.
+    ///
+    /// Downloads the classifier config and weights, then constructs an XLoraClassifier
+    /// that can compute per-token adapter scalings during inference.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_layers` - Number of transformer layers in the model
+    /// * `num_adapters` - Number of LoRA adapters loaded
+    ///
+    /// # Returns
+    ///
+    /// An `XLoraClassifier` ready to compute scalings, or `None` if no XLoRA repo configured.
+    fn load_xlora_classifier(
+        &self,
+        num_layers: usize,
+        num_adapters: usize,
+    ) -> Result<Option<crate::lora::XLoraClassifier>> {
+        use crate::lora::{XLoraClassifier, XLoraConfig};
+        use crate::utils::varbuilder_utils::{from_mmaped_safetensors, DeviceForLoadTensor};
+
+        let xlora_repo_id = match &self.xlora_repo {
+            Some(repo) => repo,
+            None => return Ok(None),
+        };
+
+        if num_adapters == 0 {
+            bail!(
+                "XLoRA requires at least one LoRA adapter. Add adapters with .with_lora_adapter() before .with_xlora()"
+            );
+        }
+
+        info!("Loading XLoRA classifier from: {}", xlora_repo_id);
+
+        let api = Api::new().map_err(|e| anyhow!("Failed to create HF API: {}", e))?;
+        let repo = api.repo(Repo::new(xlora_repo_id.clone(), RepoType::Model));
+
+        // Download XLoRA config
+        let config_path = repo.get("xlora_config.json").map_err(|e| {
+            anyhow!(
+                "Failed to download xlora_config.json from {}: {}",
+                xlora_repo_id,
+                e
+            )
+        })?;
+        let config_str = std::fs::read_to_string(&config_path)?;
+        let config: XLoraConfig = serde_json::from_str(&config_str).map_err(|e| {
+            anyhow!(
+                "Failed to parse xlora_config.json from {}: {}",
+                xlora_repo_id,
+                e
+            )
+        })?;
+
+        // Download classifier weights
+        let weights_path = repo.get("xlora_classifier.safetensors").map_err(|e| {
+            anyhow!(
+                "Failed to download xlora_classifier.safetensors from {}: {}",
+                xlora_repo_id,
+                e
+            )
+        })?;
+
+        // Create VarBuilder for classifier weights
+        let vb = from_mmaped_safetensors(
+            vec![weights_path],
+            Vec::new(),
+            Some(self.dtype),
+            &self.device,
+            Vec::new(),
+            true,
+            None,
+            |_| true,
+            Arc::new(move |_| DeviceForLoadTensor::Base),
+        )?;
+
+        // Create the classifier
+        // Note: is_quantized=false for safetensors weights
+        let classifier =
+            XLoraClassifier::new(config.clone(), num_layers, num_adapters, vb, false)
+                .map_err(|e| anyhow!("Failed to create XLoRA classifier: {}", e))?;
+
+        info!(
+            "Loaded XLoRA classifier (depth={}, hidden_size={}, {} adapters, {} layers)",
+            config.xlora_depth, config.hidden_size, num_adapters, num_layers
+        );
+
+        Ok(Some(classifier))
+    }
+
     /// Build pipeline for detected safetensors architecture.
     fn build_for_safetensors_architecture(
         &self,
@@ -1587,8 +1811,8 @@ impl CausalLMLoaderBuilder {
         repo: &hf_hub::api::sync::ApiRepo,
         repo_id: &str,
     ) -> Result<crate::pipeline::CausalLMPipeline> {
-        use crate::pipeline::CausalLMPipeline;
         use crate::pipeline::loaders::NormalLoaderType;
+        use crate::pipeline::CausalLMPipeline;
         use crate::utils::model_config::FromSafetensors;
         use crate::utils::varbuilder_utils::{from_mmaped_safetensors, DeviceForLoadTensor};
 
@@ -1602,9 +1826,16 @@ impl CausalLMLoaderBuilder {
         if let Some(isq_type) = self.isq {
             let predicates = self.get_isq_predicates_for_loader_type(&loader_type)?;
             if predicates.is_empty() {
-                warn!("No ISQ predicates for {:?}, ISQ will not be applied", loader_type);
+                warn!(
+                    "No ISQ predicates for {:?}, ISQ will not be applied",
+                    loader_type
+                );
             } else {
-                info!("Setting up immediate ISQ ({:?}) with {} predicates", isq_type, predicates.len());
+                info!(
+                    "Setting up immediate ISQ ({:?}) with {} predicates",
+                    isq_type,
+                    predicates.len()
+                );
                 mistralrs_quant::set_immediate_isq(Some(isq_type), predicates);
             }
         }
@@ -1619,8 +1850,8 @@ impl CausalLMLoaderBuilder {
             &self.device,
             Vec::new(), // layer_devices (all on base device)
             self.silent,
-            None, // make_dummy_regexes
-            |_| true, // predicate - include all tensors
+            None,                                         // make_dummy_regexes
+            |_| true,                                     // predicate - include all tensors
             Arc::new(move |_| DeviceForLoadTensor::Base), // get_device_for_tensor
         )?;
 
@@ -1747,18 +1978,20 @@ impl CausalLMLoaderBuilder {
         use crate::pipeline::loaders::NormalLoaderType;
 
         match loader_type {
-            NormalLoaderType::Qwen2 | NormalLoaderType::Qwen3 | NormalLoaderType::Mistral => Ok(vec![
-                Regex::new(r"lm_head\.(weight|bias)$")?,
-                // Attention
-                Regex::new(r"layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
-                Regex::new(r"layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
-                Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
-                Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
-                // MLP
-                Regex::new(r"layers\.(\d+)\.mlp\.gate_proj\.(weight|bias)$")?,
-                Regex::new(r"layers\.(\d+)\.mlp\.up_proj\.(weight|bias)$")?,
-                Regex::new(r"layers\.(\d+)\.mlp\.down_proj\.(weight|bias)$")?,
-            ]),
+            NormalLoaderType::Qwen2 | NormalLoaderType::Qwen3 | NormalLoaderType::Mistral => {
+                Ok(vec![
+                    Regex::new(r"lm_head\.(weight|bias)$")?,
+                    // Attention
+                    Regex::new(r"layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
+                    Regex::new(r"layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
+                    Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
+                    Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
+                    // MLP
+                    Regex::new(r"layers\.(\d+)\.mlp\.gate_proj\.(weight|bias)$")?,
+                    Regex::new(r"layers\.(\d+)\.mlp\.up_proj\.(weight|bias)$")?,
+                    Regex::new(r"layers\.(\d+)\.mlp\.down_proj\.(weight|bias)$")?,
+                ])
+            }
             NormalLoaderType::Phi3 => Ok(vec![
                 Regex::new(r"lm_head\.(weight|bias)$")?,
                 // Attention (fused qkv)
@@ -1797,12 +2030,8 @@ impl CausalLMLoaderBuilder {
                 weight_pack_factor,
                 None, // no matformer
             )?;
-            let non_mapped_size = model_meta.non_mapped_size_in_bytes(
-                "",
-                self.dtype,
-                weight_pack_factor,
-                None,
-            )?;
+            let non_mapped_size =
+                model_meta.non_mapped_size_in_bytes("", self.dtype, weight_pack_factor, None)?;
             let total_size: usize = layer_sizes.iter().sum::<usize>() + non_mapped_size;
 
             // Compute optimal device distribution
@@ -1846,7 +2075,7 @@ impl CausalLMLoaderBuilder {
     ) -> Result<crate::pipeline::TextPipeline<M>> {
         use crate::device_map::SingleDeviceMapper;
         use crate::pipeline::chat_template::{ChatTemplate, ChatTemplateValue};
-        use crate::pipeline::{GeneralMetadata, ModelKind, Modalities, SupportedModality};
+        use crate::pipeline::{GeneralMetadata, Modalities, ModelKind, SupportedModality};
         use either::Either;
 
         // Load tokenizer
@@ -1861,7 +2090,8 @@ impl CausalLMLoaderBuilder {
         // Load chat template from tokenizer_config.json
         let mut chat_template = ChatTemplate::default();
         if let Some(ref explicit_template) = self.chat_template {
-            chat_template.chat_template = Some(ChatTemplateValue(Either::Left(explicit_template.clone())));
+            chat_template.chat_template =
+                Some(ChatTemplateValue(Either::Left(explicit_template.clone())));
         } else if let Ok(tokenizer_config_path) = repo.get("tokenizer_config.json") {
             if let Ok(tokenizer_config_str) = std::fs::read_to_string(&tokenizer_config_path) {
                 #[derive(serde::Deserialize)]
@@ -1870,7 +2100,8 @@ impl CausalLMLoaderBuilder {
                 }
                 if let Ok(config) = serde_json::from_str::<TokenizerConfig>(&tokenizer_config_str) {
                     if let Some(template) = config.chat_template {
-                        chat_template.chat_template = Some(ChatTemplateValue(Either::Left(template)));
+                        chat_template.chat_template =
+                            Some(ChatTemplateValue(Either::Left(template)));
                     }
                 }
             }
@@ -1880,7 +2111,10 @@ impl CausalLMLoaderBuilder {
         let eos_tokens = calculate_eos_tokens(&chat_template, None, &tokenizer);
 
         // Build model ID
-        let model_id = self.tok_model_id.clone().unwrap_or_else(|| repo_id.to_string());
+        let model_id = self
+            .tok_model_id
+            .clone()
+            .unwrap_or_else(|| repo_id.to_string());
 
         // Build metadata
         let num_hidden_layers = model.num_layers();
@@ -1889,7 +2123,9 @@ impl CausalLMLoaderBuilder {
         // Setup paged attention if configured
         let (cache_config, cache_engine) = if let Some(ref paged_config) = self.paged_attn_config {
             // Adjust num_layers for pipeline parallelism
-            let effective_num_layers = self.layer_range.as_ref()
+            let effective_num_layers = self
+                .layer_range
+                .as_ref()
                 .map(|r| r.len())
                 .unwrap_or(num_hidden_layers);
 
@@ -1906,13 +2142,12 @@ impl CausalLMLoaderBuilder {
 
             info!(
                 "Setting up PagedAttention for safetensors: {} layers, {} KV heads, {} head dim",
-                effective_num_layers,
-                model_config.num_kv_heads,
-                model_config.k_head_dim
+                effective_num_layers, model_config.num_kv_heads, model_config.k_head_dim
             );
 
             // For now, use single device for layer mapping
-            let layer_devices: Vec<Option<Device>> = vec![Some(self.device.clone()); effective_num_layers];
+            let layer_devices: Vec<Option<Device>> =
+                vec![Some(self.device.clone()); effective_num_layers];
 
             let config = calculate_cache_config(
                 paged_config.mem_gpu,
@@ -1939,16 +2174,17 @@ impl CausalLMLoaderBuilder {
         };
 
         // Build model config metadata for GeneralMetadata
-        let model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>> = Some(Arc::new(ModelConfigMetadata {
-            max_seq_len,
-            num_layers: num_hidden_layers,
-            hidden_size: model_meta.hidden_size,
-            num_kv_heads: model_meta.num_kv_heads,
-            num_attn_heads: model_meta.num_attn_heads,
-            sliding_window: model_meta.sliding_window,
-            k_head_dim: model_meta.head_dim,
-            v_head_dim: model_meta.head_dim,
-        }));
+        let model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>> =
+            Some(Arc::new(ModelConfigMetadata {
+                max_seq_len,
+                num_layers: num_hidden_layers,
+                hidden_size: model_meta.hidden_size,
+                num_kv_heads: model_meta.num_kv_heads,
+                num_attn_heads: model_meta.num_attn_heads,
+                sliding_window: model_meta.sliding_window,
+                k_head_dim: model_meta.head_dim,
+                v_head_dim: model_meta.head_dim,
+            }));
 
         let metadata = Arc::new(GeneralMetadata {
             max_seq_len,
@@ -1958,7 +2194,7 @@ impl CausalLMLoaderBuilder {
             num_hidden_layers,
             eos_tok: eos_tokens,
             kind: ModelKind::Normal,
-            is_xlora: false,
+            is_xlora: self.xlora_repo.is_some(),
             activation_dtype: self.dtype,
             sliding_window: model_meta.sliding_window,
             cache_config,
@@ -1984,8 +2220,17 @@ impl CausalLMLoaderBuilder {
         );
 
         // Attach adapter registry for per-request LoRA switching
-        if let Some(registry) = adapter_registry {
-            pipeline.set_adapter_registry(registry);
+        if let Some(ref registry) = adapter_registry {
+            pipeline.set_adapter_registry(registry.clone());
+        }
+
+        // Load and attach XLoRA classifier if configured
+        let num_adapters = adapter_registry
+            .as_ref()
+            .map(|r| r.adapter_count().unwrap_or(0))
+            .unwrap_or(0);
+        if let Some(classifier) = self.load_xlora_classifier(num_hidden_layers, num_adapters)? {
+            pipeline.set_xlora_classifier(classifier);
         }
 
         Ok(pipeline)
@@ -2006,7 +2251,9 @@ impl CausalLMLoaderBuilder {
     /// // Use with engine
     /// let runner = MistralRsBuilder::new(pipeline, scheduler_config, false, None);
     /// ```
-    pub fn build_async(self) -> Result<std::sync::Arc<tokio::sync::Mutex<dyn crate::Pipeline + Send + Sync>>> {
+    pub fn build_async(
+        self,
+    ) -> Result<std::sync::Arc<tokio::sync::Mutex<dyn crate::Pipeline + Send + Sync>>> {
         let pipeline = self.build()?;
         Ok(std::sync::Arc::new(tokio::sync::Mutex::new(pipeline)))
     }
@@ -2023,7 +2270,11 @@ impl CausalLMLoaderBuilder {
                 }
                 Ok(paths.clone())
             }
-            ModelSource::HuggingFaceGguf { repo_id, filenames, revision } => {
+            ModelSource::HuggingFaceGguf {
+                repo_id,
+                filenames,
+                revision,
+            } => {
                 if !self.silent {
                     info!("Downloading GGUF model from HuggingFace: {}", repo_id);
                 }
@@ -2118,7 +2369,9 @@ impl CausalLMLoaderBuilder {
         loader: &GgufLoader,
     ) -> Result<crate::pipeline::TextPipeline<M>> {
         use crate::pipeline::chat_template::{ChatTemplate, ChatTemplateValue};
-        use crate::pipeline::{GeneralMetadata, ModelKind, Modalities, QuantizationKind, SupportedModality};
+        use crate::pipeline::{
+            GeneralMetadata, Modalities, ModelKind, QuantizationKind, SupportedModality,
+        };
         use either::Either;
 
         // Open files and parse content
@@ -2137,7 +2390,8 @@ impl CausalLMLoaderBuilder {
         let arch = content.arch();
 
         // Get total layers from GGUF metadata
-        let total_layers = content.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
+        let total_layers =
+            content.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
 
         // For pipeline parallelism, compute device map for only the loaded layers
         let (num_layers, layer_range_for_sizes) = match &self.layer_range {
@@ -2201,11 +2455,13 @@ impl CausalLMLoaderBuilder {
                         // output.weight (lm_head) - may be tied to token_embd
                         if content.has_tensor("output.weight") {
                             if let Ok(t) = content.tensor_info("output.weight") {
-                                size += t.shape.elem_count() / t.ggml_dtype.block_size() * t.ggml_dtype.type_size();
+                                size += t.shape.elem_count() / t.ggml_dtype.block_size()
+                                    * t.ggml_dtype.type_size();
                             }
                         } else if let Ok(t) = content.tensor_info("token_embd.weight") {
                             // Tied embeddings - reuse token_embd for output
-                            size += t.shape.elem_count() / t.ggml_dtype.block_size() * t.ggml_dtype.type_size();
+                            size += t.shape.elem_count() / t.ggml_dtype.block_size()
+                                * t.ggml_dtype.type_size();
                         }
                     }
 
@@ -2219,7 +2475,12 @@ impl CausalLMLoaderBuilder {
                 }
                 None => {
                     // No pipeline parallelism - include all non-mapped tensors
-                    model_inner.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None)?
+                    model_inner.non_mapped_size_in_bytes(
+                        "this is a dummy config!",
+                        dtype,
+                        1,
+                        None,
+                    )?
                 }
             };
             let total_model_size_in_bytes =
@@ -2244,7 +2505,8 @@ impl CausalLMLoaderBuilder {
             unsafe { dev.disable_event_tracking() };
         }
 
-        let mapper = device_map_setting.into_mapper(num_layers, &self.device, self.topology.as_ref())?;
+        let mapper =
+            device_map_setting.into_mapper(num_layers, &self.device, self.topology.as_ref())?;
 
         // Check for CPU offloading with pipeline parallelism
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
@@ -2288,7 +2550,11 @@ impl CausalLMLoaderBuilder {
             let api = Api::new().map_err(|e| anyhow!("Failed to create HF API: {}", e))?;
             let repo = api.repo(Repo::new(tok_model_id.clone(), RepoType::Model));
             let tokenizer_path = repo.get("tokenizer.json").map_err(|e| {
-                anyhow!("Failed to download tokenizer.json from {}: {}", tok_model_id, e)
+                anyhow!(
+                    "Failed to download tokenizer.json from {}: {}",
+                    tok_model_id,
+                    e
+                )
             })?;
             let tokenizer = crate::utils::tokenizer::get_tokenizer(&tokenizer_path, None)
                 .map_err(|e| anyhow!("Failed to load tokenizer: {}", e))?;
@@ -2323,14 +2589,17 @@ impl CausalLMLoaderBuilder {
         // Build model ID from source.
         // For HuggingFace models, prefer tok_model_id if specified (matches GGUFPipeline behavior).
         // This is important for pipeline parallelism where the model ID is used as the engine key.
-        let model_id = self.tok_model_id.clone().unwrap_or_else(|| match &self.source {
-            ModelSource::LocalGguf(paths) => paths
-                .first()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            ModelSource::HuggingFaceGguf { repo_id, .. } => repo_id.clone(),
-            ModelSource::HuggingFaceSafetensors { repo_id, .. } => repo_id.clone(),
-        });
+        let model_id = self
+            .tok_model_id
+            .clone()
+            .unwrap_or_else(|| match &self.source {
+                ModelSource::LocalGguf(paths) => paths
+                    .first()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                ModelSource::HuggingFaceGguf { repo_id, .. } => repo_id.clone(),
+                ModelSource::HuggingFaceSafetensors { repo_id, .. } => repo_id.clone(),
+            });
 
         // Build metadata
         let num_hidden_layers = model.num_layers();
@@ -2339,7 +2608,9 @@ impl CausalLMLoaderBuilder {
         // Setup paged attention if configured
         let (cache_config, cache_engine) = if let Some(ref paged_config) = self.paged_attn_config {
             // Adjust num_layers for pipeline parallelism
-            let effective_num_layers = self.layer_range.as_ref()
+            let effective_num_layers = self
+                .layer_range
+                .as_ref()
                 .map(|r| r.len())
                 .unwrap_or(num_hidden_layers);
 
@@ -2356,14 +2627,13 @@ impl CausalLMLoaderBuilder {
 
             info!(
                 "Setting up PagedAttention: {} layers, {} KV heads, {} head dim",
-                effective_num_layers,
-                model_config.num_kv_heads,
-                model_config.k_head_dim
+                effective_num_layers, model_config.num_kv_heads, model_config.k_head_dim
             );
 
             // For now, use single device for layer mapping
             // TODO: Support multi-device paged attention
-            let layer_devices: Vec<Option<Device>> = vec![Some(self.device.clone()); effective_num_layers];
+            let layer_devices: Vec<Option<Device>> =
+                vec![Some(self.device.clone()); effective_num_layers];
 
             let config = calculate_cache_config(
                 paged_config.mem_gpu,
@@ -2390,16 +2660,17 @@ impl CausalLMLoaderBuilder {
         };
 
         // Build model config metadata for GeneralMetadata
-        let model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>> = Some(Arc::new(ModelConfigMetadata {
-            max_seq_len,
-            num_layers: num_hidden_layers,
-            hidden_size: content_config.hidden_size(),
-            num_kv_heads: content_config.num_kv_heads(),
-            num_attn_heads: content_config.num_attn_heads(),
-            sliding_window: None,
-            k_head_dim: content_config.k_head_dim(),
-            v_head_dim: content_config.v_head_dim(),
-        }));
+        let model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>> =
+            Some(Arc::new(ModelConfigMetadata {
+                max_seq_len,
+                num_layers: num_hidden_layers,
+                hidden_size: content_config.hidden_size(),
+                num_kv_heads: content_config.num_kv_heads(),
+                num_attn_heads: content_config.num_attn_heads(),
+                sliding_window: None,
+                k_head_dim: content_config.k_head_dim(),
+                v_head_dim: content_config.v_head_dim(),
+            }));
 
         let metadata = Arc::new(GeneralMetadata {
             max_seq_len,
@@ -2411,7 +2682,7 @@ impl CausalLMLoaderBuilder {
             kind: ModelKind::GgufQuantized {
                 quant: QuantizationKind::Gguf,
             },
-            is_xlora: false,
+            is_xlora: self.xlora_repo.is_some(),
             activation_dtype: self.dtype,
             sliding_window: None,
             cache_config,
@@ -2424,8 +2695,9 @@ impl CausalLMLoaderBuilder {
         });
 
         // Create pipeline mapper (model consumed the original mapper)
-        let pipeline_mapper: Box<dyn DeviceMapper + Send + Sync> =
-            Box::new(crate::device_map::SingleDeviceMapper::new(self.device.clone()));
+        let pipeline_mapper: Box<dyn DeviceMapper + Send + Sync> = Box::new(
+            crate::device_map::SingleDeviceMapper::new(self.device.clone()),
+        );
 
         let mut pipeline = crate::pipeline::TextPipeline::new(
             model,
@@ -2437,8 +2709,17 @@ impl CausalLMLoaderBuilder {
         );
 
         // Attach adapter registry for per-request LoRA switching
-        if let Some(registry) = adapter_registry {
-            pipeline.set_adapter_registry(registry);
+        if let Some(ref registry) = adapter_registry {
+            pipeline.set_adapter_registry(registry.clone());
+        }
+
+        // Load and attach XLoRA classifier if configured
+        let num_adapters = adapter_registry
+            .as_ref()
+            .map(|r| r.adapter_count().unwrap_or(0))
+            .unwrap_or(0);
+        if let Some(classifier) = self.load_xlora_classifier(total_layers, num_adapters)? {
+            pipeline.set_xlora_classifier(classifier);
         }
 
         Ok(pipeline)
@@ -2568,7 +2849,11 @@ impl Loader for CausalLMLoader {
         // Build using CausalLMLoaderBuilder
         let mut builder = CausalLMLoaderBuilder::from_hf_gguf(
             &self.model_id,
-            &self.filenames.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &self
+                .filenames
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
         )
         .with_device(device.clone())
         .with_token_source(token_source)
@@ -2615,7 +2900,11 @@ impl Loader for CausalLMLoader {
         builder.build_async()
     }
 
-    #[allow(clippy::type_complexity, clippy::too_many_arguments, clippy::borrowed_box)]
+    #[allow(
+        clippy::type_complexity,
+        clippy::too_many_arguments,
+        clippy::borrowed_box
+    )]
     fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,

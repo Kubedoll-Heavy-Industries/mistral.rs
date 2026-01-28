@@ -111,7 +111,7 @@ pub struct ParamsGGUF<'a, R: std::io::Seek + std::io::Read>(
     pub Device<'a>,
     pub AttentionImplementation,
     pub DType,
-    pub Option<std::ops::Range<usize>>,  // layer_range for pipeline parallelism
+    pub Option<std::ops::Range<usize>>, // layer_range for pipeline parallelism
 );
 
 // A `None` type vs the `Some` type (`Adapter<'a>`)
@@ -192,6 +192,7 @@ pub trait FromGGUF {
 /// This enables unified model implementations that can be loaded from
 /// either GGUF (via `FromGGUF`) or safetensors (via `FromSafetensors`).
 #[allow(dead_code)] // Future: will be implemented by unified model structs
+#[allow(clippy::too_many_arguments)]
 pub trait FromSafetensors {
     /// Configuration type for this model (e.g., LlamaConfig JSON struct)
     type Config;
@@ -284,19 +285,33 @@ impl Config<ParamsGGML, Adapter<'_>> {
 impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, NoAdapter> {
     pub fn try_into_model<T: FromGGUF>(self) -> Result<T, candle_core::Error> {
         // Destructure props:
-        let ParamsGGUF(ct, Device { device, mapper }, attention_implementation, dtype, layer_range) = self.quant;
+        let ParamsGGUF(ct, Device { device, mapper }, attention_implementation, dtype, layer_range) =
+            self.quant;
 
         // Forwards all structured fields above into the required flattened param sequence:
         // Note: adapter_registry is None - this path doesn't support per-request LoRA
-        T::from_gguf(ct, device, mapper, attention_implementation, dtype, layer_range, None)
+        T::from_gguf(
+            ct,
+            device,
+            mapper,
+            attention_implementation,
+            dtype,
+            layer_range,
+            None,
+        )
     }
 }
 
 impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, Adapter<'_>> {
     pub fn try_into_model<T: FromAdapterGGUF>(self) -> Result<T, candle_core::Error> {
         // Destructure props:
-        let ParamsGGUF(ct, Device { device, mapper }, _attention_implementation, dtype, _layer_range) =
-            self.quant;
+        let ParamsGGUF(
+            ct,
+            Device { device, mapper },
+            _attention_implementation,
+            dtype,
+            _layer_range,
+        ) = self.quant;
 
         let Adapter {
             xlora_config,

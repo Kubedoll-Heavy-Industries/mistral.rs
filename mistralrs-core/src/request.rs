@@ -1,13 +1,13 @@
+use crate::{
+    pipeline::DiffusionGenerationParams, response::Response, sampler::TokenSamplingParams,
+    tools::ToolChoice, CustomLogitsProcessor, Tool,
+};
 use either::Either;
 use indexmap::IndexMap;
 use mistralrs_audio::AudioInput;
 use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::{
-    pipeline::DiffusionGenerationParams, response::Response, sampler::TokenSamplingParams,
-    tools::ToolChoice, CustomLogitsProcessor, Tool,
-};
 use std::{fmt::Debug, sync::Arc};
 use tokio::sync::mpsc::Sender;
 
@@ -325,7 +325,6 @@ pub struct WebSearchOptions {
     /// Override the description for the extraction tool.
     pub extract_description: Option<String>,
 }
-
 
 #[derive(Clone, Serialize, Deserialize)]
 /// Discriminated union of all request types to the Engine.

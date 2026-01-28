@@ -305,7 +305,12 @@ impl Mistral3RotaryEmbedding {
         let cos = (freqs.cos()? * mscale as f64)?.to_dtype(dtype)?;
         let rot_dim = dim;
 
-        Ok(Self { sin, cos, is_partial: false, rot_dim })
+        Ok(Self {
+            sin,
+            cos,
+            is_partial: false,
+            rot_dim,
+        })
     }
 
     pub fn new_unscaled(
@@ -331,7 +336,12 @@ impl Mistral3RotaryEmbedding {
         let cos = freqs.cos()?.to_dtype(dtype)?;
         let rot_dim = dim;
 
-        Ok(Self { sin, cos, is_partial: false, rot_dim })
+        Ok(Self {
+            sin,
+            cos,
+            is_partial: false,
+            rot_dim,
+        })
     }
 
     /// Mark this embedding as partial rotary (rope_dim < head_dim)
@@ -405,10 +415,16 @@ impl Mistral3RotaryEmbedding {
                 for (i, offset) in seqlen_offsets.iter().enumerate() {
                     let cos = self.cos.narrow(0, *offset, seq_len)?;
                     let sin = self.sin.narrow(0, *offset, seq_len)?;
-                    let q_embed =
-                        candle_nn::rotary_emb::rope_i(&q.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
-                    let k_embed =
-                        candle_nn::rotary_emb::rope_i(&k.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
+                    let q_embed = candle_nn::rotary_emb::rope_i(
+                        &q.i(i)?.unsqueeze(0)?.contiguous()?,
+                        &cos,
+                        &sin,
+                    )?;
+                    let k_embed = candle_nn::rotary_emb::rope_i(
+                        &k.i(i)?.unsqueeze(0)?.contiguous()?,
+                        &cos,
+                        &sin,
+                    )?;
                     q_embeds.push(q_embed);
                     k_embeds.push(k_embed);
                 }
@@ -420,7 +436,12 @@ impl Mistral3RotaryEmbedding {
 
 /// Implement PositionEncoding trait so YaRN RoPE can be used with CausalAttention.
 impl PositionEncoding for Mistral3RotaryEmbedding {
-    fn forward(&self, q: &Tensor, k: &Tensor, seqlen_offsets: &[usize]) -> Result<(Tensor, Tensor)> {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
         Mistral3RotaryEmbedding::forward(self, q, k, seqlen_offsets)
     }
 }
@@ -487,7 +508,8 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
                     factor: c.get_value("rope.scaling.factor").unwrap_or(16.0),
                     original_max_position_embeddings: c
                         .get_value::<u64>("rope.scaling.original_context_length")
-                        .unwrap_or(16384) as usize,
+                        .unwrap_or(16384)
+                        as usize,
                     beta_fast: c.get_value("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
                     beta_slow: c.get_value("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
                 })
@@ -594,9 +616,19 @@ impl ModelConfig::FromGGUF for ModelWeights {
         };
         let output = if is_last_stage {
             Some(if weights.has_tensor(&naming.output()) {
-                weights.load_linear(&naming.output(), config.hidden_size, config.vocab_size, device)?
+                weights.load_linear(
+                    &naming.output(),
+                    config.hidden_size,
+                    config.vocab_size,
+                    device,
+                )?
             } else {
-                weights.load_linear(&naming.token_embd(), config.hidden_size, config.vocab_size, device)?
+                weights.load_linear(
+                    &naming.token_embd(),
+                    config.hidden_size,
+                    config.vocab_size,
+                    device,
+                )?
             })
         } else {
             None
@@ -843,7 +875,12 @@ impl TransformerModel for ModelWeights {
         self.tok_embeddings.forward(tokens)
     }
 
-    fn transform(&self, hidden: Tensor, ctx: &TransformContext, cache: &mut [KvCache]) -> Result<Tensor> {
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
         let seq_len = hidden.dim(1)?;
         let start_offsets: Vec<usize> = vec![ctx.position_offset];
 
@@ -1041,10 +1078,8 @@ mod tests {
 
         // Simulate different offsets (as if prefix cache matched different lengths)
         for offset in [10, 50, 100, 500, 1000] {
-            let q =
-                Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
-            let k =
-                Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
+            let q = Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
+            let k = Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
 
             let (q_rot, k_rot) = rope
                 .forward(&q, &k, &[offset])
@@ -1219,10 +1254,8 @@ mod tests {
         for iteration in 0..20 {
             // Vary offset to simulate prefix cache hits at different points
             let offset = (iteration * 50) % 2000;
-            let q =
-                Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
-            let k =
-                Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
+            let q = Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
+            let k = Tensor::randn(0f32, 1.0, (batch, n_heads, seq_len, head_dim), &device).unwrap();
 
             let (q_rot, k_rot) = rope
                 .forward(&q, &k, &[offset])
@@ -1390,9 +1423,14 @@ mod tests {
         let max_seq_len = 4096;
         let rope_theta = 10_000.0;
 
-        let rope =
-            Mistral3RotaryEmbedding::new_unscaled(rope_theta, head_dim, max_seq_len, dtype, &device)
-                .unwrap();
+        let rope = Mistral3RotaryEmbedding::new_unscaled(
+            rope_theta,
+            head_dim,
+            max_seq_len,
+            dtype,
+            &device,
+        )
+        .unwrap();
 
         // Unscaled cos/sin should be in range [-1, 1]
         assert_bounded(&rope.cos, "unscaled cos", 1.01);

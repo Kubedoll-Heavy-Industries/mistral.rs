@@ -22,7 +22,9 @@ pub use layer::{GroupLimitedMoE, MoE, MoELayerConfig, MoEOrMlp, SoftmaxMoE, Spar
 
 // Routing strategies (some used directly via routing submodule, re-exported here for convenience)
 #[allow(unused_imports)]
-pub use routing::{GroupLimitedGreedy, RouteOutput, RoutingConfig, RoutingStrategy, SoftmaxTopK, SparseMixer};
+pub use routing::{
+    GroupLimitedGreedy, RouteOutput, RoutingConfig, RoutingStrategy, SoftmaxTopK, SparseMixer,
+};
 
 pub fn shard(dim: usize, rank: usize, world_size: usize) -> Shard {
     Shard::Simple {

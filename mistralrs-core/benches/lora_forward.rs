@@ -46,7 +46,8 @@ const LORA_RANKS: &[usize] = &[8, 16, 32, 64];
 /// Batch sizes for testing
 const BATCH_SIZES: &[usize] = &[1, 4, 16];
 
-/// Sequence lengths for testing
+/// Sequence lengths for testing (may be used in future benchmarks)
+#[allow(dead_code)]
 const SEQ_LENS: &[usize] = &[128, 512, 2048];
 
 /// Number of adapters for multi-adapter tests
