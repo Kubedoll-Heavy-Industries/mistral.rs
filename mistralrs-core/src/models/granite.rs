@@ -16,7 +16,8 @@ use crate::{
     amoe::{AnyMoeBaseModelMixin, AnyMoeConfig, AnyMoeExpertType, MlpLayer, MoeMlp},
     attention::SdpaParams,
     device_map::DeviceMapper,
-    kv_cache::{HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType},
+    kv_cache::{CacheLayout, HybridCache, HybridCacheConfig, HybridLayerType, SsmCacheConfig},
+    models::{LanguageModel, PagedAttentionContext, TokenizerModel, TransformContext},
     layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -1201,8 +1202,6 @@ enum DecoderLayer {
     Mamba(MambaBlock),
 }
 
-// Use HybridLayerCache from kv_cache instead of a local type alias
-
 // ====================== End Mamba Implementation ======================
 
 #[allow(dead_code)]
@@ -1514,86 +1513,6 @@ fn scale_tensor(tensor: Tensor, scale: f32) -> Result<Tensor> {
     }
 }
 
-/// Local enum to represent either a KV cache or Mamba cache for a layer
-/// (used internally by GraniteMoeHybrid - not exported)
-enum GraniteLayerCache {
-    Attention(KvCache),
-    Mamba(MambaLayerCache),
-}
-
-/// Hybrid cache that can store either KV cache or Mamba cache per layer
-/// (local to granite model - wraps kv_cache::HybridCache for pipeline integration)
-#[allow(dead_code)]
-struct GraniteHybridCache {
-    pub caches: Vec<GraniteLayerCache>,
-    max_seq_len: usize,
-}
-
-impl GraniteHybridCache {
-    pub fn new(
-        layer_types: &[GraniteLayerType],
-        cfg: &Config,
-        device: &Device,
-        dtype: candle_core::DType,
-    ) -> Result<Self> {
-        let mut caches = Vec::with_capacity(layer_types.len());
-        for layer_type in layer_types {
-            match layer_type {
-                GraniteLayerType::Attention => {
-                    caches.push(GraniteLayerCache::Attention(KvCache::new_normal(
-                        2,
-                        cfg.max_position_embeddings,
-                        HybridCache::CACHE_GROW_SIZE,
-                    )));
-                }
-                GraniteLayerType::Mamba => {
-                    caches.push(GraniteLayerCache::Mamba(create_mamba_cache(
-                        1, cfg, dtype, device,
-                    )?));
-                }
-            }
-        }
-        Ok(Self {
-            caches,
-            max_seq_len: cfg.max_position_embeddings,
-        })
-    }
-
-    pub fn seqlen(&self) -> usize {
-        // Return the seqlen from the first attention layer
-        for cache in &self.caches {
-            if let GraniteLayerCache::Attention(kv) = cache {
-                return kv.current_seq_len();
-            }
-        }
-        // If no attention layers, return 0
-        0
-    }
-
-    #[allow(dead_code)]
-    pub fn reset(&mut self) {
-        for cache in &mut self.caches {
-            match cache {
-                GraniteLayerCache::Attention(kv) => kv.reset(),
-                GraniteLayerCache::Mamba(mamba) => {
-                    let _ = mamba.reset();
-                }
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn num_layers(&self) -> usize {
-        self.caches.len()
-    }
-}
-
-impl PastKvLenCache for GraniteHybridCache {
-    fn get_past_kv_len(&self) -> Result<usize> {
-        Ok(self.seqlen())
-    }
-}
-
 #[allow(dead_code)]
 pub struct GraniteMoeHybrid {
     wte: Embedding,
@@ -1601,8 +1520,6 @@ pub struct GraniteMoeHybrid {
     layer_types: Vec<GraniteLayerType>,
     ln_f: RmsNorm,
     lm_head: Arc<dyn QuantMethod>,
-    hybrid_cache: Arc<Mutex<GraniteHybridCache>>,
-    // EitherCache for pipeline integration
     kv_cache: EitherCache,
     device: Device,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
@@ -1611,6 +1528,7 @@ pub struct GraniteMoeHybrid {
     logits_scaling: f32,
     num_attention_heads: usize,
     max_seq_len: usize,
+    model_cache_layout: CacheLayout,
 }
 
 impl GraniteMoeHybrid {
@@ -1790,15 +1708,7 @@ impl GraniteMoeHybrid {
             layers.push(layer);
         }
 
-        // Create hybrid cache for internal use
-        let hybrid_cache = Arc::new(Mutex::new(GraniteHybridCache::new(
-            &layer_types,
-            cfg,
-            &normal_loading_metadata.real_device,
-            vb_m.dtype(),
-        )?));
-
-        // Create pipeline-compatible hybrid cache config
+        // Create hybrid cache config
         let pipeline_layer_types: Vec<HybridLayerType> = layer_types
             .iter()
             .map(|lt| match lt {
@@ -1806,6 +1716,19 @@ impl GraniteMoeHybrid {
                 GraniteLayerType::Mamba => HybridLayerType::Mamba,
             })
             .collect();
+
+        let model_cache_layout = CacheLayout::hybrid(
+            pipeline_layer_types.clone(),
+            cfg.max_position_embeddings,
+            1,
+            SsmCacheConfig {
+                conv_dim: cfg.mamba_conv_dim(),
+                d_conv: cfg.mamba_d_conv,
+                n_heads: cfg.mamba_n_heads(),
+                head_dim: cfg.mamba_d_head(),
+                d_state: cfg.mamba_d_state,
+            },
+        );
 
         let hybrid_cache_config = HybridCacheConfig {
             layer_types: pipeline_layer_types,
@@ -1838,7 +1761,6 @@ impl GraniteMoeHybrid {
             layer_types,
             ln_f,
             lm_head,
-            hybrid_cache,
             kv_cache: EitherCache::Hybrid(pipeline_cache),
             device: normal_loading_metadata.real_device,
             cfg: ModelConfigMetadata {
@@ -1861,9 +1783,14 @@ impl GraniteMoeHybrid {
             },
             num_attention_heads,
             max_seq_len: cfg.max_position_embeddings,
+            model_cache_layout,
         })
     }
 
+    /// Forward pass for NormalModel compatibility.
+    ///
+    /// Delegates to `TokenizerModel::embed()`, `TokenizerModel::transform()`,
+    /// and `LanguageModel::lm_head()` using the pipeline's `HybridCache`.
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -1872,130 +1799,25 @@ impl GraniteMoeHybrid {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        let (_batch_size, _seq_len) = input_ids.dims2()?;
-        let mut x = self.wte.forward(input_ids)?;
-        // Scale embeddings
-        x = scale_tensor(x, self.embedding_multiplier)?;
+        let hidden = TokenizerModel::embed(self, input_ids)?;
 
-        // Get both internal cache and pipeline cache
-        let mut internal_cache = self.hybrid_cache.lock().unwrap();
-        let mut pipeline_cache = self.kv_cache.hybrid();
-
-        // Get state_indices for Mamba layers from pipeline cache
-        let state_indices = pipeline_cache.state_indices().cloned();
-
-        // Build attention mask - use seqlen_offsets for attention layers
-        let mask = CausalMasker.make_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(&*internal_cache as &dyn PastKvLenCache),
-            x.dtype(),
-            self.num_attention_heads,
-        )?;
-        // PagedAttention prompt chunking
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
+        let paged_attn = metadata.map(|(kv_cache, meta)| PagedAttentionContext {
+            kv_cache,
+            metadata: meta,
         });
+        let ctx = TransformContext {
+            seq_len: hidden.dim(1)?,
+            position_offset: seqlen_offsets[0],
+            paged_attn: paged_attn.as_ref(),
+            flash_params: Some(flash_params),
+            position_ids: None,
+        };
 
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            x = self.mapper.map(x, layer_idx)?;
+        let mut cache = self.kv_cache.hybrid();
+        let hidden = TokenizerModel::transform(self, hidden, &ctx, &mut *cache)?;
+        drop(cache);
 
-            match layer {
-                DecoderLayer::Attention(block) => {
-                    // Use internal cache for attention layers
-                    if let GraniteLayerCache::Attention(kv_cache) =
-                        &mut internal_cache.caches[layer_idx]
-                    {
-                        x = block.forward(
-                            &x,
-                            &mask.clone().map(|m| m.to_device(x.device()).unwrap()),
-                            seqlen_offsets,
-                            kv_cache,
-                            metadata.as_ref().map(|(kv_cache, metadata)| {
-                                (kv_cache[layer_idx].clone(), *metadata)
-                            }),
-                            flash_params,
-                        )?;
-                    }
-                }
-                DecoderLayer::Mamba(block) => {
-                    // For batch_size=1, use internal cache (faster, no gather/scatter overhead)
-                    // For batch_size>1, use pool-based approach with gather/scatter
-                    let batch_size = x.dim(0)?;
-
-                    if batch_size == 1 {
-                        // Single sequence: use internal cache directly (no pool overhead)
-                        if let GraniteLayerCache::Mamba(mamba_cache) =
-                            &mut internal_cache.caches[layer_idx]
-                        {
-                            // Reset state at start of new sequence (prompt phase)
-                            if seqlen_offsets[0] == 0 {
-                                mamba_cache.reset()?;
-                            }
-                            x = block.forward(&x, mamba_cache)?;
-                        }
-                    } else if let (Some(ref indices), Some(HybridLayerCache::Mamba(pool))) =
-                        (&state_indices, pipeline_cache.get_mut(layer_idx))
-                    {
-                        // Multiple sequences: use pool with gather/scatter
-                        let conv_state = pool.gather_conv_state(indices)?;
-                        let ssm_state = pool.gather_ssm_state(indices)?;
-
-                        // Get seqlen_offset from first sequence (assumes all same phase)
-                        let first_idx: u32 = indices.i(0)?.to_scalar()?;
-                        let seqlen_offset = pool.get_seqlen_offset(first_idx as usize);
-
-                        // Create temporary cache with gathered states
-                        let mut temp_cache = MambaLayerCache {
-                            conv_state,
-                            ssm_state,
-                            seqlen_offset,
-                        };
-
-                        // Run Mamba forward
-                        x = block.forward(&x, &mut temp_cache)?;
-
-                        // Scatter updated states back to pool
-                        pool.scatter_conv_state(indices, &temp_cache.conv_state)?;
-                        pool.scatter_ssm_state(indices, &temp_cache.ssm_state)?;
-
-                        // Update seqlen_offsets in pool for each sequence
-                        let indices_vec: Vec<u32> = indices.to_vec1()?;
-                        for &idx in &indices_vec {
-                            pool.set_seqlen_offset(idx as usize, temp_cache.seqlen_offset);
-                        }
-                    } else {
-                        // Fallback: use internal cache
-                        if let GraniteLayerCache::Mamba(mamba_cache) =
-                            &mut internal_cache.caches[layer_idx]
-                        {
-                            // Reset state at start of new sequence (prompt phase)
-                            if seqlen_offsets[0] == 0 {
-                                mamba_cache.reset()?;
-                            }
-                            x = block.forward(&x, mamba_cache)?;
-                        }
-                    }
-                }
-            }
-        }
-
-        let x = x.to_device(&self.device)?;
-        let mut x = self.ln_f.forward(&x)?;
-
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let mut logits = MatMul.qmethod_matmul(&x, &*self.lm_head)?;
-
-        // Scale logits
-        logits = scale_tensor(logits, self.logits_scaling)?;
-
+        let logits = LanguageModel::lm_head(self, hidden)?;
         extract_logits(&logits, context_lens)
     }
 
@@ -2018,6 +1840,144 @@ impl GraniteMoeHybrid {
         }
 
         uvb_m.to_safetensors()
+    }
+}
+
+// =============================================================================
+// New Model Trait Hierarchy Implementations
+// =============================================================================
+
+impl crate::models::Model for GraniteMoeHybrid {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TokenizerModel<HybridCache> for GraniteMoeHybrid {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.k_head_dim * self.cfg.num_kv_heads
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        let x = self.wte.forward(tokens)?;
+        scale_tensor(x, self.embedding_multiplier)
+    }
+
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        state: &mut HybridCache,
+    ) -> Result<Tensor> {
+        let mut xs = hidden;
+        let seqlen_offsets = vec![ctx.position_offset];
+
+        // Get state indices for Mamba layers from the HybridCache
+        let state_indices = state.state_indices().cloned();
+        let default_indices = Tensor::from_vec(vec![0u32], (1,), xs.device())?;
+
+        // Build causal mask
+        let mask = CausalMasker.make_causal_mask_as(
+            ctx.seq_len,
+            xs.device(),
+            &seqlen_offsets.as_slice() as &dyn PastKvLenCache,
+            xs.dtype(),
+        )?;
+
+        // Skip mask for non-first paged attention chunks
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Build flash params fallback
+        let empty_flash = FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: HashMap::new(),
+            cumulative_seqlens_k: HashMap::new(),
+            causal: false,
+        };
+        let flash_params = ctx.flash_params.unwrap_or(&empty_flash);
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            xs = self.mapper.map(xs, layer_idx)?;
+
+            match layer {
+                DecoderLayer::Attention(block) => {
+                    let kv_cache = state.caches[layer_idx]
+                        .as_kv_cache_mut()
+                        .expect("attention layer needs KV cache");
+
+                    let metadata = ctx.paged_attn.as_ref().map(|pa| {
+                        (pa.kv_cache[layer_idx].clone(), pa.metadata)
+                    });
+
+                    xs = block.forward(
+                        &xs,
+                        &mask.clone().map(|m| m.to_device(xs.device()).unwrap()),
+                        &seqlen_offsets,
+                        kv_cache,
+                        metadata,
+                        flash_params,
+                    )?;
+                }
+                DecoderLayer::Mamba(block) => {
+                    let pool = state.caches[layer_idx]
+                        .as_mamba_pool_mut()
+                        .expect("mamba layer requires MambaStatePool");
+                    let indices = state_indices.as_ref().unwrap_or(&default_indices);
+
+                    let conv_state = pool.gather_conv_state(indices)?;
+                    let ssm_state = pool.gather_ssm_state(indices)?;
+                    let first_idx: u32 = indices.i(0)?.to_scalar()?;
+                    let seqlen_offset = pool.get_seqlen_offset(first_idx as usize);
+
+                    let mut temp_cache = MambaLayerCache {
+                        conv_state,
+                        ssm_state,
+                        seqlen_offset,
+                    };
+
+                    xs = block.forward(&xs, &mut temp_cache)?;
+
+                    pool.scatter_conv_state(indices, &temp_cache.conv_state)?;
+                    pool.scatter_ssm_state(indices, &temp_cache.ssm_state)?;
+
+                    let indices_vec: Vec<u32> = indices.to_vec1()?;
+                    for &idx in &indices_vec {
+                        pool.set_seqlen_offset(idx as usize, temp_cache.seqlen_offset);
+                    }
+                }
+            }
+        }
+
+        xs.to_device(&self.device)
+    }
+
+    fn cache_layout(&self) -> CacheLayout {
+        self.model_cache_layout.clone()
+    }
+}
+
+impl LanguageModel<HybridCache> for GraniteMoeHybrid {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        let mut xs = self.ln_f.forward(&hidden)?;
+        if let Some(t) = self.lm_head.quantized_act_type() {
+            xs = xs.to_dtype(t)?;
+        }
+        let logits = MatMul.qmethod_matmul(&xs, &*self.lm_head)?;
+        scale_tensor(logits, self.logits_scaling)
     }
 }
 
@@ -2119,7 +2079,7 @@ impl NormalModel for GraniteMoeHybrid {
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
         _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _flash_params: &FlashParams,

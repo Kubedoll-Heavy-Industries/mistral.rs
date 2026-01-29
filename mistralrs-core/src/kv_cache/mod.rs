@@ -10,15 +10,60 @@ use crate::{
     sequence::Sequence,
 };
 
+mod cache_store;
 mod full_cache;
 mod hybrid_cache;
 mod rotating_cache;
 mod single_cache;
 
+pub use cache_store::{CacheLayout, CacheStore, SsmCache, SsmCacheConfig};
+// Note: CacheLayerType is an alias for HybridLayerType, use HybridLayerType directly
+// Additional types available when needed:
+// pub(crate) use cache_store::{CacheLayerType, HybridCacheStore, SinkCache, SinkCacheStore};
 pub use full_cache::{EitherCache, LayerCaches};
-pub use hybrid_cache::{HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType};
+pub use hybrid_cache::{HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, MambaStatePool};
 pub use rotating_cache::RotatingCache;
 pub use single_cache::SingleCache;
+
+// =============================================================================
+// InferenceState Trait
+// =============================================================================
+
+/// Common interface for model inference state.
+///
+/// Both attention-based models (using `[KvCache]`) and hybrid models (using
+/// `HybridCache`) implement this trait. The pipeline uses it for state lifecycle
+/// management; models access type-specific state through the concrete type.
+pub trait InferenceState {
+    /// Reset all state (for starting a new sequence).
+    fn reset(&mut self);
+
+    /// Current sequence length (tokens processed so far).
+    fn seq_len(&self) -> usize;
+}
+
+impl InferenceState for [KvCache] {
+    fn reset(&mut self) {
+        for cache in self.iter_mut() {
+            cache.reset();
+        }
+    }
+
+    fn seq_len(&self) -> usize {
+        self.first().map(|c| c.current_seq_len()).unwrap_or(0)
+    }
+}
+
+impl InferenceState for HybridCache {
+    fn reset(&mut self) {
+        self.reset();
+    }
+
+    fn seq_len(&self) -> usize {
+        // Delegate to existing CacheStore implementation
+        CacheStore::seq_len(self)
+    }
+}
 
 pub trait CacheManager<T: CacheManagerMixin + MetadataMixin + ?Sized> {
     fn clone_in_cache(

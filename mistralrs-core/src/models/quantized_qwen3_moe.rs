@@ -23,7 +23,7 @@ use crate::layers::{
     self, Activation, CausalMasker, FeedForward, MatMul, RmsNorm, RotaryEmbedding, Sdpa,
 };
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TokenizerModel};
 use crate::moe::routing::{RoutingConfig, SoftmaxTopK};
 use crate::moe::{LoadedExpertWeights, MoE, MoEExperts, MoELayerConfig, QuantProperties};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
@@ -268,6 +268,7 @@ pub struct ModelWeights {
     pub max_seq_len: usize,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
+    kv_dim: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -675,6 +676,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len,
             mapper: Some(mapper),
             dtype,
+            kv_dim: head_dim * head_count_kv,
         })
     }
 }
@@ -923,6 +925,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             max_seq_len: cfg.max_position_embeddings,
             mapper: Some(mapper),
             dtype,
+            kv_dim: cfg.head_dim() * cfg.num_key_value_heads,
         })
     }
 }
@@ -978,13 +981,17 @@ impl Model for ModelWeights {
     }
 }
 
-impl TransformerModel for ModelWeights {
+impl TokenizerModel<[KvCache]> for ModelWeights {
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -1024,7 +1031,7 @@ impl TransformerModel for ModelWeights {
     }
 }
 
-impl LanguageModel for ModelWeights {
+impl LanguageModel<[KvCache]> for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         // Move to model device and apply final norm
         let hidden = hidden.to_device(&self.device)?;

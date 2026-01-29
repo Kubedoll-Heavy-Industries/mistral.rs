@@ -1,5 +1,25 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+//! DeepSeek V3 model with universal architecture support.
+//!
+//! DeepSeek V3 builds on V2 with:
+//! - **Multi-Latent Attention (MLA)**: Compressed KV cache via latent vectors
+//! - **GroupLimitedGreedy MoE routing**: Experts grouped, limited selection per group
+//! - **FP8 quantization**: Native FP8 for experts (handled via quantization system)
+//!
+//! # Architecture
+//!
+//! DeepSeek V3 uses:
+//! - Pre-norm with RmsNorm
+//! - RoPE with YaRN scaling (DeepSeek V2 style)
+//! - MLA attention with compressed KV cache
+//! - MoE with multiple routing strategies (Greedy, NoAuxTc, GroupLimitedGreedy)
+//!
+//! # Loading Methods
+//!
+//! - **Safetensors**: Uses `DeepSeekV3::from_safetensors()` with full precision or quantized
+//! - **GGUF**: Not currently supported (MLA architecture requires custom GGUF handling)
+
 use std::{collections::HashMap, sync::Arc};
 
 use candle_core::{Context, DType, Device, IndexOp, Result, Tensor, D};
@@ -20,6 +40,7 @@ use crate::{
     },
     layers_masker::{masked_fill, PastKvLenCache},
     moe::{GroupLimitedMoE, MoELayerConfig},
+    models::{LanguageModel, Model as ModelTrait, TransformContext, TokenizerModel},
     ops::{SplitOp, TopKLastDimOp, TopKOutput},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -33,6 +54,11 @@ use crate::{
 
 use std::collections::HashSet;
 use std::iter::FromIterator;
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
 serde_default_fn!(f64, routed_scaling_factor, 1.0);
 serde_default_fn!(TopkMethod, topk_method, TopkMethod::Greedy);
 serde_default_fn!(usize, moe_layer_freq, 1);
@@ -59,6 +85,7 @@ enum ScoringFunc {
     Sigmoid,
 }
 
+/// Configuration for DeepSeek V3 models (from config.json).
 #[derive(Deserialize, Clone, Debug)]
 pub struct DeepSeekV3Config {
     pub(crate) vocab_size: usize,
@@ -134,6 +161,11 @@ impl DeepSeekV3Config {
     }
 }
 
+// =============================================================================
+// Multi-Latent Attention (MLA)
+// =============================================================================
+
+/// Query projection with optional LoRA compression.
 enum QProj {
     Plain(Arc<dyn QuantMethod>),
     Lora {
@@ -154,7 +186,12 @@ impl QProj {
     }
 }
 
-struct Attention {
+/// Multi-Latent Attention for DeepSeek V3.
+///
+/// MLA compresses KV cache by projecting to a smaller latent space:
+/// - Standard: K, V are [batch, seq, num_kv_heads, head_dim]
+/// - MLA: KV_compressed is [batch, seq, kv_lora_rank]
+struct MlaAttention {
     q: QProj,
     kv_a_proj_with_mqa: Arc<dyn QuantMethod>,
     kv_a_layernorm: RmsNorm,
@@ -168,7 +205,7 @@ struct Attention {
     num_attention_heads: usize,
 }
 
-impl Attention {
+impl MlaAttention {
     #[allow(clippy::too_many_arguments)]
     fn new(
         rotary_emb: Arc<DeepSeekV2RotaryEmbedding>,
@@ -390,6 +427,11 @@ impl Attention {
     }
 }
 
+// =============================================================================
+// MoE Components
+// =============================================================================
+
+/// Expert MLP for DeepSeek V3.
 struct Expert {
     gate: Arc<dyn QuantMethod>,
     up: Arc<dyn QuantMethod>,
@@ -789,10 +831,14 @@ impl DeepSeek3MoeOrMlp {
     }
 }
 
+// =============================================================================
+// Decoder Layer
+// =============================================================================
+
 struct DecoderLayer {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    attn: Attention,
+    attn: MlaAttention,
     moe_or_mlp: DeepSeek3MoeOrMlp,
 }
 
@@ -808,7 +854,7 @@ impl DecoderLayer {
         paged_attn: Option<PagedAttention>,
         comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
-        let attn = Attention::new(
+        let attn = MlaAttention::new(
             rotary_emb,
             cfg,
             vb.pp("self_attn"),
@@ -933,6 +979,15 @@ impl DecoderLayer {
     }
 }
 
+// =============================================================================
+// DeepSeek V3 Model
+// =============================================================================
+
+/// DeepSeek V3 language model.
+///
+/// This model implements the universal `TransformerModel` and `LanguageModel` traits,
+/// enabling integration with the new pipeline infrastructure while maintaining
+/// compatibility with the legacy `NormalModel` interface.
 pub struct DeepSeekV3 {
     lm_head: Arc<dyn QuantMethod>,
     embed_tokens: Embedding,
@@ -943,10 +998,12 @@ pub struct DeepSeekV3 {
     max_seq_len: usize,
     cfg: ModelConfigMetadata,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
+    dtype: DType,
 }
 
 impl DeepSeekV3 {
-    pub fn new(
+    /// Create a new DeepSeek V3 model from safetensors weights.
+    pub fn from_safetensors(
         cfg: &DeepSeekV3Config,
         vb: ShardedVarBuilder,
         _is_gptx: bool,
@@ -956,6 +1013,7 @@ impl DeepSeekV3 {
         let vb_m = vb.pp("model");
 
         let mapper = normal_loading_metadata.mapper;
+        let dtype = vb.dtype();
 
         let embed_tokens = embedding(
             cfg.vocab_size,
@@ -1072,11 +1130,27 @@ impl DeepSeekV3 {
                 },
             },
             mapper,
+            dtype,
         })
     }
 
+    /// Legacy constructor for compatibility with existing pipelines.
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use DeepSeekV3::from_safetensors() instead"
+    )]
+    pub fn new(
+        cfg: &DeepSeekV3Config,
+        vb: ShardedVarBuilder,
+        is_gptx: bool,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Self> {
+        Self::from_safetensors(cfg, vb, is_gptx, normal_loading_metadata, attention_mechanism)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(
+    fn forward_inner(
         &self,
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
@@ -1123,6 +1197,101 @@ impl DeepSeekV3 {
         extract_logits(&self.lm_head.forward_autocast(&xs)?, context_lens)
     }
 }
+
+// =============================================================================
+// Model Trait Implementations
+// =============================================================================
+
+impl ModelTrait for DeepSeekV3 {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TokenizerModel<[KvCache]> for DeepSeekV3 {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.k_head_dim * self.cfg.num_kv_heads
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(tokens)
+    }
+
+    fn transform(
+        &self,
+        mut hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        let position_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute causal mask
+        let mask = CausalMasker.make_causal_mask_matrix(
+            &Tensor::zeros((1, hidden.dims()[1]), DType::U32, hidden.device())?,
+            &position_offsets.as_slice() as &dyn PastKvLenCache,
+            self.dtype,
+            self.cfg.num_attn_heads,
+        )?;
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Create empty FlashParams for layers
+        let empty_flash = FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: Default::default(),
+            cumulative_seqlens_k: Default::default(),
+            causal: false,
+        };
+        let flash_params = ctx.flash_params.unwrap_or(&empty_flash);
+
+        // Run through decoder layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = self.mapper.map(hidden, i)?;
+
+            let layer_metadata = ctx
+                .paged_attn
+                .as_ref()
+                .map(|pa| (pa.kv_cache[i].clone(), pa.metadata));
+
+            hidden = layer.forward(
+                &hidden,
+                mask.as_ref()
+                    .map(|m| m.to_device(hidden.device()).unwrap())
+                    .as_ref(),
+                &position_offsets,
+                &mut cache[i],
+                layer_metadata,
+                flash_params,
+            )?;
+        }
+
+        // Apply output norm
+        self.norm.forward(&hidden)
+    }
+}
+
+impl LanguageModel<[KvCache]> for DeepSeekV3 {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        self.lm_head.forward_autocast(&hidden)
+    }
+}
+
+// =============================================================================
+// ISQ Support
+// =============================================================================
 
 impl IsqModel for DeepSeekV3 {
     fn get_layers(
@@ -1255,6 +1424,10 @@ impl IsqModel for DeepSeekV3 {
     }
 }
 
+// =============================================================================
+// NormalModel Support (for NormalPipeline compatibility)
+// =============================================================================
+
 impl NormalModel for DeepSeekV3 {
     fn forward(
         &self,
@@ -1265,7 +1438,7 @@ impl NormalModel for DeepSeekV3 {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        self.forward(
+        self.forward_inner(
             input_ids,
             seqlen_offsets,
             context_lens,
@@ -1280,7 +1453,7 @@ impl NormalModel for DeepSeekV3 {
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
         _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _flash_params: &FlashParams,

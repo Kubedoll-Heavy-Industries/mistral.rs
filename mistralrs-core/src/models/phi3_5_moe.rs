@@ -1,11 +1,37 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use candle_core::{Device, Module, Result, Tensor};
-use candle_nn::LayerNorm;
+//! Phi-3.5 MoE model with unified loading from safetensors format.
+//!
+//! Phi-3.5 MoE combines the Phi-3 architecture with Mixture of Experts:
+//! - Pre-norm with LayerNorm (not RmsNorm like most MoE models)
+//! - Separate Q, K, V projections (not fused QKV like standard Phi-3)
+//! - Sliding window attention
+//! - **SparseMixer routing** - threshold-based selection with jitter, NOT softmax top-k
+//!
+//! # Architecture
+//!
+//! Each decoder layer consists of:
+//! 1. Input LayerNorm + Attention (with sliding window) + Residual
+//! 2. Post-attention LayerNorm + SparseMixer MoE FFN + Residual
+//!
+//! The MoE routing uses SparseMixer which:
+//! - Always selects exactly 2 experts per token
+//! - Uses argmax + threshold masking instead of softmax top-k
+//! - Applies jitter noise for regularization
+//!
+//! # Loading Methods
+//!
+//! - **Safetensors**: Uses `Phi35Moe::from_safetensors()` with SparseMixerMoE
+//!
+//! Both paths use the unified `SparseMixer` routing strategy.
+
+use candle_core::{DType, Device, Result, Tensor};
+use candle_nn::{Embedding, LayerNorm, Module};
 use mistralrs_quant::{
     ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
     ShardedVarBuilder,
 };
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
@@ -13,10 +39,11 @@ use crate::{
     attention::SdpaParams,
     device_map::DeviceMapper,
     layers::{
-        self, layer_norm, Activation, CausalMasker, FeedForward, MatMul, PhiRopeConfig,
-        PhiRopeScalingConfig, PhiRotaryEmbedding, Sdpa,
+        embedding, layer_norm, CausalMasker, FeedForward, MatMul, PhiRopeConfig,
+        PhiRopeScalingConfig, PhiRotaryEmbedding,
     },
     layers_masker::PastKvLenCache,
+    models::{LanguageModel, Model as ModelTrait, TransformContext, TokenizerModel},
     moe::{MoELayerConfig, SparseMixerMoE},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -25,16 +52,25 @@ use crate::{
         EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
     },
     serde_default_fn,
-    utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
+    utils::progress::NiceProgressBar,
+    utils::unvarbuilder::UnVarBuilder,
 };
+
+use crate::layers::{reshape_attn_output, reshape_for_attn, Sdpa};
 
 serde_default_fn!(bool, word_emb_default, false);
 
-// https://huggingface.co/microsoft/Phi-3-mini-4k-instruct/blob/main/config.json
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, Default)]
+// =============================================================================
+// Configuration
+// =============================================================================
+
+/// Phi-3.5 MoE configuration (for safetensors loading).
+///
+/// This is the JSON config.json structure from HuggingFace Phi-3.5 MoE models.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
     pub(crate) vocab_size: usize,
-    pub(crate) hidden_act: Activation,
+    pub(crate) hidden_act: crate::layers::Activation,
     pub(crate) hidden_size: usize,
     pub(crate) intermediate_size: usize,
     pub(crate) num_hidden_layers: usize,
@@ -89,7 +125,11 @@ impl Config {
     }
 }
 
-struct Attention {
+// =============================================================================
+// Attention Layer
+// =============================================================================
+
+struct Phi35MoeAttention {
     q_proj: Arc<dyn QuantMethod>,
     k_proj: Arc<dyn QuantMethod>,
     v_proj: Arc<dyn QuantMethod>,
@@ -102,7 +142,7 @@ struct Attention {
     sdpa_params: SdpaParams,
 }
 
-impl Attention {
+impl Phi35MoeAttention {
     fn new(
         rotary_emb: Arc<PhiRotaryEmbedding>,
         cfg: &Config,
@@ -186,7 +226,7 @@ impl Attention {
         position_ids: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
+        _flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -204,28 +244,17 @@ impl Attention {
             v = v.to_dtype(original_dtype)?;
         }
 
-        let (q, k, v) = if q_len != 1 {
-            let q = q
-                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let k = k
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            let v = v
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
-            (q, k, v)
-        } else {
-            let q = q.reshape((b_sz, self.num_heads, q_len, self.head_dim))?;
-            let k = k.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?;
-            let v = v.reshape((b_sz, self.num_kv_heads, q_len, self.head_dim))?;
-            (q, k, v)
-        };
+        // Reshape for multi-head attention
+        let q = reshape_for_attn(q, b_sz, q_len, self.num_heads, self.head_dim)?;
+        let k = reshape_for_attn(k, b_sz, q_len, self.num_kv_heads, self.head_dim)?;
+        let v = reshape_for_attn(v, b_sz, q_len, self.num_kv_heads, self.head_dim)?;
 
+        // Apply RoPE
         let (q, k) = self
             .rotary_emb
             .forward(&q, &k, seqlen_offsets, position_ids)?;
 
+        // Attention with cache
         let mut attn_output = match &self.paged_attn {
             Some(paged_attn) => match metadata {
                 Some(((key_cache, value_cache), input_metadata)) => paged_attn.forward(
@@ -237,13 +266,11 @@ impl Attention {
                     Some(value_cache),
                     input_metadata,
                     &self.sdpa_params,
-                    Some(flash_params),
+                    None,
                 )?,
                 None => {
-                    // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
-                    // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
+                    // If we don't have metadata, we are most likely generating an imatrix
                     let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    // Sanity check.
                     assert!(attention_mask.is_some());
                     paged_attn.forward(
                         &q,
@@ -254,32 +281,21 @@ impl Attention {
                         None,
                         &input_metadata,
                         &self.sdpa_params,
-                        Some(flash_params),
+                        None,
                     )?
                 }
             },
             _ => {
                 let (k, v) = kv_cache.append(&k, &v)?;
-
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
+                Sdpa.run_attention(&q, &k, &v, attention_mask, None, &self.sdpa_params)?
             }
         };
 
         if let Some(t) = self.q_proj.quantized_act_type() {
             attn_output = attn_output.to_dtype(t)?;
         }
-        attn_output = if attention_mask.is_some() {
-            attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?
-        } else {
-            attn_output.reshape((b_sz, q_len, ()))?
-        };
+        attn_output = reshape_attn_output(attn_output, b_sz, q_len, attention_mask.is_some())?;
+
         let mut res = MatMul.qmethod_matmul(&attn_output, &*self.o_proj)?;
         if self.q_proj.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
@@ -288,17 +304,18 @@ impl Attention {
     }
 }
 
-// MoE FFN layer type alias - uses unified SparseMixerMoE from moe module
-type Phi35MoeFfn = SparseMixerMoE;
+// =============================================================================
+// Decoder Layer
+// =============================================================================
 
-struct DecoderLayer {
-    self_attn: Attention,
-    moe: Phi35MoeFfn,
+struct Phi35MoeDecoderLayer {
+    self_attn: Phi35MoeAttention,
+    moe: SparseMixerMoE,
     input_layernorm: LayerNorm,
     post_attention_layernorm: LayerNorm,
 }
 
-impl DecoderLayer {
+impl Phi35MoeDecoderLayer {
     #[allow(clippy::too_many_arguments)]
     fn new(
         rotary_emb: Arc<PhiRotaryEmbedding>,
@@ -311,7 +328,7 @@ impl DecoderLayer {
         real_device: Device,
         comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
-        let self_attn = Attention::new(
+        let self_attn = Phi35MoeAttention::new(
             rotary_emb,
             cfg,
             mapper.set_device(layer_idx, vb.pp("self_attn"), loading_isq),
@@ -382,21 +399,356 @@ impl DecoderLayer {
     }
 }
 
-pub struct Model {
-    embed_tokens: candle_nn::Embedding,
-    layers: Vec<DecoderLayer>,
-    norm: LayerNorm,
-    lm_head: Arc<dyn QuantMethod>,
+// =============================================================================
+// Phi-3.5 MoE Model
+// =============================================================================
+
+/// Phi-3.5 MoE model weights.
+///
+/// Uses unified `SparseMixer` routing for threshold-based expert selection.
+pub struct Phi35Moe {
+    embed_tokens: Embedding,
+    layers: Vec<Phi35MoeDecoderLayer>,
+    norm: Option<LayerNorm>,
+    lm_head: Option<Arc<dyn QuantMethod>>,
+    sliding_window: Option<usize>,
     device: Device,
     cache: EitherCache,
     max_seq_len: usize,
-    mapper: Box<dyn DeviceMapper + Send + Sync>,
-    sliding_window: Option<usize>,
+    num_layers: usize,
+    mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     cfg: ModelConfigMetadata,
+    dtype: DType,
 }
 
-impl Model {
-    pub fn new(
+// =============================================================================
+// Model Trait Implementations
+// =============================================================================
+
+impl ModelTrait for Phi35Moe {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TokenizerModel<[KvCache]> for Phi35Moe {
+    fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.k_head_dim * self.cfg.num_kv_heads
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(tokens)
+    }
+
+    fn transform(
+        &self,
+        mut hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        let position_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Create sliding window causal mask
+        let mask = CausalMasker.make_sliding_window_causal_mask_matrix(
+            &Tensor::zeros((1, hidden.dims()[1]), DType::U32, hidden.device())?,
+            &position_offsets.as_slice() as &dyn PastKvLenCache,
+            self.sliding_window,
+            self.dtype,
+            self.cfg.num_attn_heads,
+        )?;
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Position IDs for RoPE
+        let position_ids: Vec<usize> = (0..hidden.dims()[1])
+            .map(|i| i + ctx.position_offset)
+            .collect();
+
+        // Run through decoder layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(ref mapper) = self.mapper {
+                hidden = mapper.map(hidden, i)?;
+            }
+
+            let layer_metadata = ctx
+                .paged_attn
+                .as_ref()
+                .map(|pa| (pa.kv_cache[i].clone(), pa.metadata));
+
+            let empty_flash = FlashParams {
+                max_q: 0,
+                max_k: 0,
+                cumulative_seqlens_q: Default::default(),
+                cumulative_seqlens_k: Default::default(),
+                causal: false,
+            };
+            let flash_params = ctx.flash_params.unwrap_or(&empty_flash);
+            hidden = layer.forward(
+                &hidden,
+                mask.as_ref(),
+                &position_offsets,
+                &position_ids,
+                &mut cache[i],
+                layer_metadata,
+                flash_params,
+            )?;
+        }
+
+        Ok(hidden)
+    }
+}
+
+impl LanguageModel<[KvCache]> for Phi35Moe {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        match (&self.norm, &self.lm_head) {
+            (Some(norm), Some(lm_head)) => {
+                let x = norm.forward(&hidden)?;
+                MatMul.qmethod_matmul(&x.contiguous()?, &**lm_head)
+            }
+            _ => {
+                // Pipeline parallelism: non-last stage returns hidden states
+                Ok(hidden)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// ISQ Support
+// =============================================================================
+
+impl IsqModel for Phi35Moe {
+    fn get_layers(
+        &mut self,
+    ) -> (
+        Vec<(&mut Arc<dyn QuantMethod>, Option<usize>)>,
+        &dyn DeviceMapper,
+    ) {
+        let mut tensors = Vec::new();
+        if let Some(ref mut lm_head) = self.lm_head {
+            tensors.push((lm_head, None));
+        }
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            tensors.push((&mut layer.self_attn.q_proj, Some(i)));
+            tensors.push((&mut layer.self_attn.k_proj, Some(i)));
+            tensors.push((&mut layer.self_attn.v_proj, Some(i)));
+            tensors.push((&mut layer.self_attn.o_proj, Some(i)));
+            for moe_layer in layer.moe.get_isq_layers() {
+                tensors.push((moe_layer, Some(i)));
+            }
+        }
+        let mapper = self
+            .mapper
+            .as_ref()
+            .expect("Model must have a mapper for get_layers");
+        (tensors, &**mapper)
+    }
+
+    fn get_layers_moe_experts_only(
+        &mut self,
+    ) -> (
+        Vec<(&mut Arc<dyn QuantMethod>, Option<usize>)>,
+        &dyn DeviceMapper,
+    ) {
+        let mut tensors = Vec::new();
+        if let Some(ref mut lm_head) = self.lm_head {
+            tensors.push((lm_head, None));
+        }
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            for moe_layer in layer.moe.get_isq_layers() {
+                tensors.push((moe_layer, Some(i)));
+            }
+        }
+        let mapper = self
+            .mapper
+            .as_ref()
+            .expect("Model must have a mapper for get_layers");
+        (tensors, &**mapper)
+    }
+
+    fn residual_tensors(&self) -> Vec<(String, Tensor)> {
+        let uvb = UnVarBuilder::new();
+
+        let uvb_m = uvb.pp("model");
+        uvb_m.pp("embed_tokens").add(&self.embed_tokens);
+        if let Some(ref norm) = self.norm {
+            uvb_m.pp("norm").add(norm);
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
+            uvb_l.pp("input_layernorm").add(&layer.input_layernorm);
+            uvb_l
+                .pp("post_attention_layernorm")
+                .add(&layer.post_attention_layernorm);
+            uvb_l
+                .pp("block_sparse_moe")
+                .pp("gate")
+                .add(layer.moe.gate());
+        }
+
+        uvb.to_safetensors()
+    }
+
+    fn residual_tensors_moe_experts_only(&self) -> Option<Vec<(String, Tensor)>> {
+        let uvb = UnVarBuilder::new();
+
+        let uvb_m = uvb.pp("model");
+        uvb_m.pp("embed_tokens").add(&self.embed_tokens);
+        if let Some(ref norm) = self.norm {
+            uvb_m.pp("norm").add(norm);
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
+            uvb_l.pp("input_layernorm").add(&layer.input_layernorm);
+            uvb_l
+                .pp("post_attention_layernorm")
+                .add(&layer.post_attention_layernorm);
+
+            let uvb_attn = uvb_l.pp("self_attn");
+            uvb_attn.pp("q_proj").add(&layer.self_attn.q_proj);
+            uvb_attn.pp("k_proj").add(&layer.self_attn.k_proj);
+            uvb_attn.pp("v_proj").add(&layer.self_attn.v_proj);
+            uvb_attn.pp("o_proj").add(&layer.self_attn.o_proj);
+            uvb_l
+                .pp("block_sparse_moe")
+                .pp("gate")
+                .add(layer.moe.gate());
+        }
+
+        Some(uvb.to_safetensors())
+    }
+}
+
+// =============================================================================
+// NormalModel Support (for NormalPipeline compatibility)
+// =============================================================================
+
+impl NormalModel for Phi35Moe {
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offsets: &[usize],
+        context_lens: Vec<(usize, usize)>,
+        position_ids: Vec<usize>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
+    ) -> Result<Tensor> {
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        let cache = &mut self.cache.normal().0;
+        let attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
+            input_ids,
+            metadata
+                .as_ref()
+                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                .unwrap_or(cache as &dyn PastKvLenCache),
+            self.sliding_window,
+            xs.dtype(),
+            self.cfg.num_attn_heads,
+        )?;
+        let attention_mask = attention_mask.filter(|_| {
+            metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            if let Some(ref mapper) = self.mapper {
+                xs = mapper.map(xs, i)?;
+            }
+            xs = layer.forward(
+                &xs,
+                attention_mask
+                    .as_ref()
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
+                seqlen_offsets,
+                &position_ids,
+                &mut cache[i],
+                metadata
+                    .as_ref()
+                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
+                flash_params,
+            )?
+        }
+
+        let xs = xs.to_device(&self.device)?;
+        match (&self.norm, &self.lm_head) {
+            (Some(norm), Some(lm_head)) => {
+                let mut xs = norm.forward(&xs)?;
+                if let Some(t) = lm_head.quantized_act_type() {
+                    xs = xs.to_dtype(t)?;
+                }
+                extract_logits(&MatMul.qmethod_matmul(&xs, &**lm_head)?, context_lens)
+            }
+            _ => Ok(xs),
+        }
+    }
+
+    fn xlora_forward(
+        &self,
+        _input_ids: &Tensor,
+        _input_ids_full: &Tensor,
+        _seqlen_offsets: &[usize],
+        _seqlen_offsets_full: &[usize],
+        _no_kv_cache: bool,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
+        _context_lens: Vec<(usize, usize)>,
+        _position_ids: Vec<usize>,
+        _flash_params: &FlashParams,
+        _flash_params_full: &FlashParams,
+    ) -> Result<Tensor> {
+        unimplemented!()
+    }
+
+    fn cache(&self) -> &EitherCache {
+        &self.cache
+    }
+
+    fn cache_mut(&mut self) -> &mut EitherCache {
+        &mut self.cache
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn is_xlora(&self) -> bool {
+        false
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn config(&self) -> &ModelConfigMetadata {
+        &self.cfg
+    }
+}
+
+impl AnyMoeBaseModelMixin for Phi35Moe {}
+
+// =============================================================================
+// Safetensors Loading
+// =============================================================================
+
+impl Phi35Moe {
+    /// Create a new Phi-3.5 MoE model from safetensors weights.
+    pub fn from_safetensors(
         cfg: &Config,
         vb: ShardedVarBuilder,
         _is_gptx: bool,
@@ -411,14 +763,20 @@ impl Model {
             );
         }
         let mapper = normal_loading_metadata.mapper;
+        let dtype = vb.dtype();
+
+        // Pre-compute world_size for ModelConfigMetadata before moving mapper
+        let world_size = mapper.get_comm_for(0)?.world_size();
         let vb_m = vb.pp("model");
 
-        let embed_tokens = layers::embedding(
+        let embed_tokens = embedding(
             cfg.vocab_size,
             cfg.hidden_size,
             mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
             &cfg.quantization_config,
         )?;
+
+        // Create RoPE embeddings per device
         let mut ropes = HashMap::new();
         for layer_idx in 0..cfg.num_hidden_layers {
             let device = mapper
@@ -429,8 +787,9 @@ impl Model {
                 Arc::new(PhiRotaryEmbedding::new(vb.dtype(), cfg.clone(), device)?),
             );
         }
+
         let vb_l = vb_m.pp("layers");
-        let layers: Vec<DecoderLayer> = NiceProgressBar::<_, 'b'>(
+        let layers: Vec<Phi35MoeDecoderLayer> = NiceProgressBar::<_, 'b'>(
             0..cfg.num_hidden_layers,
             "Loading repeating layers",
             &normal_loading_metadata.multi_progress,
@@ -450,7 +809,7 @@ impl Model {
                 }
             };
             let comm = mapper.get_comm_for(layer_idx)?;
-            DecoderLayer::new(
+            Phi35MoeDecoderLayer::new(
                 rotary_emb.clone(),
                 cfg,
                 vb_l.pp(layer_idx),
@@ -462,11 +821,13 @@ impl Model {
                 &comm,
             )
         })?;
+
         let norm = layer_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
+
         let lm_head = if !cfg.tie_word_embeddings {
             ReplicatedLayer::new(
                 cfg.hidden_size,
@@ -478,11 +839,13 @@ impl Model {
         } else {
             unreachable!()
         };
+
         Ok(Self {
-            embed_tokens,
+            embed_tokens: Embedding::new(embed_tokens.embeddings().clone(), cfg.hidden_size),
             layers,
-            norm,
-            lm_head,
+            norm: Some(norm),
+            lm_head: Some(lm_head),
+            sliding_window: cfg.sliding_window,
             device: normal_loading_metadata.real_device,
             cache: EitherCache::Normal(NormalCache::new_sliding(
                 cfg.num_hidden_layers,
@@ -490,220 +853,38 @@ impl Model {
                 cfg.sliding_window,
             )),
             max_seq_len: cfg.max_position_embeddings,
-            sliding_window: cfg.sliding_window,
+            num_layers: cfg.num_hidden_layers,
+            mapper: Some(mapper),
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers,
                 hidden_size: cfg.hidden_size,
-                num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
-                num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
-                    .max(1),
+                num_attn_heads: cfg.num_attention_heads / world_size,
+                num_kv_heads: (cfg.num_key_value_heads / world_size).max(1),
                 sliding_window: cfg.sliding_window,
                 k_head_dim: cfg.head_dim(),
                 v_head_dim: cfg.head_dim(),
             },
-            mapper,
+            dtype,
         })
     }
 
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        seqlen_offsets: &[usize],
-        position_ids: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        let mut xs = self.embed_tokens.forward(input_ids)?;
-        let cache = &mut self.cache.normal().0;
-        let attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
-            input_ids,
-            metadata
-                .as_ref()
-                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
-                .unwrap_or(cache as &dyn PastKvLenCache),
-            self.sliding_window,
-            xs.dtype(),
-            self.cfg.num_attn_heads,
-        )?;
-        // PagedAttention prompt chunking
-        let attention_mask = attention_mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
-
-        for (i, layer) in self.layers.iter().enumerate() {
-            xs = self.mapper.map(xs, i)?;
-            xs = layer.forward(
-                &xs,
-                attention_mask
-                    .as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
-                seqlen_offsets,
-                position_ids,
-                &mut cache[i],
-                metadata
-                    .as_ref()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
-                flash_params,
-            )?
-        }
-        let xs = xs.to_device(&self.device)?;
-        let mut xs = xs.apply(&self.norm)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        extract_logits(&MatMul.qmethod_matmul(&xs, &*self.lm_head)?, context_lens)
+    /// Legacy constructor for NormalModelLoader compatibility.
+    #[deprecated(since = "0.8.0", note = "Use `from_safetensors()` instead")]
+    pub fn new(
+        cfg: &Config,
+        vb: ShardedVarBuilder,
+        is_gptx: bool,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Self> {
+        Self::from_safetensors(cfg, vb, is_gptx, normal_loading_metadata, attention_mechanism)
     }
 }
 
-impl IsqModel for Model {
-    fn get_layers(
-        &mut self,
-    ) -> (
-        Vec<(&mut Arc<dyn QuantMethod>, Option<usize>)>,
-        &dyn DeviceMapper,
-    ) {
-        let mut tensors = Vec::new();
-        tensors.push((&mut self.lm_head, None));
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            tensors.push((&mut layer.self_attn.q_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.k_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.v_proj, Some(i)));
-            tensors.push((&mut layer.self_attn.o_proj, Some(i)));
-            // Use unified get_isq_layers from SparseMixerMoE
-            for moe_layer in layer.moe.get_isq_layers() {
-                tensors.push((moe_layer, Some(i)));
-            }
-        }
-        (tensors, &*self.mapper)
-    }
-    fn get_layers_moe_experts_only(
-        &mut self,
-    ) -> (
-        Vec<(&mut Arc<dyn QuantMethod>, Option<usize>)>,
-        &dyn DeviceMapper,
-    ) {
-        let mut tensors = Vec::new();
-        tensors.push((&mut self.lm_head, None));
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            // Use unified get_isq_layers from SparseMixerMoE
-            for moe_layer in layer.moe.get_isq_layers() {
-                tensors.push((moe_layer, Some(i)));
-            }
-        }
-        (tensors, &*self.mapper)
-    }
+// =============================================================================
+// Deprecated: Old Model type (use Phi35Moe instead)
+// =============================================================================
 
-    fn residual_tensors(&self) -> Vec<(String, Tensor)> {
-        let uvb = UnVarBuilder::new();
-
-        let uvb_m = uvb.pp("model");
-        uvb_m.pp("embed_tokens").add(&self.embed_tokens);
-        uvb_m.pp("norm").add(&self.norm);
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
-            uvb_l.pp("input_layernorm").add(&layer.input_layernorm);
-            uvb_l
-                .pp("post_attention_layernorm")
-                .add(&layer.post_attention_layernorm);
-            // Add MoE gate to residuals
-            uvb_l
-                .pp("block_sparse_moe")
-                .pp("gate")
-                .add(layer.moe.gate());
-        }
-
-        uvb.to_safetensors()
-    }
-
-    fn residual_tensors_moe_experts_only(&self) -> Option<Vec<(String, Tensor)>> {
-        let uvb = UnVarBuilder::new();
-
-        let uvb_m = uvb.pp("model");
-        uvb_m.pp("embed_tokens").add(&self.embed_tokens);
-        uvb_m.pp("norm").add(&self.norm);
-
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let uvb_l = uvb_m.pp("layers").pp(layer_idx);
-            uvb_l.pp("input_layernorm").add(&layer.input_layernorm);
-            uvb_l
-                .pp("post_attention_layernorm")
-                .add(&layer.post_attention_layernorm);
-
-            let uvb_attn = uvb_l.pp("self_attn");
-            uvb_attn.pp("q_proj").add(&layer.self_attn.q_proj);
-            uvb_attn.pp("k_proj").add(&layer.self_attn.k_proj);
-            uvb_attn.pp("v_proj").add(&layer.self_attn.v_proj);
-            uvb_attn.pp("o_proj").add(&layer.self_attn.o_proj);
-            // Add MoE gate to residuals (attention is already included above)
-            uvb_l
-                .pp("block_sparse_moe")
-                .pp("gate")
-                .add(layer.moe.gate());
-        }
-
-        Some(uvb.to_safetensors())
-    }
-}
-
-impl NormalModel for Model {
-    fn forward(
-        &self,
-        input_ids: &Tensor,
-        seqlen_offsets: &[usize],
-        context_lens: Vec<(usize, usize)>,
-        position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
-        flash_params: &FlashParams,
-    ) -> Result<Tensor> {
-        self.forward(
-            input_ids,
-            seqlen_offsets,
-            &position_ids,
-            context_lens,
-            metadata,
-            flash_params,
-        )
-    }
-    fn xlora_forward(
-        &self,
-        _input_ids: &Tensor,
-        _input_ids_full: &Tensor,
-        _seqlen_offsets: &[usize],
-        _seqlen_offsets_full: &[usize],
-        _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
-        _context_lens: Vec<(usize, usize)>,
-        _position_ids: Vec<usize>,
-        _flash_params: &FlashParams,
-        _flash_params_full: &FlashParams,
-    ) -> Result<Tensor> {
-        unimplemented!()
-    }
-    fn cache(&self) -> &EitherCache {
-        &self.cache
-    }
-    fn cache_mut(&mut self) -> &mut EitherCache {
-        &mut self.cache
-    }
-    fn device(&self) -> &Device {
-        &self.device
-    }
-    fn is_xlora(&self) -> bool {
-        false
-    }
-    fn max_seq_len(&self) -> usize {
-        self.max_seq_len
-    }
-    fn config(&self) -> &ModelConfigMetadata {
-        &self.cfg
-    }
-}
-
-impl AnyMoeBaseModelMixin for Model {}
+#[deprecated(since = "0.8.0", note = "Use `Phi35Moe::from_safetensors()` instead")]
+pub type Model = Phi35Moe;

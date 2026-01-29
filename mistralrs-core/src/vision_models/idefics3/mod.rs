@@ -15,11 +15,11 @@ use vision::{Idefics3Connector, Idefics3VisionTransformer};
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     device_map::DeviceMapper,
-    models::{llama::Llama3Model, Model, TransformerModel},
+    models::{llama::Llama3Model, Model, TokenizerModel},
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, NormalCache, NormalLoadingMetadata, VisionModel,
+        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, VisionModel,
     },
     utils::unvarbuilder::UnVarBuilder,
 };
@@ -298,7 +298,7 @@ impl VisionModel for Idefics3Model {
         Model::device(&self.text_model)
     }
     fn max_seq_len(&self) -> usize {
-        TransformerModel::max_seq_len(&self.text_model)
+        <Llama3Model as TokenizerModel<[KvCache]>>::max_seq_len(&self.text_model)
     }
     fn config(&self) -> &ModelConfigMetadata {
         self.text_model.config()

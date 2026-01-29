@@ -2,7 +2,7 @@
 //!
 //! This module defines common types used across different transformer implementations.
 //!
-//! For the canonical transformer model trait, see [`crate::models::TransformerModel`].
+//! For the canonical transformer model trait, see [`crate::models::TokenizerModel`].
 
 // Allow dead code - work-in-progress for unified transformer model traits
 #![allow(dead_code)]

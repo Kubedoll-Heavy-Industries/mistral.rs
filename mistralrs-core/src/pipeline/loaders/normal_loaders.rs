@@ -35,14 +35,14 @@ use regex::Regex;
 use serde::Deserialize;
 
 #[allow(deprecated)]
-use crate::xlora_models::{self, XLoraConfig};
+use crate::lora::XLoraConfig;
 use crate::models::{self, TransformContext};
 
 use super::{AutoDeviceMapParams, DeviceMappedModelLoader};
 
 #[deprecated(
     since = "0.8.0",
-    note = "Use TransformerModel + LanguageModel traits instead. NormalModel bundles cache with model, \
+    note = "Use TokenizerModel + LanguageModel traits instead. NormalModel bundles cache with model, \
             but cache belongs to the pipeline. Models should be stateless."
 )]
 pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
@@ -62,6 +62,10 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     ///
     /// XLoRA via NormalModel is deprecated. Use `CausalLMLoaderBuilder::with_xlora()`
     /// with `TextPipeline` instead.
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use CausalLMLoaderBuilder::with_xlora() with TextPipeline instead"
+    )]
     #[allow(clippy::too_many_arguments)]
     fn xlora_forward(
         &self,
@@ -86,6 +90,10 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
     /// # Deprecated
     ///
     /// Always returns false. XLoRA support moved to `TextPipeline` orchestration.
+    #[deprecated(
+        since = "0.8.0",
+        note = "XLoRA support moved to TextPipeline orchestration"
+    )]
     fn is_xlora(&self) -> bool {
         false
     }
@@ -110,8 +118,8 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
         false
     }
 
-    // === TransformerModel methods for pipeline parallelism ===
-    // These mirror the canonical TransformerModel trait from models/mod.rs.
+    // === TokenizerModel methods for pipeline parallelism ===
+    // These mirror the canonical TokenizerModel trait from models/mod.rs.
     // Models supporting pipeline parallelism must implement these.
 
     /// Convert token IDs to embeddings (HEAD stage only).
@@ -185,6 +193,10 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
     ///
     /// XLoRA loading via `NormalModelLoader` is deprecated. Use
     /// `CausalLMLoaderBuilder::with_xlora()` instead.
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use CausalLMLoaderBuilder::with_xlora() instead"
+    )]
     #[allow(clippy::too_many_arguments)]
     fn load_xlora(
         &self,
@@ -540,28 +552,6 @@ impl NormalModelLoader for MistralLoader {
             attention_mechanism,
         )?))
     }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::mistral::Config = serde_json::from_str(config)?;
-        Ok(Box::new(xlora_models::XLoraMistral::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
-        )?))
-    }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
@@ -733,29 +723,6 @@ impl NormalModelLoader for GemmaLoader {
             self.is_gptx(config)?,
             normal_loading_metadata,
             attention_mechanism,
-        )?))
-    }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::gemma::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraGemma::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
         )?))
     }
     fn is_gptx(&self, _: &str) -> Result<bool> {
@@ -939,29 +906,6 @@ impl NormalModelLoader for LlamaLoader {
              See: pipeline/loaders/gguf_metadata.rs for CausalLMLoader."
         )
     }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::llama::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraLlama::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
-        )?))
-    }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
@@ -1131,29 +1075,6 @@ impl NormalModelLoader for MixtralLoader {
             self.is_gptx(config)?,
             normal_loading_metadata,
             attention_mechanism,
-        )?))
-    }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::mixtral::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraMixtral::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
         )?))
     }
     fn is_gptx(&self, _: &str) -> Result<bool> {
@@ -1340,29 +1261,6 @@ impl NormalModelLoader for Phi2Loader {
             attention_mechanism,
         )?))
     }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::phi2::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraPhi2::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
-        )?))
-    }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
@@ -1530,29 +1428,6 @@ impl NormalModelLoader for Phi3Loader {
             self.is_gptx(config)?,
             normal_loading_metadata,
             attention_mechanism,
-        )?))
-    }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::phi3::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraPhi3::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
         )?))
     }
     fn is_gptx(&self, _: &str) -> Result<bool> {
@@ -1911,29 +1786,6 @@ impl NormalModelLoader for Gemma2Loader {
             attention_mechanism,
         )?))
     }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::gemma2::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraGemma2::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
-        )?))
-    }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
@@ -2112,29 +1964,6 @@ impl NormalModelLoader for Starcoder2Loader {
             attention_mechanism,
         )?))
     }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::starcoder2::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraStarcoder2::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
-        )?))
-    }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)
     }
@@ -2305,29 +2134,6 @@ impl NormalModelLoader for Phi3_5MoELoader {
             self.is_gptx(config)?,
             normal_loading_metadata,
             attention_mechanism,
-        )?))
-    }
-    fn load_xlora(
-        &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        lora_config: &[((String, String), LoraConfig)],
-        xlora_config: Option<XLoraConfig>,
-        xlora_ordering: Ordering,
-        normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
-    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::phi3::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(xlora_models::XLoraPhi3::new(
-            &cfg,
-            vb,
-            lora_config,
-            xlora_config,
-            xlora_ordering,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            preload_adapters,
         )?))
     }
     fn is_gptx(&self, _: &str) -> Result<bool> {
@@ -3751,20 +3557,19 @@ pub struct SmolLm3Loader;
 impl NormalModelLoader for SmolLm3Loader {
     fn load(
         &self,
-        config: &str,
-        vb: ShardedVarBuilder,
-        normal_loading_metadata: NormalLoadingMetadata,
-        attention_mechanism: AttentionImplementation,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        let cfg: crate::models::smollm3::Config = serde_json::from_str(config)?;
-
-        Ok(Box::new(models::smollm3::SmolLm3::new(
-            &cfg,
-            vb,
-            self.is_gptx(config)?,
-            normal_loading_metadata,
-            attention_mechanism,
-        )?))
+        // TODO(migration): SmolLM3 safetensors loading needs migration to TextPipeline<ModelWeights>.
+        // The new SmolLM3 model is stateless and incompatible with NormalModel's cache-bundled design.
+        // For now, use GGUF format with CausalLMLoader instead.
+        anyhow::bail!(
+            "SmolLM3 safetensors loading via NormalModel is deprecated. \
+             Use GGUF format with CausalLMLoader instead, or wait for safetensors loader migration. \
+             See: pipeline/loaders/gguf_metadata.rs for CausalLMLoader."
+        )
     }
     fn load_xlora(
         &self,
@@ -3776,7 +3581,7 @@ impl NormalModelLoader for SmolLm3Loader {
         _normal_loading_metadata: NormalLoadingMetadata,
         _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
-        todo!()
+        anyhow::bail!("XLoRA via NormalModel is deprecated for SmolLM3")
     }
     fn is_gptx(&self, _: &str) -> Result<bool> {
         Ok(true)

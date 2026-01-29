@@ -35,6 +35,7 @@ use crate::models::quantized_qwen::ModelWeights as QQwen;
 use crate::models::quantized_qwen3::ModelWeights as QQwen3;
 use crate::models::quantized_qwen3_moe::ModelWeights as QQwen3MoE;
 use crate::models::quantized_starcoder2::ModelWeights as QStarcoder2;
+use crate::models::smollm3::ModelWeights as SmolLm3;
 use crate::pipeline::chat_template::ChatTemplate;
 use crate::pipeline::hooks::HookContainer;
 use crate::pipeline::text::TextPipeline;
@@ -61,6 +62,7 @@ use crate::sequence::Sequence;
 /// - `Qwen3` - Qwen 3
 /// - `Qwen3MoE` - Qwen 3 MoE
 /// - `Starcoder2` - StarCoder 2
+/// - `SmolLm3` - SmolLM 3
 pub enum CausalLMPipeline {
     Llama(TextPipeline<LlamaModel>),
     Mixtral(TextPipeline<Mixtral>),
@@ -71,6 +73,7 @@ pub enum CausalLMPipeline {
     Qwen3(TextPipeline<QQwen3>),
     Qwen3MoE(TextPipeline<QQwen3MoE>),
     Starcoder2(TextPipeline<QStarcoder2>),
+    SmolLm3(TextPipeline<SmolLm3>),
 }
 
 /// Macro to dispatch a method call to the inner pipeline.
@@ -88,6 +91,7 @@ macro_rules! dispatch {
             CausalLMPipeline::Qwen3($p) => $body,
             CausalLMPipeline::Qwen3MoE($p) => $body,
             CausalLMPipeline::Starcoder2($p) => $body,
+            CausalLMPipeline::SmolLm3($p) => $body,
         }
     };
 }
@@ -216,6 +220,7 @@ impl CausalLMPipeline {
             Self::Qwen3(_) => "Qwen3",
             Self::Qwen3MoE(_) => "Qwen3MoE",
             Self::Starcoder2(_) => "Starcoder2",
+            Self::SmolLm3(_) => "SmolLm3",
         }
     }
 

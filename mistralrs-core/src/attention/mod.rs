@@ -132,17 +132,26 @@ pub trait PositionEncoding: Send + Sync {
 
 /// Attention mechanism trait - abstracts over attention implementations.
 ///
-/// This trait enables composable transformer blocks by allowing different
-/// attention implementations:
-/// - `CausalAttention` (generic, handles Q/K norm, RoPE, paged attention)
-/// - Model-specific inline attention (for custom optimizations)
-pub trait Attention: Send + Sync {
+/// This trait is parameterized by cache type `C`, enabling composable transformer
+/// blocks with different cache requirements:
+/// - `CausalAttention: Attention<KvCache>` - Standard attention with KV cache
+/// - `MambaBlock: Attention<MambaState>` - Mamba layers with SSM state
+///
+/// The cache type parameter enables type-safe composition:
+/// ```ignore
+/// type LlamaBlock = TransformerBlock<RmsNorm, CausalAttention, Mlp>;  // KvCache
+/// type GraniteMambaBlock = TransformerBlock<RmsNorm, MambaLayer, Mlp>;  // MambaState
+/// ```
+///
+/// For hybrid models with heterogeneous layer types, see `HybridCache` which
+/// manages both cache types with indexed access.
+pub trait Attention<C>: Send + Sync {
     /// Forward pass through the attention layer.
     ///
     /// # Arguments
     /// * `x` - Input hidden states after pre-attention norm [batch, seq_len, hidden_dim]
     /// * `mask` - Optional attention mask
-    /// * `cache` - KV cache (mutated for eager attention)
+    /// * `cache` - Cache state (KvCache for attention, MambaState for Mamba, etc.)
     /// * `position_offsets` - Position offsets for RoPE
     /// * `metadata` - Paged attention metadata (KV cache tensors + input metadata)
     ///
@@ -152,7 +161,7 @@ pub trait Attention: Send + Sync {
         &self,
         x: &Tensor,
         mask: Option<&Tensor>,
-        cache: &mut KvCache,
+        cache: &mut C,
         position_offsets: &[usize],
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor>;
@@ -188,6 +197,27 @@ impl<N: candle_nn::Module + Send + Sync> QkNorm for RmsNormQkNorm<N> {
 
     fn forward_k(&self, k: &Tensor) -> Result<Tensor> {
         self.k_norm.forward(k)
+    }
+}
+
+// ============================================================================
+// Position Encoding Implementations
+// ============================================================================
+
+/// Identity position encoding - passes Q and K through unchanged.
+///
+/// Used for transformer layers that skip positional encoding (e.g., SmolLM3
+/// layers where `no_rope_layers` is true).
+pub struct IdentityPositionEncoding;
+
+impl PositionEncoding for IdentityPositionEncoding {
+    fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        _seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        Ok((q.clone(), k.clone()))
     }
 }
 
@@ -383,7 +413,7 @@ impl CausalAttention {
     }
 }
 
-impl Attention for CausalAttention {
+impl Attention<KvCache> for CausalAttention {
     fn forward(
         &self,
         x: &Tensor,
@@ -551,7 +581,7 @@ impl FusedQkvCausalAttention {
     }
 }
 
-impl Attention for FusedQkvCausalAttention {
+impl Attention<KvCache> for FusedQkvCausalAttention {
     fn forward(
         &self,
         x: &Tensor,

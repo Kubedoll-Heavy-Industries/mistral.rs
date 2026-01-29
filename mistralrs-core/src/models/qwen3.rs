@@ -701,7 +701,7 @@ impl NormalModel for Model {
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
         _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _flash_params: &FlashParams,

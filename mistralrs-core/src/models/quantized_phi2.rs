@@ -27,7 +27,7 @@ use crate::layers::{
 };
 use crate::layers_masker::PastKvLenCache;
 use crate::models::{
-    LanguageModel, LanguageModelExt, Model, TransformContext, TransformerModel, TransformerModelExt,
+    LanguageModel, LanguageModelExt, Model, TransformContext, TokenizerModel, TransformerModelExt,
 };
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::KvCache;
@@ -116,6 +116,7 @@ pub struct ModelWeights {
     max_seq_len: usize,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
+    kv_dim: usize,
 }
 
 impl ModelConfig::FromGGUF for ModelWeights {
@@ -282,6 +283,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             layers.push(Phi2Block::new(attn_norm, attention, mlp));
         }
 
+        let head_dim = embedding_length / head_count;
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
             layers,
@@ -291,6 +293,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len,
             mapper: Some(mapper),
             dtype,
+            kv_dim: head_dim * head_count_kv,
         })
     }
 }
@@ -305,13 +308,17 @@ impl Model for ModelWeights {
     }
 }
 
-impl TransformerModel for ModelWeights {
+impl TokenizerModel<[KvCache]> for ModelWeights {
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -371,7 +378,7 @@ impl TransformerModel for ModelWeights {
     }
 }
 
-impl LanguageModel for ModelWeights {
+impl LanguageModel<[KvCache]> for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         // Move to model device and apply final norm
         let hidden = hidden.to_device(&self.device)?;

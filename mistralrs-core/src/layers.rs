@@ -49,6 +49,7 @@ pub trait FeedForward: Send + Sync {
 // Generic Transformer Block
 // ============================================================================
 
+use crate::kv_cache::SsmCache;
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
 
@@ -64,6 +65,10 @@ use crate::pipeline::KvCache;
 /// - `A`: Attention implementation (e.g., `CausalAttention`)
 /// - `F`: Feed-forward network (e.g., `Mlp`)
 ///
+/// The cache type is derived from the attention implementation's `Attention<C>` bound:
+/// - `TransformerBlock<RmsNorm, CausalAttention, Mlp>` uses `KvCache`
+/// - `TransformerBlock<RmsNorm, MambaLayer, Mlp>` uses `MambaState`
+///
 /// This enables zero-cost abstraction through monomorphization while
 /// eliminating code duplication across different model architectures.
 pub struct TransformerBlock<N, A, F> {
@@ -73,12 +78,7 @@ pub struct TransformerBlock<N, A, F> {
     pub ffn: F,
 }
 
-impl<N, A, F> TransformerBlock<N, A, F>
-where
-    N: Module,
-    A: Attention,
-    F: FeedForward,
-{
+impl<N, A, F> TransformerBlock<N, A, F> {
     /// Create a new transformer block.
     pub fn new(attn_norm: N, attention: A, ffn_norm: N, ffn: F) -> Self {
         Self {
@@ -88,7 +88,17 @@ where
             ffn,
         }
     }
+}
 
+/// Implementation for standard attention with KvCache.
+///
+/// This is the common case for most transformer models (Llama, Mistral, Qwen, etc.).
+impl<N, A, F> TransformerBlock<N, A, F>
+where
+    N: Module,
+    A: Attention<KvCache>,
+    F: FeedForward,
+{
     /// Forward pass through the transformer block.
     ///
     /// # Arguments
@@ -132,13 +142,16 @@ where
     }
 }
 
-// Implement TransformerLayer trait for TransformerBlock.
+// Implement TransformerLayer trait for TransformerBlock with KvCache.
 // This enables TransformerBlock to be used as the Layer associated type
-// in TransformerModel implementations.
+// in TokenizerModel implementations.
+//
+// Note: Only implemented for A: Attention<KvCache> to maintain backward
+// compatibility. Hybrid models (Granite, etc.) use different patterns.
 impl<N, A, F> crate::models::TransformerLayer for TransformerBlock<N, A, F>
 where
     N: Module + Send + Sync,
-    A: Attention + Send + Sync,
+    A: Attention<KvCache> + Send + Sync,
     F: FeedForward + Send + Sync,
 {
     fn forward(
@@ -150,6 +163,49 @@ where
         paged_attn_meta: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         TransformerBlock::forward(self, hidden, mask, position_offsets, cache, paged_attn_meta)
+    }
+}
+
+/// Implementation for Mamba/SSM layers with SsmCache.
+///
+/// This enables TransformerBlock to be used with Mamba layers in hybrid models
+/// like Granite. The cache type flows from the attention implementation:
+/// - `TransformerBlock<RmsNorm, MambaAttention, Mlp>` uses `SsmCache`
+impl<N, A, F> TransformerBlock<N, A, F>
+where
+    N: Module,
+    A: Attention<SsmCache>,
+    F: FeedForward,
+{
+    /// Forward pass through the transformer block with SSM cache.
+    ///
+    /// # Arguments
+    /// * `hidden` - Input hidden states `[batch, seq_len, hidden_size]`
+    /// * `cache` - SSM cache (conv_state + ssm_state)
+    ///
+    /// # Returns
+    /// Output hidden states of the same shape as input
+    ///
+    /// Note: SSM layers don't use attention mask or position offsets (state is recurrent).
+    pub fn forward_ssm(&self, hidden: Tensor, cache: &mut SsmCache) -> Result<Tensor> {
+        // Attention (Mamba) with pre-norm and residual
+        let residual = &hidden;
+        let x = self.attn_norm.forward(&hidden)?;
+
+        // Mamba doesn't need mask, position offsets, or paged attention
+        let attn_out = self.attention.forward(&x, None, cache, &[], None)?;
+        let x = (attn_out + residual)?;
+
+        // FFN with pre-norm and residual
+        let residual = &x;
+        let x = self.ffn_norm.forward(&x)?;
+        let ffn_out = self.ffn.forward(&x)?;
+        ffn_out + residual
+    }
+
+    /// Mamba layers don't use paged attention.
+    pub fn has_paged_attn_ssm(&self) -> bool {
+        false
     }
 }
 
@@ -173,12 +229,7 @@ pub struct ParallelTransformerBlock<N, A, F> {
     pub ffn: F,
 }
 
-impl<N, A, F> ParallelTransformerBlock<N, A, F>
-where
-    N: Module,
-    A: Attention,
-    F: FeedForward,
-{
+impl<N, A, F> ParallelTransformerBlock<N, A, F> {
     /// Create a new parallel transformer block.
     pub fn new(norm: N, attention: A, ffn: F) -> Self {
         Self {
@@ -187,7 +238,15 @@ where
             ffn,
         }
     }
+}
 
+/// Implementation for standard attention with KvCache.
+impl<N, A, F> ParallelTransformerBlock<N, A, F>
+where
+    N: Module,
+    A: Attention<KvCache>,
+    F: FeedForward,
+{
     /// Forward pass with parallel attention and FFN computation.
     pub fn forward(
         &self,
@@ -221,11 +280,11 @@ where
     }
 }
 
-// Implement TransformerLayer trait for ParallelTransformerBlock.
+// Implement TransformerLayer trait for ParallelTransformerBlock with KvCache.
 impl<N, A, F> crate::models::TransformerLayer for ParallelTransformerBlock<N, A, F>
 where
     N: Module + Send + Sync,
-    A: Attention + Send + Sync,
+    A: Attention<KvCache> + Send + Sync,
     F: FeedForward + Send + Sync,
 {
     fn forward(

@@ -8,7 +8,7 @@
 //!
 //! # Architecture
 //!
-//! The typed pipeline differs from `GGUFPipeline` which uses `Box<dyn LanguageModel>`:
+//! The typed pipeline differs from `GGUFPipeline` which uses `Box<dyn LanguageModel<[KvCache]>>`:
 //!
 //! | Aspect | `TextPipeline<M>` | `GGUFPipeline` |
 //! |--------|-------------------|----------------|
@@ -60,13 +60,13 @@ use crate::sequence::Sequence;
 
 /// Type-safe text generation pipeline.
 ///
-/// Unlike `GGUFPipeline` which uses `Box<dyn LanguageModel>`, this pipeline
+/// Unlike `GGUFPipeline` which uses `Box<dyn LanguageModel<[KvCache]>>`, this pipeline
 /// knows the model type `M` at compile time. The `forward()` method is
 /// monomorphized, eliminating vtable overhead on the hot path.
 ///
 /// # Type Parameter
 ///
-/// `M: LanguageModel + Send + Sync` - The concrete model type (e.g., `QLlama`, `QQwen3`).
+/// `M: LanguageModel<[KvCache]> + Send + Sync` - The concrete model type (e.g., `QLlama`, `QQwen3`).
 ///
 /// # Ownership
 ///
@@ -75,7 +75,7 @@ use crate::sequence::Sequence;
 /// - `cache`: KV cache (working memory for generation)
 /// - `tokenizer`, `chat_template`, `metadata`: Shared configuration
 /// - `hook`: Optional transport for pipeline parallelism
-pub struct TextPipeline<M: LanguageModel + Send + Sync> {
+pub struct TextPipeline<M: LanguageModel<[KvCache]> + Send + Sync> {
     /// The language model (weights + architecture).
     model: M,
     /// Tokenizer for encoding/decoding text.
@@ -99,7 +99,7 @@ pub struct TextPipeline<M: LanguageModel + Send + Sync> {
     xlora_classifier: Option<XLoraClassifier>,
 }
 
-impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
+impl<M: LanguageModel<[KvCache]> + Send + Sync> TextPipeline<M> {
     /// Create a new typed text pipeline.
     ///
     /// # Arguments
@@ -376,7 +376,7 @@ impl<M: LanguageModel + Send + Sync> TextPipeline<M> {
 // Pipeline trait implementations
 // ============================================================================
 
-impl<M: LanguageModel + Send + Sync + 'static> MetadataMixin for TextPipeline<M> {
+impl<M: LanguageModel<[KvCache]> + Send + Sync + 'static> MetadataMixin for TextPipeline<M> {
     fn device(&self) -> Device {
         self.model.device().clone()
     }
@@ -402,7 +402,7 @@ impl<M: LanguageModel + Send + Sync + 'static> MetadataMixin for TextPipeline<M>
     }
 }
 
-impl<M: LanguageModel + Send + Sync + 'static> CacheManagerMixin for TextPipeline<M> {
+impl<M: LanguageModel<[KvCache]> + Send + Sync + 'static> CacheManagerMixin for TextPipeline<M> {
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
         if matches!(self.cache, EitherCache::Full(_)) {
             FullCacheManager.clone_in_cache(self, seqs, false)
@@ -443,7 +443,7 @@ impl<M: LanguageModel + Send + Sync + 'static> CacheManagerMixin for TextPipelin
     }
 }
 
-impl<M: LanguageModel + Send + Sync + 'static> PreProcessingMixin for TextPipeline<M> {
+impl<M: LanguageModel<[KvCache]> + Send + Sync + 'static> PreProcessingMixin for TextPipeline<M> {
     fn get_chat_template(&self) -> Option<Arc<ChatTemplate>> {
         Some(self.chat_template.clone())
     }
@@ -453,20 +453,20 @@ impl<M: LanguageModel + Send + Sync + 'static> PreProcessingMixin for TextPipeli
     }
 }
 
-impl<M: LanguageModel + Send + Sync + 'static> IsqPipelineMixin for TextPipeline<M> {
+impl<M: LanguageModel<[KvCache]> + Send + Sync + 'static> IsqPipelineMixin for TextPipeline<M> {
     fn re_isq_model(&mut self, _dtype: mistralrs_quant::IsqType) -> anyhow::Result<()> {
         anyhow::bail!("ISQ re-quantization not supported on typed pipeline")
     }
 }
 
-impl<M: LanguageModel + Send + Sync + 'static> AnyMoePipelineMixin for TextPipeline<M> {}
+impl<M: LanguageModel<[KvCache]> + Send + Sync + 'static> AnyMoePipelineMixin for TextPipeline<M> {}
 
 // ============================================================================
 // Pipeline trait implementation
 // ============================================================================
 
 #[async_trait::async_trait]
-impl<M: LanguageModel + Send + Sync + 'static> Pipeline for TextPipeline<M> {
+impl<M: LanguageModel<[KvCache]> + Send + Sync + 'static> Pipeline for TextPipeline<M> {
     fn get_hook(&self) -> Option<&HookContainer> {
         self.hook.as_ref()
     }
@@ -574,7 +574,7 @@ mod tests {
         // The TextPipeline<M> type should be sized when M is known
         fn assert_sized<T: Sized>() {}
         // Can't call this without a concrete M, but the function itself compiles
-        fn _verify_type_param<M: LanguageModel + Send + Sync + 'static>() {
+        fn _verify_type_param<M: LanguageModel<[KvCache]> + Send + Sync + 'static>() {
             assert_sized::<TextPipeline<M>>();
         }
     }

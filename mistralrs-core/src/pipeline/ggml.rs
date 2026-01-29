@@ -11,7 +11,7 @@ use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::DeviceMapper;
 use crate::kv_cache::{FullCacheManager, NormalCache};
 use crate::lora::Ordering;
-use crate::models::{LanguageModel, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, TokenizerModel, TransformContext};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
@@ -51,6 +51,12 @@ enum Model {
     XLoraLlama(Box<XLoraQLlama>),
 }
 
+#[deprecated(
+    since = "0.8.0",
+    note = "Use TextPipeline<M> with typed loaders (e.g., CausalLMLoader) instead. \
+            GGMLPipeline uses runtime polymorphism; TextPipeline provides \
+            compile-time type safety and monomorphized inference paths."
+)]
 pub struct GGMLPipeline {
     model: Model,
     tokenizer: Arc<Tokenizer>,
@@ -64,6 +70,12 @@ pub struct GGMLPipeline {
 }
 
 /// A loader for a GGML model.
+#[deprecated(
+    since = "0.8.0",
+    note = "Use typed loaders instead: CausalLMLoader for text models. \
+            GGMLLoader uses runtime polymorphism; typed loaders provide \
+            compile-time type safety."
+)]
 pub struct GGMLLoader {
     model_id: String,
     config: GGMLSpecificConfig,
@@ -81,6 +93,11 @@ pub struct GGMLLoader {
 }
 
 #[derive(Clone, Default)]
+#[deprecated(
+    since = "0.8.0",
+    note = "Use typed loader builders instead (e.g., CausalLMLoaderBuilder). \
+            Configuration is passed directly to typed loaders."
+)]
 /// Config for a GGML loader.
 pub struct GGMLSpecificConfig {
     pub gqa: usize,
@@ -88,6 +105,11 @@ pub struct GGMLSpecificConfig {
 }
 
 #[derive(Default)]
+#[deprecated(
+    since = "0.8.0",
+    note = "Use typed loader builders instead: CausalLMLoaderBuilder for text models. \
+            Typed builders provide better ergonomics and type safety."
+)]
 /// A builder for a GGML loader.
 pub struct GGMLLoaderBuilder {
     model_id: Option<String>,
@@ -549,7 +571,7 @@ impl Pipeline for GGMLPipeline {
         let is_llama = matches!(self.model, Model::Llama(_));
 
         let logits = if is_llama {
-            // Use unified TransformerModel forward path
+            // Use unified TokenizerModel forward path
             let Model::Llama(ref model) = self.model else {
                 unreachable!()
             };

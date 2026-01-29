@@ -29,7 +29,7 @@ use crate::gguf::Content;
 use crate::layers::{Activation, Llama3RopeConfig, RmsNorm};
 use crate::models::{
     standard_embed, standard_lm_head, standard_transform, LanguageModel, LanguageModelConfig,
-    LanguageModelExt, Model, TransformContext, TransformerModel, TransformerModelExt,
+    LanguageModelExt, Model, TransformContext, TokenizerModel, TransformerModelExt,
 };
 use crate::paged_attention::{AttentionImplementation, ModelConfigMetadata};
 use crate::pipeline::loaders::{
@@ -325,13 +325,17 @@ impl Model for Llama {
     }
 }
 
-impl TransformerModel for Llama {
+impl TokenizerModel<[KvCache]> for Llama {
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.k_head_dim * self.cfg.num_kv_heads
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -375,7 +379,7 @@ impl TransformerModelExt for Llama {
     }
 }
 
-impl LanguageModel for Llama {
+impl LanguageModel<[KvCache]> for Llama {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         standard_lm_head(self, hidden)
     }

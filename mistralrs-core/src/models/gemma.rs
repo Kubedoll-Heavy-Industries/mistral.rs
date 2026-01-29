@@ -1,5 +1,18 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+//! Gemma model implementation.
+//!
+//! Supports the new trait architecture (`Model`, `TransformerModel`, `LanguageModel`)
+//! for pipeline parallelism while maintaining backward compatibility with `NormalModel`.
+//!
+//! # Key Differences from Standard Llama
+//!
+//! 1. **RmsNorm with +1 offset**: Gemma normalizes as `x * (1 + weights)` not `x * weights`
+//!    - Uses `RmsNorm::new_gemma()` which adds +1 to loaded weights
+//!    - When saving for UQFF, must use `undo_gemma()` to restore original weights
+//! 2. **GELU activation** in MLP (vs SiLU in Llama)
+//! 3. **Embedding scaling**: Embeddings are scaled by `sqrt(hidden_size)`
+
 use std::{collections::HashMap, sync::Arc};
 
 use candle_core::{Device, Module, Result, Tensor};
@@ -25,6 +38,9 @@ use crate::{
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
+
+// Import the new trait hierarchy
+use crate::models::{LanguageModel, TransformContext, TokenizerModel};
 
 fn default_max_position_embeddings() -> usize {
     4096
@@ -65,6 +81,48 @@ impl Config {
             }
             (None, None) => candle_core::bail!("none of hidden_act and hidden_activation are set"),
         }
+    }
+}
+
+impl crate::models::LanguageModelConfig for Config {
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+    fn intermediate_size(&self) -> usize {
+        self.intermediate_size
+    }
+    fn num_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> usize {
+        self.num_attention_heads
+    }
+    fn num_key_value_heads(&self) -> usize {
+        self.num_key_value_heads
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta as f32
+    }
+    fn max_seq_len(&self) -> usize {
+        self.max_position_embeddings
+    }
+    fn hidden_act(&self) -> Activation {
+        self.hidden_act().unwrap_or(Activation::Gelu)
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+    fn quantization_config(&self) -> Option<&QuantizedConfig> {
+        self.quantization_config.as_ref()
     }
 }
 
@@ -359,6 +417,23 @@ pub struct Model {
 }
 
 impl Model {
+    /// Create a new Gemma model from safetensors weights.
+    ///
+    /// # Deprecation Notice
+    ///
+    /// This constructor is maintained for backward compatibility with the existing
+    /// `NormalModel` pipeline. For new code, prefer using the trait-based architecture
+    /// via `TransformerModel` and `LanguageModel` traits.
+    ///
+    /// The new trait architecture supports:
+    /// - Pipeline parallelism via `embed()`, `transform()`, `lm_head()` composition
+    /// - Cleaner separation between model weights and runtime state
+    /// - Unified interface for both GGUF and safetensors loading
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use the trait-based architecture (TransformerModel, LanguageModel) for new pipelines. \
+                This constructor is maintained for NormalModel compatibility."
+    )]
     pub fn new(
         cfg: &Config,
         vb: ShardedVarBuilder,
@@ -610,7 +685,7 @@ impl NormalModel for Model {
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
         _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _flash_params: &FlashParams,
@@ -755,5 +830,114 @@ impl AnyMoeBaseModelMixin for Model {
     }
     fn amoe_supported(&self) -> bool {
         true
+    }
+}
+
+// ============================================================================
+// New Trait Architecture Implementations
+// ============================================================================
+//
+// These implementations enable the Gemma model to work with the new trait-based
+// pipeline architecture that supports pipeline parallelism. The existing
+// `NormalModel` implementation remains for backward compatibility.
+
+impl crate::models::Model for Model {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TokenizerModel<[KvCache]> for Model {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.k_head_dim * self.cfg.num_kv_heads
+    }
+
+    /// Embed tokens with Gemma-specific scaling by sqrt(hidden_size).
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        let embeds = self.embed_tokens.forward(tokens)?;
+        // Gemma-specific: scale embeddings by sqrt(hidden_size)
+        embeds * (self.hidden_size as f64).sqrt()
+    }
+
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        let seq_len = hidden.dim(1)?;
+        let start_offsets: Vec<usize> = vec![ctx.position_offset];
+
+        // Compute causal mask using hidden tensor's dtype
+        let mask = CausalMasker.make_causal_mask_as(
+            seq_len,
+            hidden.device(),
+            &start_offsets.as_slice() as &dyn PastKvLenCache,
+            hidden.dtype(),
+        )?;
+
+        // Skip mask for non-first chunks in paged attention
+        let mask = mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        // Run through layers using the existing DecoderLayer implementation
+        let mut xs = hidden;
+
+        // Create empty FlashParams for when none provided (non-flash attention path)
+        let empty_flash = FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: Default::default(),
+            cumulative_seqlens_k: Default::default(),
+            causal: false,
+        };
+        let flash_params = ctx.flash_params.unwrap_or(&empty_flash);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Apply device mapping
+            xs = self.mapper.map(xs, i)?;
+
+            // Get layer metadata for paged attention
+            let layer_metadata = ctx.paged_attn.as_ref().map(|pa| {
+                (pa.kv_cache[i].clone(), pa.metadata)
+            });
+
+            xs = layer.forward(
+                &xs,
+                mask.as_ref()
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
+                &start_offsets,
+                &mut cache[i],
+                layer_metadata,
+                flash_params,
+            )?;
+        }
+
+        Ok(xs)
+    }
+}
+
+impl LanguageModel<[KvCache]> for Model {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        // Apply final norm, then project to vocab
+        let xs = hidden.to_device(&self.device)?;
+        let mut xs = xs.apply(&self.norm)?;
+        if let Some(t) = self.lm_head.quantized_act_type() {
+            xs = xs.to_dtype(t)?;
+        }
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 }

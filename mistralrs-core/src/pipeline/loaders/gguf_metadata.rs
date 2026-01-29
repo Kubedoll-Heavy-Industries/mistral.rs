@@ -38,6 +38,7 @@ use crate::device_map::{self, DeviceMapSetting, DeviceMapper};
 use crate::gguf::{
     convert_gguf_to_hf_tokenizer, get_gguf_chat_template, Content, GGUFArchitecture,
 };
+use crate::kv_cache::KvCache;
 use crate::models::LanguageModel;
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
@@ -63,6 +64,7 @@ use crate::models::quantized_qwen::ModelWeights as QQwen;
 use crate::models::quantized_qwen3::ModelWeights as QQwen3;
 use crate::models::quantized_qwen3_moe::ModelWeights as QQwen3MoE;
 use crate::models::quantized_starcoder2::ModelWeights as QStarcoder2;
+use crate::models::smollm3::ModelWeights as SmolLm3;
 
 /// Format-specific metadata.
 ///
@@ -712,7 +714,7 @@ pub fn load_text_pipeline(
 /// 2. Loads model via FromGGUF trait
 /// 3. Extracts tokenizer and chat template
 /// 4. Constructs TextPipeline<M>
-fn load_pipeline_for_model<M: LanguageModel + FromGGUF + Send + Sync + 'static>(
+fn load_pipeline_for_model<M: LanguageModel<[KvCache]> + FromGGUF + Send + Sync + 'static>(
     loader: &GgufLoader,
     device: &Device,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
@@ -1952,9 +1954,32 @@ impl CausalLMLoaderBuilder {
                 )?;
                 Ok(CausalLMPipeline::Mistral3(pipeline))
             }
+            NormalLoaderType::SmolLm3 => {
+                let config: crate::models::smollm3::Config =
+                    serde_json::from_str(config_str)?;
+                let model = SmolLm3::from_safetensors(
+                    &config,
+                    vb,
+                    &self.device,
+                    mapper,
+                    self.attention,
+                    self.dtype,
+                    self.layer_range.clone(),
+                    adapter_registry.clone(),
+                )?;
+                let pipeline = self.build_text_pipeline_safetensors(
+                    model,
+                    &model_meta,
+                    tokenizer_path,
+                    repo,
+                    repo_id,
+                    adapter_registry.clone(),
+                )?;
+                Ok(CausalLMPipeline::SmolLm3(pipeline))
+            }
             _ => bail!(
                 "Safetensors loading not yet supported for {:?}. \
-                 Currently supported: Mistral, Qwen2, Qwen3, Phi3. \
+                 Currently supported: Mistral, Qwen2, Qwen3, Phi3, SmolLm3. \
                  Use GGUF format or contribute a FromSafetensors implementation.",
                 loader_type
             ),
@@ -1978,7 +2003,7 @@ impl CausalLMLoaderBuilder {
         use crate::pipeline::loaders::NormalLoaderType;
 
         match loader_type {
-            NormalLoaderType::Qwen2 | NormalLoaderType::Qwen3 | NormalLoaderType::Mistral => {
+            NormalLoaderType::Qwen2 | NormalLoaderType::Qwen3 | NormalLoaderType::Mistral | NormalLoaderType::SmolLm3 => {
                 Ok(vec![
                     Regex::new(r"lm_head\.(weight|bias)$")?,
                     // Attention
@@ -2064,7 +2089,7 @@ impl CausalLMLoaderBuilder {
     }
 
     /// Build TextPipeline for safetensors model.
-    fn build_text_pipeline_safetensors<M: LanguageModel + Send + Sync + 'static>(
+    fn build_text_pipeline_safetensors<M: LanguageModel<[KvCache]> + Send + Sync + 'static>(
         &self,
         model: M,
         model_meta: &SafetensorsModelMetadata,
@@ -2364,7 +2389,7 @@ impl CausalLMLoaderBuilder {
     }
 
     /// Build a typed pipeline for a specific model type.
-    fn build_typed_pipeline<M: LanguageModel + FromGGUF + Send + Sync + 'static>(
+    fn build_typed_pipeline<M: LanguageModel<[KvCache]> + FromGGUF + Send + Sync + 'static>(
         &self,
         loader: &GgufLoader,
     ) -> Result<crate::pipeline::TextPipeline<M>> {

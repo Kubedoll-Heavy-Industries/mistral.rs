@@ -36,7 +36,7 @@ use crate::{
         CausalMasker, FeedForward, MatMul, RmsNorm, RotaryEmbedding,
     },
     layers_masker::PastKvLenCache,
-    models::{LanguageModel, Model as ModelTrait, TransformContext, TransformerModel},
+    models::{LanguageModel, Model as ModelTrait, TransformContext, TokenizerModel},
     moe::{
         routing::{RoutingConfig, SoftmaxTopK},
         LoadedExpertWeights, MoE, MoEExperts, MoELayerConfig, QuantProperties,
@@ -266,13 +266,17 @@ impl ModelTrait for Mixtral {
     }
 }
 
-impl TransformerModel for Mixtral {
+impl TokenizerModel<[KvCache]> for Mixtral {
     fn num_layers(&self) -> usize {
         self.num_layers
     }
 
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.k_head_dim * self.cfg.num_kv_heads
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -336,7 +340,7 @@ impl TransformerModel for Mixtral {
     }
 }
 
-impl LanguageModel for Mixtral {
+impl LanguageModel<[KvCache]> for Mixtral {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         match (&self.norm, &self.lm_head) {
             (Some(norm), Some(lm_head)) => {
@@ -479,7 +483,7 @@ impl NormalModel for Mixtral {
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
         _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _flash_params: &FlashParams,

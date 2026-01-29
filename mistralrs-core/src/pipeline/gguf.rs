@@ -16,6 +16,7 @@ use crate::gguf::{
 use crate::gguf::{Content, GGUFArchitecture};
 use crate::kv_cache::{FullCacheManager, NormalCache, NormalCacheManager};
 use crate::lora::Ordering;
+use crate::kv_cache::KvCache;
 use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
@@ -65,14 +66,14 @@ use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-/// Model variant: either a TransformerModel (unified path) or XLora (legacy two-pass).
+/// Model variant: either a TokenizerModel (unified path) or XLora (legacy two-pass).
 ///
 /// This replaces the old 10-variant enum with a simpler structure:
 /// - LanguageModel implementations use dynamic dispatch (Box<dyn>)
 /// - XLora models stay concrete until we create an XLoraModel trait
 enum ModelVariant {
     /// Models implementing LanguageModel (stateless, unified forward path)
-    Transformer(Box<dyn LanguageModel + Send + Sync>),
+    Transformer(Box<dyn LanguageModel<[KvCache]> + Send + Sync>),
     /// XLora Llama (two-pass inference, owns cache)
     XLoraLlama(XLoraQLlama),
     /// XLora Phi3 (two-pass inference, owns cache)
@@ -83,7 +84,7 @@ impl ModelVariant {
     /// Get this model as a LanguageModel trait object, if it implements the trait.
     ///
     /// Returns Some for LanguageModel, None for XLora models (which need two-pass inference).
-    fn as_language_model(&self) -> Option<&dyn LanguageModel> {
+    fn as_language_model(&self) -> Option<&dyn LanguageModel<[KvCache]>> {
         match self {
             ModelVariant::Transformer(model) => Some(&**model),
             ModelVariant::XLoraLlama(_) | ModelVariant::XLoraPhi3(_) => None,
@@ -143,7 +144,7 @@ pub struct GGUFPipeline {
     hook: Option<HookContainer>,
 }
 
-/// Unified forward pass for models implementing TransformerModel.
+/// Unified forward pass for models implementing TokenizerModel.
 ///
 /// This is the ONE code path for inference. Pipeline parallelism is just
 /// configuration - hooks fire at boundaries if layers are distributed,
@@ -160,8 +161,8 @@ pub struct GGUFPipeline {
 /// (avoids borrow checker conflicts with &mut self).
 #[allow(clippy::too_many_arguments)]
 fn forward_transformer(
-    model: &dyn LanguageModel,
-    cache: &mut [crate::kv_cache::KvCache],
+    model: &dyn LanguageModel<[KvCache]>,
+    cache: &mut [KvCache],
     hook: Option<&HookContainer>,
     input_ids: &Tensor,
     seqlen_offsets: &[usize],
@@ -723,7 +724,7 @@ impl Loader for GGUFLoader {
         };
 
         // Config into model:
-        // TransformerModel implementations are boxed for dynamic dispatch.
+        // TokenizerModel implementations are boxed for dynamic dispatch.
         // XLora models stay concrete (they have different forward signature).
         let model: ModelVariant = match self.kind {
             ModelKind::GgufQuantized { .. } => match arch {
@@ -1068,7 +1069,7 @@ impl Pipeline for GGUFPipeline {
             }
             (None, None) => None,
         };
-        // Models implementing TransformerModel use the unified forward path.
+        // Models implementing TokenizerModel use the unified forward path.
         // Check BEFORE the match to avoid borrow conflicts.
         if self.model.as_language_model().is_some() {
             // Safe to unwrap: we just checked it's Some
@@ -1111,9 +1112,9 @@ impl Pipeline for GGUFPipeline {
                 &flash_meta,
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
-            // TransformerModel handled in unified path above
+            // TokenizerModel handled in unified path above
             ModelVariant::Transformer(_) => {
-                unreachable!("TransformerModel handled in unified path above")
+                unreachable!("TokenizerModel handled in unified path above")
             }
         };
         if return_raw_logits {

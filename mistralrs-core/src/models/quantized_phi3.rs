@@ -24,7 +24,7 @@ use crate::layers::{
 };
 use crate::layers_masker::PastKvLenCache;
 use crate::models::{
-    LanguageModel, LanguageModelExt, Model, TransformContext, TransformerModel, TransformerModelExt,
+    LanguageModel, LanguageModelExt, Model, TransformContext, TokenizerModel, TransformerModelExt,
 };
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::loaders::{GgufWeightSource, WeightSource};
@@ -66,6 +66,7 @@ pub struct ModelWeights {
     pub max_seq_len: usize,
     dtype: DType,
     n_heads: usize,
+    kv_dim: usize,
 }
 
 impl ModelWeights {
@@ -389,6 +390,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             max_seq_len: cfg.sliding_window.unwrap_or(cfg.max_position_embeddings),
             dtype,
             n_heads: cfg.num_attention_heads,
+            kv_dim: cfg.head_dim() * cfg.num_key_value_heads,
         })
     }
 }
@@ -560,6 +562,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len: context_window,
             dtype,
             n_heads: head_count,
+            kv_dim: head_dim * head_count_kv,
         })
     }
 }
@@ -604,13 +607,17 @@ impl Model for ModelWeights {
     }
 }
 
-impl TransformerModel for ModelWeights {
+impl TokenizerModel<[KvCache]> for ModelWeights {
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -659,7 +666,7 @@ impl TransformerModel for ModelWeights {
     }
 }
 
-impl LanguageModel for ModelWeights {
+impl LanguageModel<[KvCache]> for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         let x = self.output_norm.forward(&hidden)?;
         MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)

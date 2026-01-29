@@ -1,16 +1,19 @@
-// Allow deprecated traits during migration to new trait hierarchy
-#![allow(deprecated)]
+// Models are parameterized by their inference state type S.
+// See TokenizerModel<S> for the core trait hierarchy.
 
 pub(crate) mod deepseek2;
 pub(crate) mod deepseek3;
 pub(crate) mod gemma;
 pub(crate) mod gemma2;
 pub(crate) mod glm4;
+pub(crate) mod quantized_gemma;
+pub(crate) mod quantized_gemma2;
 pub(crate) mod gpt_oss;
 pub(crate) mod granite;
 pub(crate) mod llama;
 pub(crate) mod mistral;
 pub(crate) mod mixtral;
+pub(crate) mod quantized_mistral;
 pub(crate) mod phi2;
 pub(crate) mod phi3;
 pub(crate) mod phi3_5_moe;
@@ -35,6 +38,8 @@ use candle_nn::Embedding;
 use mistralrs_quant::QuantMethod;
 
 use crate::device_map::DeviceMapper;
+pub use crate::kv_cache::InferenceState;
+use crate::kv_cache::CacheLayout;
 use crate::layers::{CausalMasker, MatMul};
 use crate::layers_masker::PastKvLenCache;
 use crate::pipeline::text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata};
@@ -101,31 +106,46 @@ pub trait TransformerLayer: Send + Sync {
 }
 
 // =============================================================================
-// Object-Safe Base Traits (for dynamic dispatch via dyn LanguageModel)
+// Model Trait Hierarchy (State-Parameterized)
 // =============================================================================
+//
+// Models are parameterized by their inference state type S:
+// - [KvCache]     - standard attention-only models (Llama, Mistral, Qwen, etc.)
+// - HybridCache   - mixed attention/SSM models (Granite, Jamba)
+//
+// The state type captures the architecture. The trait captures the capability.
+//
+// Hierarchy:
+//   Model                        - base (weights on a device)
+//   └── TokenizerModel<S>        - embed + transform (processes token input)
+//       ├── LanguageModel<S>     - adds lm_head (text generation)
+//       └── EmbeddingModel<S>    - adds pool (dense vector output)
 
-/// Trait for transformer-based models.
+/// Trait for models that process token input.
 ///
-/// This is the **object-safe** base trait used for dynamic dispatch in pipelines
-/// like `GGUFPipeline`. It defines the core operations that all transformer models
-/// must implement.
+/// A `TokenizerModel` can embed token IDs into continuous representations
+/// and transform them through layers with inference state type S.
 ///
-/// # Design
+/// # Type Parameter
 ///
-/// This trait is intentionally minimal and object-safe. Models implement the
-/// required methods directly. For models with standard structure, helper functions
-/// are available that can be called from the implementations.
+/// - `S`: The inference state type. Captures the model's architecture:
+///   - `[KvCache]` - standard attention models (Llama, Mistral, Qwen, etc.)
+///   - `HybridCache` - mixed attention/SSM models (Granite, Jamba)
 ///
-/// # Related Traits
+/// # Object Safety
 ///
-/// - `TransformerModelExt`: Extension trait with accessors and associated types
-///   for compile-time polymorphism. Use this with typed pipelines like `TextPipeline<M>`.
-pub trait TransformerModel: Model {
+/// This trait is object-safe when S is concrete: `dyn TokenizerModel<[KvCache]>`.
+pub trait TokenizerModel<S: InferenceState + ?Sized>: Model {
     /// Number of transformer layers in this model.
     fn num_layers(&self) -> usize;
 
     /// Maximum sequence length this model supports.
     fn max_seq_len(&self) -> usize;
+
+    /// KV cache dimension (typically `head_dim * num_kv_heads`).
+    ///
+    /// Used by the default `cache_layout()` implementation.
+    fn kv_dim(&self) -> usize;
 
     /// Convert token IDs to embeddings.
     ///
@@ -133,7 +153,7 @@ pub trait TransformerModel: Model {
     /// Output: embeddings [batch, seq_len, hidden_dim]
     fn embed(&self, tokens: &Tensor) -> Result<Tensor>;
 
-    /// Transform hidden states through transformer layers.
+    /// Transform hidden states through model layers.
     ///
     /// Input: hidden states [batch, seq_len, hidden_dim]
     /// Output: hidden states [batch, seq_len, hidden_dim]
@@ -141,25 +161,43 @@ pub trait TransformerModel: Model {
         &self,
         hidden: Tensor,
         ctx: &TransformContext,
-        cache: &mut [KvCache],
+        state: &mut S,
     ) -> Result<Tensor>;
+
+    /// Describes cache requirements for this model.
+    ///
+    /// Default: uniform KV cache for all layers. Override for:
+    /// - Hybrid models (mixed attention/Mamba): `CacheLayout::hybrid(...)`
+    /// - Sliding window attention: `CacheLayout::sliding_window(...)`
+    /// - Attention sinks: `CacheLayout::with_sinks(...)`
+    fn cache_layout(&self) -> CacheLayout {
+        CacheLayout::uniform_kv(self.num_layers(), self.kv_dim(), self.max_seq_len())
+    }
 }
 
-/// Trait for language models (decoder-only transformers for text generation).
+/// Language model: adds next-token prediction to TokenizerModel.
 ///
-/// This is the **object-safe** base trait that extends `TransformerModel` with
-/// the language modeling head for next-token prediction.
-///
-/// # Pipeline parallelism
 /// The pipeline (not the model) determines which methods to call based on its stage:
 /// - HEAD: `embed()` → `transform()` → send activation
 /// - TAIL: receive → `transform()` → `lm_head()`
-pub trait LanguageModel: TransformerModel {
+pub trait LanguageModel<S: InferenceState + ?Sized>: TokenizerModel<S> {
     /// Project hidden states to vocabulary logits.
     ///
     /// Input: hidden states [batch, seq_len, hidden_dim]
     /// Output: logits [batch, seq_len, vocab_size]
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor>;
+}
+
+/// Embedding model: adds pooling to TokenizerModel.
+///
+/// Embedding models transform input tokens to dense vectors without
+/// a language modeling head.
+pub trait EmbeddingModel<S: InferenceState + ?Sized>: TokenizerModel<S> {
+    /// Pool hidden states to produce embeddings.
+    ///
+    /// Input: hidden states [batch, seq_len, hidden_dim]
+    /// Output: embeddings [batch, embedding_dim]
+    fn pool(&self, hidden: Tensor) -> Result<Tensor>;
 }
 
 // =============================================================================
@@ -174,7 +212,7 @@ pub trait LanguageModel: TransformerModel {
 ///
 /// Models implementing this trait can use the helper functions for standard
 /// implementations of `TransformerModel` methods.
-pub trait TransformerModelExt: TransformerModel {
+pub trait TransformerModelExt: TokenizerModel<[KvCache]> {
     /// The transformer layer type for this model.
     type Layer: TransformerLayer;
 
@@ -201,7 +239,7 @@ pub trait TransformerModelExt: TransformerModel {
 ///
 /// This trait is **not object-safe** due to the `TransformerModelExt` bound.
 /// Used by typed pipelines for models with standard LM head structure.
-pub trait LanguageModelExt: LanguageModel + TransformerModelExt {
+pub trait LanguageModelExt: LanguageModel<[KvCache]> + TransformerModelExt {
     /// Access to output projection weights.
     fn output(&self) -> &Arc<dyn QuantMethod>;
 }

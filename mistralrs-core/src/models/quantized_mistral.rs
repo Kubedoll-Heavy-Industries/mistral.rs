@@ -1,9 +1,9 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-//! Qwen3 model using the generic transformer infrastructure.
+//! Mistral model using the generic transformer infrastructure.
 //!
-//! Uses `StandardTransformerBlock` (RmsNorm + CausalAttention + Mlp) composition
-//! with Q/K normalization (always present in Qwen3).
+//! Uses `StandardTransformerBlock` (RmsNorm + CausalAttention + Mlp) composition.
+//! This is for original Mistral models (7B v0.1, v0.2) - NOT Mistral3 with YaRN.
 //!
 //! Supports loading from both GGUF and safetensors formats via `FromGGUF` and
 //! `FromSafetensors` traits.
@@ -16,7 +16,7 @@ use mistralrs_quant::{QuantMethod, QuantizedConfig, ShardedVarBuilder};
 
 use crate::device_map::DeviceMapper;
 use crate::gguf::Content;
-use crate::layers::{Activation, RmsNorm, RmsNormQkNorm};
+use crate::layers::{Activation, RmsNorm};
 use crate::models::{
     standard_embed, standard_lm_head, standard_transform, LanguageModel, LanguageModelExt, Model,
     TransformContext, TokenizerModel, TransformerModelExt,
@@ -24,7 +24,7 @@ use crate::models::{
 use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::loaders::{
     load_transformer_from_safetensors, load_transformer_layers, GgufNaming, GgufWeightSource,
-    SafetensorsNaming, StandardTransformerBlock, TensorNaming, TransformerConfig, WeightSource,
+    StandardTransformerBlock, TensorNaming, TransformerConfig, WeightSource,
 };
 use crate::pipeline::KvCache;
 use crate::serde_default_fn;
@@ -36,8 +36,9 @@ use crate::utils::model_config as ModelConfig;
 // =============================================================================
 
 serde_default_fn!(bool, word_emb_default, false);
+serde_default_fn!(f64, default_rope_theta, 10000.0);
 
-/// Configuration for Qwen3 model loaded from safetensors.
+/// Configuration for Mistral model loaded from safetensors.
 /// Mirrors the config.json structure from HuggingFace.
 #[derive(Debug, Clone, serde::Deserialize, Default, serde::Serialize)]
 pub struct Config {
@@ -49,17 +50,21 @@ pub struct Config {
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
     pub sliding_window: Option<usize>,
+    #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
     pub rms_norm_eps: f64,
+    #[serde(default)]
     pub hidden_act: Activation,
     pub quantization_config: Option<QuantizedConfig>,
     #[serde(default = "word_emb_default")]
     pub tie_word_embeddings: bool,
+    pub head_dim: Option<usize>,
 }
 
 impl Config {
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 }
 
@@ -102,13 +107,13 @@ impl crate::models::LanguageModelConfig for Config {
     }
 }
 
-/// Qwen3 model weights using the generic transformer builder infrastructure.
+/// Mistral model weights using the generic transformer builder infrastructure.
 ///
 /// The model uses pre-norm architecture with:
 /// - RMS normalization for attention and FFN
-/// - Q/K normalization (Qwen3-specific)
 /// - Gated MLP with SiLU activation
 /// - RoPE positional embeddings
+/// - Optional sliding window attention
 pub struct ModelWeights {
     tok_embeddings: Embedding,
     layers: Vec<StandardTransformerBlock>,
@@ -116,6 +121,7 @@ pub struct ModelWeights {
     output: Arc<dyn QuantMethod>,
     pub device: Device,
     pub max_seq_len: usize,
+    sliding_window: Option<usize>,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
     kv_dim: usize,
@@ -138,12 +144,16 @@ impl ModelConfig::FromSafetensors for ModelWeights {
         layer_range: Option<std::ops::Range<usize>>,
         adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
-        let naming = SafetensorsNaming;
+        // Build transformer config with sliding window if present
+        let mut transformer_config = TransformerConfig::from_config(cfg);
+        if let Some(window) = cfg.sliding_window {
+            transformer_config = transformer_config.with_sliding_window(window);
+        }
 
-        // Load transformer with Q/K normalization customization
+        // Load transformer - no model-specific customization needed
         let loaded = load_transformer_from_safetensors(
             cfg,
-            TransformerConfig::from_config(cfg),
+            transformer_config,
             vb,
             device,
             &*mapper,
@@ -151,19 +161,9 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             dtype,
             layer_range,
             adapter_registry,
-            |ctx, builder, weights| {
-                // Qwen3-specific: Q/K normalization (always present)
-                let q_norm = weights.load_rms_norm(
-                    &naming.attn_q_norm(ctx.layer_idx),
-                    ctx.rms_norm_eps,
-                    ctx.device,
-                )?;
-                let k_norm = weights.load_rms_norm(
-                    &naming.attn_k_norm(ctx.layer_idx),
-                    ctx.rms_norm_eps,
-                    ctx.device,
-                )?;
-                Ok(builder.with_qk_norm(Arc::new(RmsNormQkNorm::new(q_norm, k_norm))))
+            |_ctx, builder, _weights| {
+                // Mistral has no model-specific customizations like Q/K norm
+                Ok(builder)
             },
         )?;
 
@@ -174,6 +174,7 @@ impl ModelConfig::FromSafetensors for ModelWeights {
             output: loaded.output,
             device: device.clone(),
             max_seq_len: loaded.max_seq_len,
+            sliding_window: cfg.sliding_window,
             mapper: Some(mapper),
             dtype,
             kv_dim: cfg.head_dim() * cfg.num_key_value_heads,
@@ -195,14 +196,14 @@ impl ModelConfig::FromGGUF for ModelWeights {
         layer_range: Option<std::ops::Range<usize>>,
         adapter_registry: Option<std::sync::Arc<crate::lora::AdapterRegistry>>,
     ) -> Result<Self> {
-        // Verify architecture
+        // Verify architecture - Mistral uses "llama" architecture in GGUF
         let meta = ct.get_metadata();
         let arch: String = {
             use crate::utils::gguf_metadata::TryValueInto;
             meta.get("general.architecture").cloned().try_value_into()?
         };
-        if arch != "qwen3" {
-            candle_core::bail!("Expected `qwen3` architecture, got `{arch}`.");
+        if arch != "llama" {
+            candle_core::bail!("Expected `llama` architecture for Mistral GGUF, got `{arch}`.");
         }
 
         // Parse config from GGUF metadata using generic infrastructure
@@ -210,8 +211,18 @@ impl ModelConfig::FromGGUF for ModelWeights {
             path_prefix: &arch,
             metadata: meta,
         };
-        let config = TransformerConfig::from_gguf_metadata(&metadata)
+        let mut config = TransformerConfig::from_gguf_metadata(&metadata)
             .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+
+        // Extract sliding window if present
+        let sliding_window = metadata
+            .get_value::<u64>("attention.sliding_window")
+            .ok()
+            .map(|v| v as usize);
+
+        if let Some(window) = sliding_window {
+            config = config.with_sliding_window(window);
+        }
 
         // Create weight source wrapper
         let mut weights = GgufWeightSource::new(&mut ct);
@@ -245,7 +256,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             )?
         };
 
-        // Load transformer layers using generic infrastructure with Qwen3-specific customizer
+        // Load transformer layers using generic infrastructure
         let layers = load_transformer_layers(
             &config,
             &mut weights,
@@ -256,21 +267,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             attention_mechanism,
             dtype,
             adapter_registry,
-            |ctx, builder, weights| {
-                // Qwen3-specific: Add Q/K normalization
-                let q_norm = weights.load_rms_norm(
-                    &naming.attn_q_norm(ctx.layer_idx),
-                    ctx.rms_norm_eps,
-                    ctx.device,
-                )?;
-                let k_norm = weights.load_rms_norm(
-                    &naming.attn_k_norm(ctx.layer_idx),
-                    ctx.rms_norm_eps,
-                    ctx.device,
-                )?;
-                let qk_norm: Arc<dyn crate::attention::QkNorm> =
-                    Arc::new(RmsNormQkNorm::new(q_norm, k_norm));
-                Ok(builder.with_qk_norm(qk_norm))
+            |_ctx, builder, _weights| {
+                // Mistral has no model-specific customizations like Q/K norm
+                Ok(builder)
             },
         )?;
 
@@ -281,6 +280,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             output,
             device: device.clone(),
             max_seq_len: config.max_seq_len,
+            sliding_window,
             mapper: Some(mapper),
             dtype,
             kv_dim: config.head_dim * config.num_kv_heads,
@@ -292,6 +292,11 @@ impl ModelWeights {
     /// Number of transformer layers in this model.
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Get the sliding window size if configured.
+    pub fn sliding_window(&self) -> Option<usize> {
+        self.sliding_window
     }
 
     /// Forward pass for embeddings - returns hidden states before LM head.

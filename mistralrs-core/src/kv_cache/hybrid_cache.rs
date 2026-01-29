@@ -9,6 +9,7 @@
 
 use candle_core::{Device, IndexOp, Result, Tensor};
 
+use super::cache_store::CacheStore;
 use super::KvCache;
 
 /// Pool-based Mamba state cache for continuous batching.
@@ -403,5 +404,47 @@ impl HybridCache {
     /// Used by the model during forward to access Mamba state pool.
     pub fn state_indices(&self) -> Option<&Tensor> {
         self.state_indices.as_ref()
+    }
+}
+
+// =============================================================================
+// CacheStore Implementation for HybridCache
+// =============================================================================
+
+impl CacheStore for HybridCache {
+    fn num_layers(&self) -> usize {
+        self.caches.len()
+    }
+
+    fn kv(&self, idx: usize) -> Option<&KvCache> {
+        self.caches.get(idx)?.as_kv_cache()
+    }
+
+    fn kv_mut(&mut self, idx: usize) -> Option<&mut KvCache> {
+        self.caches.get_mut(idx)?.as_kv_cache_mut()
+    }
+
+    fn mamba_pool(&self, idx: usize) -> Option<&MambaStatePool> {
+        self.caches.get(idx)?.as_mamba_pool()
+    }
+
+    fn mamba_pool_mut(&mut self, idx: usize) -> Option<&mut MambaStatePool> {
+        self.caches.get_mut(idx)?.as_mamba_pool_mut()
+    }
+
+    fn reset(&mut self) {
+        for cache in &mut self.caches {
+            cache.reset();
+        }
+    }
+
+    fn seq_len(&self) -> usize {
+        // Return seq_len from first attention layer's KV cache
+        for cache in &self.caches {
+            if let HybridLayerCache::Attention(kv) = cache {
+                return kv.current_seq_len();
+            }
+        }
+        0
     }
 }

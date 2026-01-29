@@ -16,6 +16,7 @@ use crate::{
     get_delta_from_lora_ab,
     layers::{embedding, Activation, CausalMasker, MatMul, Mlp, RmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
+    models::{LanguageModel, TransformContext, TokenizerModel},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -90,6 +91,45 @@ impl Config {
             .as_ref()
             .map(|p| p.rope_theta)
             .unwrap_or(self.rope_theta)
+    }
+}
+
+impl crate::models::LanguageModelConfig for Config {
+    fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+    fn intermediate_size(&self) -> usize {
+        self.intermediate_size
+    }
+    fn num_layers(&self) -> usize {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> usize {
+        self.num_attention_heads
+    }
+    fn num_key_value_heads(&self) -> usize {
+        self.num_key_value_heads
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+    fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.get_rope_theta() as f32
+    }
+    fn max_seq_len(&self) -> usize {
+        self.max_position_embeddings
+    }
+    fn hidden_act(&self) -> Activation {
+        self.hidden_act
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+    fn quantization_config(&self) -> Option<&QuantizedConfig> {
+        self.quantization_config.as_ref()
     }
 }
 
@@ -388,6 +428,14 @@ pub struct Model {
 }
 
 impl Model {
+    /// Create a new Mistral model.
+    ///
+    /// **Deprecated**: For new code, prefer using `quantized_mistral::ModelWeights` with `FromGGUF`
+    /// or `FromSafetensors` traits for better integration with the unified model trait hierarchy.
+    #[deprecated(
+        since = "0.8.0",
+        note = "Use quantized_mistral::ModelWeights with FromGGUF/FromSafetensors for new trait architecture"
+    )]
     pub fn new(
         cfg: &Config,
         vb: ShardedVarBuilder,
@@ -728,7 +776,7 @@ impl NormalModel for Model {
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
         _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _flash_params: &FlashParams,
@@ -874,5 +922,121 @@ impl AnyMoeBaseModelMixin for Model {
     }
     fn amoe_supported(&self) -> bool {
         true
+    }
+}
+
+// ============================================================================
+// New Trait Architecture Implementations
+// ============================================================================
+//
+// These implementations enable the existing Model struct to work with the
+// unified model trait hierarchy while maintaining backwards compatibility
+// with NormalModel.
+
+impl crate::models::Model for Model {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TokenizerModel<[KvCache]> for Model {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.k_head_dim * self.cfg.num_kv_heads
+    }
+
+    fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        cache: &mut [KvCache],
+    ) -> Result<Tensor> {
+        // Note: This implementation requires flash_params to be provided in the context.
+        // For the legacy Model struct, use forward() or forward_embeds() methods instead
+        // which handle flash_params internally. This trait method is primarily for compatibility
+        // with the new unified pipeline architecture.
+        let flash_params = ctx.flash_params.ok_or_else(|| {
+            candle_core::Error::Msg(
+                "Mistral Model::transform requires flash_params in TransformContext. \
+                 Use forward() or forward_embeds() methods for full control."
+                    .to_string(),
+            )
+        })?;
+
+        let mut xs = hidden;
+        let seq_len = xs.dim(1)?;
+        let start_offsets = vec![ctx.position_offset];
+
+        // Compute causal mask with optional sliding window support
+        let attention_mask = if let Some(window) = self.sliding_window {
+            CausalMasker.make_sliding_window_mask(
+                seq_len,
+                xs.device(),
+                ctx.position_offset,
+                window,
+                xs.dtype(),
+            )?
+        } else {
+            CausalMasker.make_causal_mask_as(
+                seq_len,
+                xs.device(),
+                &start_offsets.as_slice() as &dyn PastKvLenCache,
+                xs.dtype(),
+            )?
+        };
+
+        // Skip mask for non-first chunks in paged attention
+        let attention_mask: Option<Tensor> = attention_mask.filter(|_| {
+            ctx.paged_attn
+                .as_ref()
+                .map(|pa| pa.metadata.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Global layer index for device mapping (accounts for partial layer loading)
+            let global_layer_idx = self.layer_start + i;
+            xs = self.mapper.map(xs, global_layer_idx)?;
+
+            // Prepare paged attention metadata if present
+            let layer_metadata = ctx.paged_attn.as_ref().map(|pa| {
+                (pa.kv_cache[i].clone(), pa.metadata)
+            });
+
+            xs = layer.forward(
+                &xs,
+                attention_mask
+                    .as_ref()
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
+                &start_offsets,
+                &mut cache[i],
+                layer_metadata,
+                flash_params,
+            )?;
+        }
+
+        xs.to_device(&self.device)
+    }
+}
+
+impl LanguageModel<[KvCache]> for Model {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        let mut xs = hidden.apply(&self.norm)?;
+        if let Some(t) = self.lm_head.quantized_act_type() {
+            xs = xs.to_dtype(t)?;
+        }
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 }

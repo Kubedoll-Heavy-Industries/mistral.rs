@@ -15,7 +15,7 @@ use crate::gguf::{
 };
 use crate::models::quantized_qwen::ModelWeights as QQwen;
 use crate::models::quantized_qwen3::ModelWeights as QQwen3;
-use crate::models::TransformerModel;
+use crate::models::TokenizerModel;
 use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::loaders::QuantizationKind;
 use crate::pipeline::ChatTemplate;

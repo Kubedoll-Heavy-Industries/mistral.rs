@@ -18,7 +18,7 @@ use crate::layers::{
     RmsNorm, RotaryEmbedding,
 };
 use crate::layers_masker::PastKvLenCache;
-use crate::models::{LanguageModel, Model, TransformContext, TransformerModel};
+use crate::models::{LanguageModel, Model, TransformContext, TokenizerModel};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::KvCache;
@@ -187,6 +187,7 @@ pub struct ModelWeights {
     pub max_seq_len: usize,
     mapper: Option<Box<dyn DeviceMapper + Send + Sync>>,
     dtype: DType,
+    kv_dim: usize,
 }
 
 impl ModelConfig::FromGGML for ModelWeights {
@@ -272,6 +273,7 @@ impl ModelConfig::FromGGML for ModelWeights {
                 dtype,
             })
         }
+        let n_kv_head = ct.hparams.n_head as usize / gqa;
         Ok(Self {
             tok_embeddings: Embedding::new(tok_embeddings, ct.hparams.n_embd as usize),
             layers,
@@ -284,6 +286,7 @@ impl ModelConfig::FromGGML for ModelWeights {
             max_seq_len: DEFAULT_MAX_SEQ_LEN as usize, // Cannot determine from ggml.
             mapper: None,
             dtype,
+            kv_dim: head_dim * n_kv_head,
         })
     }
 }
@@ -709,6 +712,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
             max_seq_len,
             mapper: Some(mapper),
             dtype,
+            kv_dim: head_dim * head_count_kv,
         })
     }
 }
@@ -761,13 +765,17 @@ impl Model for ModelWeights {
     }
 }
 
-impl TransformerModel for ModelWeights {
+impl TokenizerModel<[KvCache]> for ModelWeights {
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
     fn max_seq_len(&self) -> usize {
         self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.kv_dim
     }
 
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -807,7 +815,7 @@ impl TransformerModel for ModelWeights {
     }
 }
 
-impl LanguageModel for ModelWeights {
+impl LanguageModel<[KvCache]> for ModelWeights {
     fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
         // Move to model device and apply final norm
         let hidden = hidden.to_device(&self.device)?;

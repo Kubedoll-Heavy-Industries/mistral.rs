@@ -14,6 +14,7 @@ use crate::{
     attention::SdpaParams,
     device_map::DeviceMapper,
     layers::{self, embedding, GptOssRotaryEmbedding, MatMul, RmsNorm, RotaryEmbedding},
+    models::{LanguageModel, TokenizerModel, TransformContext},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -968,7 +969,7 @@ impl NormalModel for Model {
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
         _no_kv_cache: bool,
-        _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
+        _non_granular_state: &Option<crate::lora::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         _flash_params: &FlashParams,
@@ -999,6 +1000,163 @@ impl NormalModel for Model {
 
     fn config(&self) -> &ModelConfigMetadata {
         &self.cfg_metadata
+    }
+}
+
+// ============================================================================
+// New Model Trait Hierarchy Implementations
+// ============================================================================
+//
+// These implementations enable the existing Model struct to work with the
+// unified model trait hierarchy while maintaining backwards compatibility
+// with NormalModel.
+
+impl crate::models::Model for Model {
+    fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+impl TokenizerModel<[KvCache]> for Model {
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cfg.head_dim() * self.cfg.num_key_value_heads
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(tokens)
+    }
+
+    fn transform(
+        &self,
+        hidden: Tensor,
+        ctx: &TransformContext,
+        state: &mut [KvCache],
+    ) -> Result<Tensor> {
+        let mut xs = hidden;
+        let tgt_len = ctx.seq_len;
+        let sliding_window = self.cfg.sliding_window;
+
+        // Build causal mask and sliding window mask (same logic as inner_forward)
+        let (causal_mask, sliding_mask) = if tgt_len == 1 {
+            (None, None)
+        } else {
+            let past_kv_len = ctx.position_offset;
+            let kv_len = tgt_len + past_kv_len;
+
+            let q_pos = Tensor::arange(
+                past_kv_len as u32,
+                (past_kv_len + tgt_len) as u32,
+                xs.device(),
+            )?
+            .to_dtype(DType::I64)?
+            .reshape((tgt_len, 1))?;
+            let k_pos = Tensor::arange(0u32, kv_len as u32, xs.device())?
+                .to_dtype(DType::I64)?
+                .reshape((1, kv_len))?;
+
+            let causal_mask_bool = k_pos.broadcast_gt(&q_pos)?;
+            let zeros = Tensor::zeros((tgt_len, kv_len), xs.dtype(), xs.device())?;
+            let neg_inf =
+                Tensor::full(f32::NEG_INFINITY, (tgt_len, kv_len), xs.device())?
+                    .to_dtype(xs.dtype())?;
+            let causal_mask = Some(
+                causal_mask_bool
+                    .where_cond(&neg_inf, &zeros)?
+                    .unsqueeze(0)?
+                    .unsqueeze(0)?,
+            );
+
+            let sliding_mask = if let Some(window) = sliding_window {
+                let window_tensor =
+                    Tensor::full(window as i64, q_pos.shape(), xs.device())?;
+                let min_k = q_pos.sub(&window_tensor)?.maximum(0i64)?;
+
+                let too_far_left = k_pos.broadcast_lt(&min_k)?;
+                let too_far_right = k_pos.broadcast_gt(&q_pos)?;
+                let sliding_mask_bool = too_far_left
+                    .to_dtype(DType::U8)?
+                    .add(&too_far_right.to_dtype(DType::U8)?)?
+                    .gt(0u8)?;
+
+                Some(
+                    sliding_mask_bool
+                        .where_cond(&neg_inf, &zeros)?
+                        .unsqueeze(0)?
+                        .unsqueeze(0)?,
+                )
+            } else {
+                None
+            };
+
+            (causal_mask, sliding_mask)
+        };
+
+        // Skip mask for non-first paged attention chunks
+        let should_use_mask = ctx
+            .paged_attn
+            .as_ref()
+            .map(|pa| pa.metadata.is_first_prompt_chunk)
+            .unwrap_or(true);
+        let causal_mask = if should_use_mask { causal_mask } else { None };
+        let sliding_mask = if should_use_mask { sliding_mask } else { None };
+
+        let seqlen_offsets = vec![ctx.position_offset];
+
+        let empty_flash = FlashParams {
+            max_q: 0,
+            max_k: 0,
+            cumulative_seqlens_q: Default::default(),
+            cumulative_seqlens_k: Default::default(),
+            causal: false,
+        };
+        let flash_params = ctx.flash_params.unwrap_or(&empty_flash);
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            xs = self.mapper.map(xs, i)?;
+
+            let layer_mask = if layer.self_attn.is_sliding {
+                sliding_mask.as_ref().or(causal_mask.as_ref())
+            } else {
+                causal_mask.as_ref()
+            };
+
+            let layer_metadata = ctx
+                .paged_attn
+                .as_ref()
+                .map(|pa| (pa.kv_cache[i].clone(), pa.metadata));
+
+            xs = layer.forward(
+                &xs,
+                layer_mask
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
+                &seqlen_offsets,
+                &mut state[i],
+                layer_metadata,
+                flash_params,
+                i,
+            )?;
+        }
+
+        xs.to_device(&self.device)
+    }
+}
+
+impl LanguageModel<[KvCache]> for Model {
+    fn lm_head(&self, hidden: Tensor) -> Result<Tensor> {
+        let mut xs = self.norm.forward(&hidden)?;
+        if let Some(t) = self.lm_head.quantized_act_type() {
+            xs = xs.to_dtype(t)?;
+        }
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 }
 

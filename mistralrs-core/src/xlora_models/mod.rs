@@ -1,5 +1,20 @@
+//! Legacy XLoRA model implementations.
+//!
+//! # Deprecated
+//!
+//! This entire module is deprecated since 0.8.0. Use `CausalLMLoaderBuilder::with_xlora()`
+//! with `TextPipeline` instead. The new architecture separates the XLoRA classifier from
+//! the base model, allowing any model to support XLoRA without code duplication.
+//!
+//! Migration guide:
+//! - Instead of `XLoraLlama`, use `Llama` with `XLoraClassifier` orchestration
+//! - Instead of `XLoraQLlama`, use quantized Llama with `XLoraClassifier` orchestration
+//! - Use `CausalLMLoaderBuilder::with_xlora()` to configure XLoRA adapters
+
 // Allow deprecated traits during migration - XLora models use NormalModel and AnyMoeBaseModelMixin
 #![allow(deprecated)]
+// Silence unused import warnings - this module is deprecated and will be removed
+#![allow(unused_imports)]
 
 mod classifier;
 mod config;

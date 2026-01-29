@@ -31,6 +31,7 @@ use tokenizers::Tokenizer;
 
 use crate::device_map::DeviceMapper;
 use crate::kv_cache::{FullCacheManager, NormalCacheManager};
+use crate::kv_cache::KvCache;
 use crate::models::{LanguageModel, PagedAttentionContext, TransformContext};
 use crate::paged_attention::ModelConfigMetadata;
 use crate::pipeline::hooks::{ActivationResult, HookContainer};
@@ -63,7 +64,7 @@ pub enum StageOutput {
 /// Configuration that's immutable after loading.
 pub struct PipelineConfig {
     /// The language model (weights + architecture).
-    pub model: Arc<dyn LanguageModel + Send + Sync>,
+    pub model: Arc<dyn LanguageModel<[KvCache]> + Send + Sync>,
     /// Tokenizer for encoding/decoding text.
     pub tokenizer: Arc<Tokenizer>,
     /// Model identifier (e.g., "meta-llama/Llama-3-8B").
@@ -86,7 +87,7 @@ pub struct TransportConfig {
 
 /// Unified text generation pipeline.
 ///
-/// Handles autoregressive generation for any `TransformerModel`, with optional
+/// Handles autoregressive generation for any `TokenizerModel`, with optional
 /// pipeline parallelism via hooks.
 pub struct TextGenerationPipeline {
     // === Immutable configuration ===
@@ -216,7 +217,7 @@ impl TextGenerationPipeline {
     }
 
     /// Access the model.
-    pub fn model(&self) -> &Arc<dyn LanguageModel + Send + Sync> {
+    pub fn model(&self) -> &Arc<dyn LanguageModel<[KvCache]> + Send + Sync> {
         &self.config.model
     }
 
